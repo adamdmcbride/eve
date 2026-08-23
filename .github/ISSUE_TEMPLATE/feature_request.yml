@@ -1,0 +1,40 @@
+name: Feature request
+description: Propose a focused capability or product improvement.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Describe the user problem before proposing implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Valuable outcome
+      description: What would become simpler, safer, faster, or more useful?
+    validations:
+      required: true
+  - type: textarea
+    id: existing
+    attributes:
+      label: Existing path considered
+      description: Note any current Eve capability, configuration, organ, or upstream tool that may already solve part of this.
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: Privacy and authority boundaries
+      description: Identify data, permissions, external effects, and verification needs.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: List observable outcomes rather than implementation preferences.
+    validations:
+      required: true
+

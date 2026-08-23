@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Eve</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <aside class="sidebar-shell">
+        <div class="sidebar-top">
+          <div class="sidebar-brand">
+            <div class="brand-mark">E</div>
+            <div class="brand-copy">
+              <strong>Eve</strong>
+              <span>Local companion</span>
+            </div>
+            <span class="status-dot" aria-hidden="true"></span>
+          </div>
+
+          <label class="search-shell" for="threadSearchInput">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M10.5 4.75a5.75 5.75 0 1 0 0 11.5a5.75 5.75 0 0 0 0-11.5Zm0-1.5a7.25 7.25 0 1 1 4.61 12.84l4.4 4.41l-1.06 1.06l-4.41-4.4a7.25 7.25 0 0 1-3.54-13.91Z"
+              />
+            </svg>
+            <input id="threadSearchInput" type="search" placeholder="Search chats" />
+          </label>
+
+          <article class="assistant-card">
+            <div class="assistant-card-head">
+              <div class="assistant-avatar">E</div>
+              <div class="assistant-card-copy">
+                <strong>Eve</strong>
+                <span id="presenceLine">Waking Eve...</span>
+              </div>
+            </div>
+            <p id="focusLine" class="assistant-focus">No current focus yet.</p>
+          </article>
+
+          <div class="memory-cluster">
+            <article class="memory-card">
+              <p class="section-kicker">Self Model</p>
+              <h2 id="identityStatement">Listening for evidence...</h2>
+              <p id="identityDetails" class="memory-copy">
+                Eve is building a more durable sense of self.
+              </p>
+            </article>
+
+            <article class="memory-card">
+              <div class="memory-card-head">
+                <p class="section-kicker">Active Mind</p>
+                <p id="activeMindUpdatedLine" class="memory-meta">Not refreshed yet.</p>
+              </div>
+              <h2 id="activeMindSummary">Waiting for a live mind snapshot...</h2>
+              <p id="activeMindDetails" class="memory-copy">
+                Eve's current focus, live concerns, and next step will appear here.
+              </p>
+            </article>
+
+            <article class="memory-card">
+              <div class="memory-card-head">
+                <p class="section-kicker">Relationship Memory</p>
+                <p id="humanUpdatedLine" class="memory-meta">Not refreshed yet.</p>
+              </div>
+              <h2 id="relationshipOverview">Learning how to relate...</h2>
+              <p id="relationshipDetails" class="memory-copy">
+                No durable relationship memory yet.
+              </p>
+            </article>
+
+            <article class="memory-card">
+              <div class="memory-card-head">
+                <p class="section-kicker">Model Health</p>
+                <p id="modelUpdatedLine" class="memory-meta">No checks yet.</p>
+              </div>
+              <h2 id="modelOverview">Watching fast and deep lanes...</h2>
+              <p id="modelDetails" class="memory-copy">
+                Eve will show residency, probe latency, and recovery actions here.
+              </p>
+            </article>
+          </div>
+        </div>
+
+        <section class="sidebar-section">
+          <div class="section-head">
+            <p class="section-kicker">Recent Chats</p>
+            <button id="toggleThreadFilterBtn" class="ghost small">Waiting</button>
+          </div>
+          <div id="threadList" class="thread-list"></div>
+        </section>
+
+        <footer class="sidebar-footer">
+          <div class="profile-card">
+            <div class="profile-badge">AM</div>
+            <div class="profile-copy">
+              <strong>User</strong>
+              <span>Talking with Eve</span>
+            </div>
+          </div>
+        </footer>
+      </aside>
+
+      <section class="workspace-shell">
+        <header class="workspace-top">
+          <div class="workspace-heading">
+            <h1 id="threadTitle" class="workspace-title">New chat</h1>
+            <p id="threadMeta" class="workspace-subtitle">No thread selected</p>
+          </div>
+
+          <div class="workspace-actions">
+            <button id="wakeBtn" class="ghost small">Wake</button>
+            <button id="newThreadBtn" class="ghost small">New chat</button>
+            <button id="archiveThreadBtn" class="ghost small" disabled>Archive</button>
+          </div>
+        </header>
+
+        <section id="threadView" class="thread-view empty-state">Waking Eve...</section>
+
+        <form id="composerForm" class="composer-shell">
+          <textarea id="messageInput" placeholder="Message Eve"></textarea>
+          <div class="composer-row">
+            <button type="submit" class="send-btn" aria-label="Send message">↑</button>
+          </div>
+        </form>
+      </section>
+    </main>
+
+    <template id="threadCardTemplate">
+      <button class="thread-card">
+        <div class="thread-card-head">
+          <span class="thread-dot" aria-hidden="true"></span>
+          <div class="thread-card-copy">
+            <strong class="thread-subject"></strong>
+            <span class="thread-preview"></span>
+          </div>
+          <span class="thread-badge"></span>
+        </div>
+        <span class="thread-meta"></span>
+      </button>
+    </template>
+
+    <template id="threadBubbleTemplate">
+      <article class="bubble">
+        <span class="bubble-meta"></span>
+        <p class="bubble-body"></p>
+      </article>
+    </template>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

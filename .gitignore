@@ -1,0 +1,70 @@
+.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.build/
+.codex/
+.venv/
+.venv-*/
+
+# Local secrets and provider credentials never belong in source control.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+.eve/
+.eve.backup-*/
+EveBackups/
+.logs/
+coordination/
+operation_not_permitted.txt
+*.log
+*.sqlite
+*.sqlite3
+
+# OpenClaw workspace scaffolding generated at the repo root is not Eve docs.
+# The intentional OpenClaw sidecar workspace lives under ./openclaw/.
+.openclaw/
+/HEARTBEAT.md
+/IDENTITY.md
+/SOUL.md
+/TOOLS.md
+/USER.md
+
+build/
+models/
+*.gguf
+*.safetensors
+
+openclaw/.openclaw/
+openclaw/context/
+openclaw/dreams/
+openclaw/memory/
+openclaw/state/
+openclaw/wiki/
+openclaw/wiki/**/.openclaw-wiki/
+openclaw/DREAMS.md
+openclaw/MEMORY.md
+openclaw/openclaw-workspace-state.json
+
+# User continuity and training/runtime material are local data.
+memory/
+wiki/
+data/eve_training/
+
+mac/generated/Eve.iconset/* 2.png
+
+vendor/upstreams/*
+!vendor/upstreams/README.md
+
+# Beads / Dolt files (added by bd init)
+.beads/
+.dolt/
+*.db
+.beads-credential-key

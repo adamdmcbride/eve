@@ -1,0 +1,364 @@
+{
+  "gateway": {
+    "mode": "local",
+    "bind": "loopback",
+    "port": "__EVE_GATEWAY_PORT__"
+  },
+  "discovery": {
+    "wideArea": {
+      "enabled": false
+    },
+    "mdns": {
+      "mode": "off"
+    }
+  },
+  "update": {
+    "channel": "stable",
+    "checkOnStart": true,
+    "auto": {
+      "enabled": false
+    }
+  },
+  "memory": {
+    "backend": "qmd",
+    "citations": "auto",
+    "qmd": {
+      "command": "/opt/homebrew/bin/qmd",
+      "mcporter": {
+        "enabled": true,
+        "serverName": "qmd",
+        "startDaemon": true
+      },
+      "searchMode": "query",
+      "rerank": false,
+      "includeDefaultMemory": true,
+      "paths": [
+        {
+          "path": "__EVE_RUNTIME_ROOT__/PROJECT_MEMORY.md",
+          "name": "eve-project-memory"
+        },
+        {
+          "path": "__EVE_RUNTIME_ROOT__/COORDINATION.md",
+          "name": "eve-coordination"
+        },
+        {
+          "path": "__EVE_RUNTIME_ROOT__/docs",
+          "name": "eve-canonical-docs",
+          "pattern": "**/*.md"
+        },
+        {
+          "path": "__EVE_RUNTIME_ROOT__/.eve/capability_intelligence.md",
+          "name": "eve-capability-intelligence"
+        }
+      ],
+      "sessions": {
+        "enabled": false
+      },
+      "update": {
+        "interval": "15m",
+        "debounceMs": 15000,
+        "onBoot": true,
+        "startup": "idle",
+        "startupDelayMs": 120000,
+        "waitForBootSync": false,
+        "embedInterval": "60m",
+        "commandTimeoutMs": 30000,
+        "updateTimeoutMs": 120000,
+        "embedTimeoutMs": 1800000
+      },
+      "limits": {
+        "maxResults": 6,
+        "maxSnippetChars": 700,
+        "maxInjectedChars": 3500,
+        "timeoutMs": 45000
+      },
+      "scope": {
+        "default": "deny",
+        "rules": [
+          {
+            "action": "allow",
+            "match": {
+              "chatType": "direct"
+            }
+          },
+          {
+            "action": "allow",
+            "match": {
+              "chatType": "dm"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "hooks": {
+    "internal": {
+      "enabled": true,
+      "entries": {
+        "eve-evidence-ingest": {
+          "enabled": true
+        }
+      }
+    }
+  },
+  "channels": {
+    "imessage": {
+      "name": "Eve iMessage",
+      "enabled": false,
+      "cliPath": "/opt/homebrew/bin/imsg",
+      "dmPolicy": "disabled",
+      "groupPolicy": "allowlist"
+    }
+  },
+  "mcp": {
+    "servers": {
+      "eve-openclaw-channels": {
+        "command": "/opt/homebrew/bin/openclaw",
+        "args": [
+          "--profile",
+          "eve-repair",
+          "mcp",
+          "serve",
+          "--claude-channel-mode",
+          "off"
+        ]
+      }
+    }
+  },
+  "plugins": {
+    "allow": [
+      "llama-cpp",
+      "acpx",
+      "active-memory",
+      "memory-wiki",
+      "webhooks",
+      "memory-core",
+      "imessage"
+    ],
+    "entries": {
+      "acpx": {
+        "enabled": true,
+        "config": {
+          "permissionMode": "approve-reads",
+          "nonInteractivePermissions": "fail",
+          "pluginToolsMcpBridge": true,
+          "openClawToolsMcpBridge": true,
+          "timeoutSeconds": 180,
+          "mcpServers": {
+            "eve-openclaw-channels": {
+              "command": "/opt/homebrew/bin/openclaw",
+              "args": [
+                "--profile",
+                "eve-repair",
+                "mcp",
+                "serve",
+                "--claude-channel-mode",
+                "off"
+              ]
+            }
+          }
+        }
+      },
+      "active-memory": {
+        "enabled": true,
+        "config": {
+          "enabled": true,
+          "agents": [
+            "eve-repair"
+          ],
+          "model": "llamacpp-deep/eve-deep",
+          "allowedChatTypes": [
+            "direct"
+          ],
+          "queryMode": "recent",
+          "promptStyle": "precision-heavy",
+          "thinking": "off",
+          "timeoutMs": 45000,
+          "maxSummaryChars": 600,
+          "logging": true,
+          "persistTranscripts": false,
+          "qmd": {
+            "searchMode": "inherit"
+          }
+        }
+      },
+      "webhooks": {
+        "enabled": true,
+        "config": {
+            "routes": {
+              "eveRepair": {
+                "path": "/plugins/webhooks/eve-repair",
+              "sessionKey": "agent:eve-repair:main",
+                "controllerId": "webhooks/eve-repair",
+                "description": "Local Eve repair TaskFlow bridge",
+                "secret": "__EVE_WEBHOOK_SECRET__"
+            }
+          }
+        }
+      },
+      "memory-core": {
+        "enabled": true,
+        "config": {
+          "dreaming": {
+            "enabled": true,
+            "timezone": "America/New_York",
+            "frequency": "0 3 * * *"
+          }
+        }
+      },
+      "memory-wiki": {
+        "enabled": true,
+        "config": {
+          "vaultMode": "bridge",
+          "vault": {
+            "path": "__EVE_RUNTIME_ROOT__/openclaw/wiki/eve-memory-wiki",
+            "renderMode": "native"
+          },
+          "obsidian": {
+            "enabled": false,
+            "useOfficialCli": false,
+            "openAfterWrites": false
+          },
+          "bridge": {
+            "enabled": true,
+            "readMemoryArtifacts": true,
+            "indexDreamReports": true,
+            "indexDailyNotes": true,
+            "indexMemoryRoot": true,
+            "followMemoryEvents": true
+          },
+          "ingest": {
+            "autoCompile": true,
+            "maxConcurrentJobs": 1,
+            "allowUrlIngest": false
+          },
+          "search": {
+            "backend": "shared",
+            "corpus": "all"
+          },
+          "context": {
+            "includeCompiledDigestPrompt": false
+          },
+          "render": {
+            "preserveHumanBlocks": true,
+            "createBacklinks": true,
+            "createDashboards": true
+          }
+        }
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "workspace": "__EVE_WORKSPACE__",
+      "contextInjection": "continuation-skip",
+      "bootstrapMaxChars": 4000,
+      "bootstrapTotalMaxChars": 12000,
+      "heartbeat": {
+        "every": "0m"
+      },
+      "contextPruning": {
+        "mode": "cache-ttl",
+        "ttl": "1m",
+        "keepLastAssistants": 3
+      },
+      "compaction": {
+        "mode": "safeguard",
+        "reserveTokens": 6144,
+        "reserveTokensFloor": 6144,
+        "midTurnPrecheck": {
+          "enabled": true
+        }
+      },
+      "model": {
+        "primary": "llamacpp-deep/eve-deep",
+        "fallbacks": []
+      },
+      "memorySearch": {
+        "extraPaths": [],
+        "query": {
+          "hybrid": {
+            "mmr": {
+              "enabled": true,
+              "lambda": 0.65
+            },
+            "temporalDecay": {
+              "enabled": true,
+              "halfLifeDays": 21
+            }
+          }
+        }
+      }
+    },
+    "list": [
+      {
+        "id": "main",
+        "default": true,
+        "skills": [
+          "eve_capability_use",
+          "eve_codex_independent_operator",
+          "eve_control_home",
+          "eve_external_channel_drafting",
+          "eve_memory_wiki_reflection",
+          "eve_organ_assimilation",
+          "eve_personal_conversation",
+          "eve_self_repair",
+          "eve_system_sensing",
+          "eve_task_followthrough"
+        ],
+        "skillsLimits": {
+          "maxSkillsPromptChars": 5000
+        }
+      },
+      {
+        "id": "eve-repair",
+        "workspace": "__EVE_WORKSPACE__",
+        "model": {
+          "primary": "llamacpp-deep/eve-deep",
+          "fallbacks": []
+        },
+      "skills": [
+        "eve_capability_use",
+        "eve_codex_independent_operator",
+        "eve_control_home",
+        "eve_external_channel_drafting",
+        "eve_memory_wiki_reflection",
+        "eve_organ_assimilation",
+        "eve_personal_conversation",
+        "eve_self_repair",
+        "eve_system_sensing",
+        "eve_task_followthrough"
+      ],
+      "skillsLimits": {
+        "maxSkillsPromptChars": 5000
+      },
+        "contextLimits": {
+          "toolResultMaxChars": 6000
+        },
+        "tools": {
+          "profile": "minimal",
+          "alsoAllow": [
+            "read",
+            "write",
+            "edit",
+            "exec",
+            "process"
+          ]
+        }
+      }
+    ]
+  },
+  "tools": {
+    "profile": "coding",
+    "alsoAllow": [
+      "wiki_apply",
+      "wiki_get",
+      "wiki_lint",
+      "wiki_search",
+      "wiki_status"
+    ],
+    "loopDetection": {
+      "enabled": true
+    }
+  }
+}

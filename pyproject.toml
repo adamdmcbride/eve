@@ -1,0 +1,53 @@
+[project]
+name = "eve-local-runtime"
+version = "0.1.0"
+description = "Local Eve runtime infrastructure, memory, model orchestration, and autonomy tooling."
+readme = "README.md"
+license = "Apache-2.0"
+authors = [
+  { name = "Adam McBride" },
+]
+requires-python = ">=3.12,<3.15"
+dependencies = [
+  "py-trees>=2.3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+infra = [
+  "dagster>=1.13.19",
+  "opentelemetry-api>=1.44.0",
+  "opentelemetry-sdk>=1.44.0",
+]
+techlab = [
+  "huggingface-hub>=1.28.0",
+  "lancedb>=0.37.1",
+  "mlx>=0.32.1; platform_system == 'Darwin' and platform_machine == 'arm64'",
+  "mlx-lm>=0.31.3; platform_system == 'Darwin' and platform_machine == 'arm64'",
+  "numpy>=2.5.2,!=2.4.4",
+  "pyarrow>=25.0.1,!=23.0.0,<26.0.0",
+  "transformers>=5.15.1",
+]
+oss-lab = [
+  "deepeval>=4.1.10",
+  "dvc>=3.60.0",
+  "langfuse>=4.14.4",
+  "langgraph>=1.2.11",
+  "openinference-semantic-conventions>=0.1.32",
+  "peft>=0.20.0",
+  "ragas>=0.3.2",
+]
+
+[tool.uv]
+package = false
+conflicts = [
+  [
+    { extra = "oss-lab" },
+    { extra = "techlab" },
+  ],
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

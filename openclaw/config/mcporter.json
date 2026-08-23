@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "qmd": {
+      "command": "/opt/homebrew/bin/qmd",
+        "args": [
+          "mcp"
+        ],
+        "description": "Eve local QMD memory server",
+        "lifecycle": {
+          "mode": "keep-alive",
+          "idleTimeoutMs": 1800000
+        }
+      }
+    },
+    "daemonIdleTimeoutMs": 1800000
+}

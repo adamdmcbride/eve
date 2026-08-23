@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Eve Monitor</title>
+    <link rel="stylesheet" href="/monitor.css" />
+  </head>
+  <body>
+    <main class="monitor-shell">
+      <header class="topbar">
+        <div class="brand-lockup">
+          <div class="brand-mark">E</div>
+          <div>
+            <h1>Eve Monitor</h1>
+            <p id="generatedLine">Connecting to Eve...</p>
+          </div>
+        </div>
+
+        <div class="topbar-actions">
+          <a class="icon-button labeled" href="/" title="Open Eve chat">
+            <span aria-hidden="true">&#8599;</span>
+            <span>Chat</span>
+          </a>
+          <button id="pauseBtn" class="icon-button labeled" type="button" title="Pause live updates">
+            <span aria-hidden="true">&#10073;&#10073;</span>
+            <span>Pause</span>
+          </button>
+          <button id="refreshBtn" class="icon-button" type="button" title="Refresh now" aria-label="Refresh now">
+            <span aria-hidden="true">&#8635;</span>
+          </button>
+        </div>
+      </header>
+
+      <section class="status-strip" aria-live="polite">
+        <article class="metric-tile">
+          <span class="metric-label">Daemon</span>
+          <strong id="daemonState">Unknown</strong>
+          <span id="runtimeDir">Runtime pending</span>
+        </article>
+        <article class="metric-tile">
+          <span class="metric-label">Lane Readiness</span>
+          <strong id="lanesReady">0 / 0</strong>
+          <span id="laneSummary">No lane snapshot</span>
+        </article>
+        <article class="metric-tile">
+          <span class="metric-label">Peak Pressure</span>
+          <strong id="peakPressure">0</strong>
+          <span id="peakPressureLabel">No pressure data</span>
+        </article>
+        <article class="metric-tile">
+          <span class="metric-label">Threads</span>
+          <strong id="threadCounts">0 active</strong>
+          <span id="unreadCounts">0 unread</span>
+        </article>
+        <article class="metric-tile">
+          <span class="metric-label">Active Reply</span>
+          <strong id="replyState">Idle</strong>
+          <span id="replyDetail">No active reply</span>
+        </article>
+      </section>
+
+      <section class="monitor-grid">
+        <article class="panel workspace-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Integrated State</p>
+              <h2>Workspace</h2>
+            </div>
+            <span id="workspaceUpdated" class="time-pill">Not refreshed</span>
+          </div>
+          <p id="workspaceSummary" class="large-copy">Waiting for the global workspace.</p>
+          <p id="currentExperience" class="support-copy">Current experience will appear here.</p>
+          <div class="workspace-columns">
+            <section>
+              <h3>Continuity</h3>
+              <ul id="continuityList" class="signal-list"></ul>
+            </section>
+            <section>
+              <h3>Readiness</h3>
+              <ul id="readinessList" class="signal-list"></ul>
+            </section>
+            <section>
+              <h3>Surprise</h3>
+              <ul id="surpriseList" class="signal-list"></ul>
+            </section>
+            <section>
+              <h3>Trace</h3>
+              <ul id="consequenceList" class="signal-list"></ul>
+            </section>
+          </div>
+        </article>
+
+        <article class="panel lanes-panel">
+          <div class="panel-head compact">
+            <div>
+              <p class="eyebrow">Inference</p>
+              <h2>Model Lanes</h2>
+            </div>
+            <span id="modelUpdated" class="time-pill">No checks</span>
+          </div>
+          <div id="laneList" class="lane-list"></div>
+        </article>
+
+        <article class="panel pressure-panel">
+          <div class="panel-head compact">
+            <div>
+              <p class="eyebrow">Homeostasis</p>
+              <h2>Pressure Map</h2>
+            </div>
+            <span id="regulationMode" class="time-pill">Unknown</span>
+          </div>
+          <div class="pulse-chart" aria-hidden="true">
+            <svg viewBox="0 0 320 84" role="img">
+              <path id="pulsePath" d="" />
+            </svg>
+          </div>
+          <div id="pressureList" class="pressure-list"></div>
+        </article>
+
+        <article class="panel reply-turn-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Cognitive Control</p>
+              <h2>Reply Turn Replay</h2>
+            </div>
+            <span id="replyTurnCount" class="time-pill">0 turns</span>
+          </div>
+          <div id="replyTurnList" class="timeline"></div>
+        </article>
+
+        <article class="panel autonomy-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Autonomy</p>
+              <h2>Agenda</h2>
+            </div>
+            <span id="autonomyStage" class="time-pill">observe</span>
+          </div>
+          <p id="autonomyFocus" class="large-copy">No autonomy agenda loaded.</p>
+          <div id="autonomyThreads" class="thread-stack"></div>
+          <div id="runList" class="run-list"></div>
+        </article>
+
+        <article class="panel substrate-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Substrate</p>
+              <h2>Evidence, Corrections, Episodes</h2>
+            </div>
+            <div class="segmented" role="tablist" aria-label="Substrate stream">
+              <button class="segment active" type="button" data-stream="evidence">Evidence</button>
+              <button class="segment" type="button" data-stream="commitments">Commitments</button>
+              <button class="segment" type="button" data-stream="experience">Experience</button>
+              <button class="segment" type="button" data-stream="corrections">Corrections</button>
+              <button class="segment" type="button" data-stream="episodes">Episodes</button>
+            </div>
+          </div>
+          <div id="substrateFeed" class="feed-list"></div>
+        </article>
+
+        <article class="panel actions-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Operations</p>
+              <h2>Action Trace</h2>
+            </div>
+            <span id="actionCount" class="time-pill">0 actions</span>
+          </div>
+          <div id="actionsTimeline" class="timeline"></div>
+          <p class="section-label">System Tasks</p>
+          <div id="systemTasks" class="timeline"></div>
+        </article>
+
+        <article class="panel attention-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Attention</p>
+              <h2>Threads</h2>
+            </div>
+            <span id="attentionCount" class="time-pill">0 tracked</span>
+          </div>
+          <div id="threadAttention" class="thread-stack"></div>
+        </article>
+      </section>
+    </main>
+
+    <script src="/monitor.js" type="module"></script>
+  </body>
+</html>

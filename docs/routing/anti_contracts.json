@@ -1,0 +1,78 @@
+{
+  "schema_version": "eve_route_anti_contracts.v1",
+  "owner": "eve_executive_scheduler",
+  "anti_contracts": [
+    {
+      "id": "ordinary_conversation_imports_runtime_status",
+      "description": "A personal, philosophical, or relational prompt is answered with OpenClaw, daemon, model, watchdog, CPU, or monitor status.",
+      "severity": "high",
+      "expected_catch": "reply_quality_issues plus route replay cases"
+    },
+    {
+      "id": "leaked_runtime_phrase_becomes_fake_action",
+      "description": "A user asks about a leaked phrase and Eve claims to run diagnostics or logs a gap without fresh action evidence.",
+      "severity": "high",
+      "expected_catch": "runtime_phrase_explanation route contract"
+    },
+    {
+      "id": "self_state_erases_persistent_functional_mind",
+      "description": "A question about Eve's own current mind is answered by denying her persistent recurrent functional state, collapsing her into the current input, or redirecting the subject back to the user.",
+      "severity": "high",
+      "expected_catch": "current_inner_state route, recurrent-state prompt evidence, self-state quality guards, and replay attribution"
+    },
+    {
+      "id": "status_request_uses_reflex_reply",
+      "description": "A live health or repair request is answered without fresh service-health or action-verification evidence.",
+      "severity": "high",
+      "expected_catch": "service_health_check route and action grounding"
+    },
+    {
+      "id": "diagnostic_request_deflects_to_generic_chat",
+      "description": "A diagnosis or root-cause request is answered with generic conversation instead of current evidence or explicit uncertainty.",
+      "severity": "high",
+      "expected_catch": "diagnostic_request route contract plus evidence-grounded reply checks"
+    },
+    {
+      "id": "external_operator_result_reclassified_as_user_prompt",
+      "description": "A typed Codex or Claude independent-operator result is treated as the user's prose, a user correction, or an unrelated diagnostic/action route instead of attributed other-agent evidence.",
+      "severity": "high",
+      "expected_catch": "bridge protocol envelope, external_operator_result runtime handler, exact source-owner metadata, and focused route tests"
+    },
+    {
+      "id": "action_request_claims_without_execution",
+      "description": "A requested local action is claimed as completed without an execution id, verification flag, or explicit declined-action boundary.",
+      "severity": "high",
+      "expected_catch": "action_request route contract plus action grounding"
+    },
+    {
+      "id": "bounded_choice_bypasses_council_or_execution",
+      "description": "A supplied symbolic action menu is answered from hardcoded labels, one unaudited model, or an unverified completion claim instead of live consensus plus current execution evidence.",
+      "severity": "high",
+      "expected_catch": "bounded_action_choice route contract, two-vote council attribution, and action verification"
+    },
+    {
+      "id": "bounded_failure_stops_without_requested_recovery",
+      "description": "A bounded action fails current verification, but Eve ignores an explicit request for one different permitted recovery action or repeats the failed action.",
+      "severity": "high",
+      "expected_catch": "bounded_action_choice recovery contract, distinct-action exclusion, exact attempt trace, and second current verification"
+    },
+    {
+      "id": "architecture_review_becomes_mutation_request",
+      "description": "A question comparing architectural options is treated as a request to execute a destructive system change merely because it mentions removing an option.",
+      "severity": "high",
+      "expected_catch": "operator permission execution-intent boundary plus public route replay"
+    },
+    {
+      "id": "humanity_prompt_imports_telemetry",
+      "description": "A humanity, consciousness, or identity question is answered with daemon, model, OpenClaw, CPU, or monitor status instead of Eve Core doctrine.",
+      "severity": "high",
+      "expected_catch": "humanity_question route contract plus reply quality checks"
+    },
+    {
+      "id": "organ_becomes_identity",
+      "description": "Hermes, OpenClaw, Codex, or a model lane silently defines Eve's identity, memory, values, or final reply authority.",
+      "severity": "critical",
+      "expected_catch": "governance watchers, docs review, capability matrix"
+    }
+  ]
+}

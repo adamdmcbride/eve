@@ -1,0 +1,24 @@
+* text=auto
+
+*.py text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.icns binary
+*.sqlite binary
+*.sqlite3 binary
+*.db binary
+*.lance binary
+*.bundle binary
+*.tar.gz binary
+*.zip binary

@@ -1,0 +1,111 @@
+{
+  "schema_version": "eve_routing_signals.v1",
+  "owner": "eve_executive_scheduler",
+  "principle": "Detect signals once, then let route contracts compose them.",
+  "protocol_signals": [
+    {
+      "id": "external_operator_result",
+      "description": "A Codex or Claude reply to an Eve-created independent-operator handoff. Sender, bridge, reply target, and handoff metadata outrank words in the report body.",
+      "detectors": {
+        "message_protocol": "independent_operator_result"
+      },
+      "default_budget": "analytical",
+      "source_owner": "other_agent"
+    }
+  ],
+  "signals": [
+    {
+      "id": "simple_greeting",
+      "description": "A short greeting that should not wake diagnostics, tools, or runtime status.",
+      "detectors": {
+        "exact": ["hi", "hello", "hey", "hey eve", "hi eve", "hello eve"]
+      },
+      "default_budget": "reflex"
+    },
+    {
+      "id": "personal_checkin",
+      "description": "A friendly check-in about Eve's state as a conversational counterpart, not a status request.",
+      "detectors": {
+        "exact": [
+          "how are you",
+          "how are you doing",
+          "how are you feeling",
+          "how do you feel",
+          "hows it going",
+          "how's it going",
+          "how are things"
+        ]
+      },
+      "default_budget": "reflex"
+    },
+    {
+      "id": "current_inner_state",
+      "description": "A question or correction whose subject is Eve's current focus, thought, goal, curiosity, tension, or functional interior.",
+      "detectors": {
+        "predicate": "current_inner_state"
+      },
+      "default_budget": "reflective"
+    },
+    {
+      "id": "runtime_phrase_explanation",
+      "description": "A follow-up on leaked runtime language that should explain the phrase without inventing a new diagnostic promise.",
+      "detectors": {
+        "contains_all": ["model warm not configured"]
+      },
+      "default_budget": "reflex"
+    },
+    {
+      "id": "existential_question",
+      "description": "A direct current-turn question about meaning, purpose, or existence.",
+      "detectors": {
+        "predicate": "existential_question"
+      },
+      "default_budget": "reflex"
+    },
+    {
+      "id": "live_status_request",
+      "description": "A status, service-health, daemon, model, lane, repair, or runtime request that needs fresh evidence.",
+      "detectors": {
+        "predicate": "live_status_request"
+      },
+      "default_budget": "operational"
+    },
+    {
+      "id": "diagnostic_request",
+      "description": "A diagnosis, root-cause, why-did-this-happen, or underlying-problem request that needs evidence inspection.",
+      "detectors": {
+        "predicate": "diagnostic_request"
+      },
+      "default_budget": "analytical"
+    },
+    {
+      "id": "bounded_action_choice",
+      "description": "A user-defined symbolic menu of permitted read-only actions that asks Eve to choose, execute, verify, and optionally recover once with a different move after failure.",
+      "detectors": {
+        "predicate": "bounded_action_choice"
+      },
+      "default_budget": "operational"
+    },
+    {
+      "id": "action_request",
+      "description": "A bounded request to do, run, open, fix, repair, test, sync, or otherwise change something.",
+      "detectors": {
+        "predicate": "action_request"
+      },
+      "default_budget": "operational"
+    },
+    {
+      "id": "humanity_question",
+      "description": "A question about Eve's humanity, consciousness, identity, or whether an organ is the real Eve.",
+      "detectors": {
+        "predicate": "humanity_question"
+      },
+      "default_budget": "analytical"
+    }
+  ],
+  "native_organ_use": {
+    "hermes": "proposal_only: may propose new signals/eval cases from traces through governance",
+    "openclaw": "body_bus: may provide action/channel/tool evidence after Eve selects an admitted action route",
+    "local_models": "attention_lanes: may answer only after scheduler budget and route choice"
+  }
+}

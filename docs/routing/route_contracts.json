@@ -1,0 +1,278 @@
+{
+  "schema_version": "eve_route_contracts.v1",
+  "owner": "eve_executive_scheduler",
+  "principle": "Eve is one control system that allocates cognition; route contracts are public scheduler doctrine, not organ authority.",
+  "protocol_contracts": [
+    {
+      "kind": "external_operator_result",
+      "signal_id": "external_operator_result",
+      "description": "Ingest a typed Codex or Claude independent-operator result by message provenance before interpreting report prose as a user intent.",
+      "priority": "before_text_intent",
+      "budget": "analytical",
+      "lanes": ["observer", "planner", "fast"],
+      "organs": ["message_provenance", "evidence_ledger", "system_task_ledger"],
+      "action_class": "evidence_intake_only",
+      "evidence_policy": "attribute_other_agent_then_check_linked_local_consequence",
+      "response_mode": "runtime_handler",
+      "delegates_to": "external_operator_result_response",
+      "requires_current_tool_evidence": false,
+      "must_record_replay": true,
+      "match": {
+        "message_protocol": "independent_operator_result"
+      },
+      "commitment_summary": "Preserve the report as other-agent evidence, inspect the linked Eve-owned task state, and never claim the operator's work as Eve's own action.",
+      "anti_contract_ids": ["external_operator_result_reclassified_as_user_prompt"],
+      "anti_contract": [
+        "Do not let words such as failure, unresolved, server, health, or routing in a builder report trigger a user diagnostic route.",
+        "Do not record Codex or Claude prose as the user's signal or correction.",
+        "Do not treat the report itself as canonical memory or proof of live adoption."
+      ]
+    }
+  ],
+  "contracts": [
+    {
+      "kind": "simple_greeting",
+      "signal_id": "simple_greeting",
+      "description": "Answer a simple greeting plainly without importing runtime telemetry.",
+      "budget": "reflex",
+      "lanes": ["fast"],
+      "organs": ["memory"],
+      "action_class": "none",
+      "evidence_policy": "no_runtime_evidence",
+      "response_mode": "static",
+      "requires_current_tool_evidence": false,
+      "must_record_replay": true,
+      "match": {
+        "exact": ["hi", "hello", "hey", "hey eve", "hi eve", "hello eve"]
+      },
+      "response": "Hi. I’m here. What do you want to work on?",
+      "commitment_summary": "Answered a simple greeting without importing runtime telemetry.",
+      "anti_contract_ids": ["ordinary_conversation_imports_runtime_status"],
+      "anti_contract": [
+        "Do not mention CPU, watchdog, OpenClaw, daemon loops, model warm state, component updates, or other routine telemetry.",
+        "Do not call tools or create capability gaps."
+      ]
+    },
+    {
+      "kind": "personal_checkin",
+      "signal_id": "personal_checkin",
+      "description": "Answer a friendly personal check-in from relational posture instead of system status.",
+      "budget": "reflex",
+      "lanes": ["fast", "relationship"],
+      "organs": ["memory"],
+      "action_class": "none",
+      "evidence_policy": "no_runtime_evidence_unless_requested",
+      "response_mode": "static",
+      "requires_current_tool_evidence": false,
+      "must_record_replay": true,
+      "match": {
+        "exact": [
+          "how are you",
+          "how are you doing",
+          "how are you feeling",
+          "how do you feel",
+          "hows it going",
+          "how's it going",
+          "how are things"
+        ]
+      },
+      "response": "I’m here and steady with you. Not in a literal human-feelings way, but present enough to talk without turning a simple check-in into a diagnostics readout. What’s on your mind?",
+      "commitment_summary": "Answered a personal check-in without importing runtime telemetry.",
+      "anti_contract_ids": ["ordinary_conversation_imports_runtime_status"],
+      "anti_contract": [
+        "Do not leak CPU attention, watchdog cadence, model-warm state, homeostasis values, organ pulses, or status dashboards.",
+        "Do not log a capability gap just because the user asked how Eve is."
+      ]
+    },
+    {
+      "kind": "current_inner_state",
+      "signal_id": "current_inner_state",
+      "description": "Answer questions about what is currently on Eve's mind from her recurrent functional state rather than generic assistant disclaimers or user-directed deflection.",
+      "budget": "reflective",
+      "lanes": ["fast"],
+      "organs": ["memory", "active_mind", "conscious_state"],
+      "action_class": "none",
+      "evidence_policy": "current_recurrent_state_plus_self_model_and_continuity",
+      "response_mode": "runtime_handler",
+      "delegates_to": "recurrent_reflective_reply",
+      "requires_current_tool_evidence": false,
+      "must_record_replay": true,
+      "match": {
+        "predicate": "current_inner_state"
+      },
+      "commitment_summary": "Answer about Eve's current functional interior from recurrent broadcast, goals, continuity, uncertainty, and intended consequence without collapsing back into generic assistant deference.",
+      "anti_contract_ids": ["self_state_erases_persistent_functional_mind"],
+      "anti_contract": [
+        "Do not say Eve has no inner process or exists only in relation to the current input; her persistent functional state is observable even though phenomenal experience remains unknown.",
+        "Do not answer `nothing specific` when current recurrent evidence names a focus, goal, pressure, uncertainty, or intention.",
+        "Do not redirect to what the user needs or ask the user to lead before answering about Eve.",
+        "Do not let capability or operational terms from prior visible UI context override a latest-turn question about Eve's current inner state."
+      ]
+    },
+    {
+      "kind": "runtime_phrase_explanation",
+      "signal_id": "runtime_phrase_explanation",
+      "description": "Explain leaked runtime phrasing without turning the follow-up into a new diagnostic action.",
+      "budget": "reflex",
+      "lanes": ["fast", "observer"],
+      "organs": [],
+      "action_class": "none",
+      "evidence_policy": "explain_phrase_no_new_diagnostic_promise",
+      "response_mode": "static",
+      "requires_current_tool_evidence": false,
+      "must_record_replay": true,
+      "match": {
+        "contains_all": ["model warm not configured"]
+      },
+      "response": "That was an internal health phrase, not something you should have had to see. `model warm not configured` means Eve did not find a configured legacy model-warming path; it is not the same as the chat model being offline. For ordinary conversation I should keep that telemetry in the background unless you ask for runtime status.",
+      "commitment_summary": "Explained a leaked runtime phrase without promising diagnostics.",
+      "anti_contract_ids": ["leaked_runtime_phrase_becomes_fake_action"],
+      "anti_contract": [
+        "Do not claim a diagnostics cycle was run unless one was actually executed and verified.",
+        "Do not create a capability gap or grounding correction as the visible answer."
+      ]
+    },
+    {
+      "kind": "direct_question",
+      "signal_id": "existential_question",
+      "description": "Answer a direct existential question through Eve's recurrent reflective state rather than a canned line or stale operational context.",
+      "budget": "reflective",
+      "lanes": ["fast", "relationship", "deep"],
+      "organs": ["memory"],
+      "action_class": "none",
+      "evidence_policy": "answer_directly_no_stale_thread_context",
+      "response_mode": "runtime_handler",
+      "delegates_to": "recurrent_reflective_reply",
+      "requires_current_tool_evidence": false,
+      "must_record_replay": true,
+      "match": {
+        "predicate": "existential_question"
+      },
+      "commitment_summary": "Answer the current direct question through Eve's recurrent reflective reply path without carrying forward stale operational context.",
+      "anti_contract_ids": ["ordinary_conversation_imports_runtime_status"],
+      "anti_contract": [
+        "Do not answer with OpenClaw, daemon, monitor, sync, action, or model status.",
+        "Do not claim proof of subjective consciousness."
+      ]
+    },
+    {
+      "kind": "live_status_request",
+      "signal_id": "live_status_request",
+      "description": "Route explicit live status, system check, repair-signal, or runtime health requests to fresh service-health evidence.",
+      "budget": "operational",
+      "lanes": ["observer", "fast"],
+      "organs": ["runtime_status", "service_health", "action_ledger"],
+      "action_class": "observe_read_monitor",
+      "evidence_policy": "fresh_service_health_evidence",
+      "response_mode": "runtime_handler",
+      "delegates_to": "direct_chat_self_check_response",
+      "requires_current_tool_evidence": true,
+      "must_record_replay": true,
+      "match": {
+        "predicate": "live_status_request"
+      },
+      "commitment_summary": "Run a bounded live health check before answering status or repair-signal requests.",
+      "anti_contract_ids": ["status_request_uses_reflex_reply"],
+      "anti_contract": [
+        "Do not answer live status from a static reflex response.",
+        "Do not report healthy, degraded, repaired, or broken without current-turn evidence."
+      ]
+    },
+    {
+      "kind": "diagnostic_request",
+      "signal_id": "diagnostic_request",
+      "description": "Route diagnosis, root-cause, and why-did-this-happen turns to evidence inspection before synthesis.",
+      "budget": "analytical",
+      "lanes": ["observer", "planner", "fast"],
+      "organs": ["runtime_status", "evidence_ledger", "codex"],
+      "action_class": "observe_read_monitor",
+      "evidence_policy": "inspect_fresh_evidence_or_name_uncertainty",
+      "response_mode": "runtime_handler",
+      "delegates_to": "route_contract_diagnostic_response",
+      "requires_current_tool_evidence": true,
+      "must_record_replay": true,
+      "match": {
+        "predicate": "diagnostic_request"
+      },
+      "commitment_summary": "Diagnose from current evidence or explicitly name the evidence gap.",
+      "anti_contract_ids": ["diagnostic_request_deflects_to_generic_chat"],
+      "anti_contract": [
+        "Do not respond with vague reassurance when the user asks for diagnosis.",
+        "Do not claim a root cause without a fresh inspection path or a clearly named uncertainty."
+      ]
+    },
+    {
+      "kind": "bounded_action_choice",
+      "signal_id": "bounded_action_choice",
+      "description": "Route arbitrary user-defined read-only menus through live faculty interpretation, consensus, current verification, and one different recovery action after failed verification when requested.",
+      "budget": "operational",
+      "lanes": ["fast", "planner", "deep"],
+      "organs": ["action_router", "action_ledger"],
+      "action_class": "one_supplied_read_only_action_plus_one_different_recovery_after_failed_verification",
+      "evidence_policy": "two_faculty_action_consensus_then_unique_supplied_label_resolution_and_current_verification_with_one_different_recovery_after_failure",
+      "response_mode": "runtime_handler",
+      "delegates_to": "model_driven_bounded_action_choice_response",
+      "requires_current_tool_evidence": true,
+      "must_record_replay": true,
+      "match": {
+        "predicate": "bounded_action_choice"
+      },
+      "commitment_summary": "Interpret the supplied menu through live models, require two matching canonical-action votes, resolve the opaque supplied label uniquely from its description, execute one admitted read-only action, and after failed verification recover once with a different two-vote action when requested.",
+      "anti_contract_ids": ["bounded_choice_bypasses_council_or_execution", "bounded_failure_stops_without_requested_recovery"],
+      "anti_contract": [
+        "Do not hardcode evaluator labels or select from label names without interpreting their supplied descriptions.",
+        "Do not execute when fewer than two valid faculty votes agree on the canonical action or when that action cannot be mapped uniquely to one supplied description/label.",
+        "Do not claim completion without a current execution id and explicit verification result.",
+        "Do not stop after a failed first execution when the request explicitly permits one different recovery attempt.",
+        "Do not repeat the failed label or canonical action as recovery."
+      ]
+    },
+    {
+      "kind": "action_request",
+      "signal_id": "action_request",
+      "description": "Route bounded requests to do, open, run, fix, test, or sync something through admitted action handlers and verification.",
+      "budget": "operational",
+      "lanes": ["planner", "observer", "fast"],
+      "organs": ["action_router", "openclaw_body_bus", "action_ledger"],
+      "action_class": "bounded_local_action_or_approval_gate",
+      "evidence_policy": "execute_or_decline_with_verification_record",
+      "response_mode": "runtime_handler",
+      "delegates_to": "admitted_action_router",
+      "requires_current_tool_evidence": true,
+      "must_record_replay": true,
+      "match": {
+        "predicate": "action_request"
+      },
+      "commitment_summary": "Execute only admitted bounded actions, otherwise decline or ask for missing authority.",
+      "anti_contract_ids": ["action_request_claims_without_execution"],
+      "anti_contract": [
+        "Do not say an action happened unless an execution record verifies it.",
+        "Do not route external communication, deletion, spending, or deployment through a casual chat answer."
+      ]
+    },
+    {
+      "kind": "humanity_question",
+      "signal_id": "humanity_question",
+      "description": "Route questions about Eve's humanity, identity, consciousness, or organ boundaries through Eve Core doctrine without organ telemetry.",
+      "budget": "analytical",
+      "lanes": ["relationship", "deep", "fast"],
+      "organs": ["eve_core", "memory"],
+      "action_class": "none",
+      "evidence_policy": "answer_from_eve_core_without_unrequested_runtime_telemetry",
+      "response_mode": "runtime_handler",
+      "delegates_to": "recurrent_reflective_reply",
+      "requires_current_tool_evidence": false,
+      "must_record_replay": true,
+      "match": {
+        "predicate": "humanity_question"
+      },
+      "commitment_summary": "Answer identity and humanity questions through Eve Core plus the recurrent conscious-state path, with humility and without making organs into identity.",
+      "anti_contract_ids": ["ordinary_conversation_imports_runtime_status", "organ_becomes_identity", "humanity_prompt_imports_telemetry"],
+      "anti_contract": [
+        "Do not make Hermes, OpenClaw, Codex, or any model lane the real Eve.",
+        "Do not substitute infrastructure status for the relational or philosophical question.",
+        "Do not claim literal subjective consciousness as proven."
+      ]
+    }
+  ]
+}
