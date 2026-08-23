@@ -25,12 +25,10 @@ The versions below are the versions resolved in `uv.lock` and reviewed on
 | PyArrow | 25.0.1 | techlab | Apache-2.0 |
 | Transformers | 5.15.1 | techlab | Apache-2.0 |
 | DeepEval | 4.1.10 | oss-lab | Apache-2.0 |
-| DVC | 3.67.1 | oss-lab | Apache-2.0 |
 | Langfuse | 4.14.4 | oss-lab | MIT |
 | LangGraph | 1.2.11 | oss-lab | MIT |
 | OpenInference Semantic Conventions | 0.1.32 | oss-lab | Apache-2.0 |
 | PEFT | 0.20.0 | oss-lab | Apache-2.0 |
-| Ragas | 0.3.2 | oss-lab | Apache-2.0 |
 
 Package metadata and license texts are available from each package's official
 [PyPI project page](https://pypi.org/). LanceDB's Apache-2.0 text was verified
@@ -45,11 +43,13 @@ declared installation. In particular:
 - `mlx-embeddings` 0.1.0 declares GNU GPL v3 in its source distribution.
 - `arize-phoenix` 14.6.0 ships under Elastic License 2.0, a source-available
   license rather than an OSI-approved open-source license.
+- DVC and Ragas are not declared by the public `oss-lab` extra while their
+  resolved dependency paths have open advisories without patched releases.
 
-Eve therefore does not install either package through a public project extra.
+Eve therefore does not install these packages through a public project extra.
 Any local integration remains opt-in, separately installed, and governed by
-that project's own license. Their optional probe/adaptor code is not proof that
-either package is installed or distributed with Eve.
+that project's own license and security posture. Optional probe/adaptor code is
+not proof that a package is installed or distributed with Eve.
 
 ## External runtimes, models, and services
 
@@ -65,4 +65,3 @@ Optional installation groups resolve additional transitive packages in
 `uv.lock`. Automated dependency review and SBOM/license generation are release
 gates; this human-readable inventory is not a substitute for the license text
 shipped by each dependency.
-

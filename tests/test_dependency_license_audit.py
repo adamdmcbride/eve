@@ -17,8 +17,14 @@ class DependencyLicenseAuditTests(unittest.TestCase):
     def test_repository_direct_dependency_inventory_is_complete(self):
         result = audit_module.audit(ROOT)
         self.assertTrue(result["ok"], result["findings"])
-        self.assertEqual(19, result["direct_dependency_count"])
+        self.assertEqual(17, result["direct_dependency_count"])
         self.assertEqual(0, result["warning_count"])
+        project = audit_module.tomllib.loads(
+            (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        )["project"]
+        declared = audit_module.declared_dependencies(project)
+        self.assertNotIn("dvc", declared)
+        self.assertNotIn("ragas", declared)
 
     def test_missing_notice_and_forbidden_dependency_block_release(self):
         with tempfile.TemporaryDirectory() as directory:

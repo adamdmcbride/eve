@@ -69,7 +69,7 @@ honestly marking optional learned artifacts unavailable.
 ## License and provenance result
 
 - Eve's original source is Apache-2.0.
-- The notice inventory covers all 19 declared direct dependencies at their
+- The notice inventory covers all 17 declared direct dependencies at their
   locked versions.
 - `bin/eve_dependency_license_audit.py` reports zero direct-dependency errors
   and zero warnings.
@@ -103,7 +103,7 @@ Observed passing checks include:
 - 207 capability-intelligence, topology, OpenClaw, bootstrap, and runtime
   contracts;
 - 37 specialist-substrate contracts, including strict Hermes JSON behavior;
-- direct dependency inventory: 19 dependencies, 0 errors, 0 warnings;
+- direct dependency inventory: 17 dependencies, 0 errors, 0 warnings;
 - `uv lock --check`;
 - OpenClaw template JSON validation and shell syntax checks;
 - public candidate audit: 0 errors.

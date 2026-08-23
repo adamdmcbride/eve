@@ -46,12 +46,16 @@ tree by this audit.
 
 - `mlx-embeddings` was removed from the `techlab` extra.
 - `arize-phoenix` was removed from the `oss-lab` extra.
+- DVC and Ragas were removed from the public `oss-lab` extra after the initial
+  GitHub dependency graph exposed open advisories with no patched release for
+  their affected dependency paths. Their optional probes remain fail-closed
+  and user-managed rather than installing a knowingly vulnerable graph.
 - `public_release.json` lists both as forbidden declared dependencies.
 - The release audit fails if either dependency is reintroduced into
   `pyproject.toml`.
 - Existing optional integration probes remain non-authoritative and can report
   a separately installed local component.
-- Deterministic direct-dependency gate: 19 declared dependencies, zero errors,
+- Deterministic direct-dependency gate: 17 declared dependencies, zero errors,
   zero warnings.
 
 ## Remaining gate

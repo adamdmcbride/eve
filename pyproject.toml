@@ -9,12 +9,12 @@ authors = [
 ]
 requires-python = ">=3.12,<3.15"
 dependencies = [
-  "py-trees>=2.3.0",
+  "py-trees==2.4.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "pytest>=8.0",
+  "pytest==9.0.3",
 ]
 infra = [
   "dagster>=1.13.19",
@@ -32,12 +32,10 @@ techlab = [
 ]
 oss-lab = [
   "deepeval>=4.1.10",
-  "dvc>=3.60.0",
   "langfuse>=4.14.4",
   "langgraph>=1.2.11",
   "openinference-semantic-conventions>=0.1.32",
   "peft>=0.20.0",
-  "ragas>=0.3.2",
 ]
 
 [tool.uv]
