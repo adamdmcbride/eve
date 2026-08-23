@@ -145,6 +145,7 @@ class EvePlatformTests(unittest.TestCase):
                 self.assertTrue(lane["RunAtLoad"])
                 self.assertTrue(lane["KeepAlive"])
 
+    @unittest.skipUnless(Path("/bin/zsh").is_file(), "requires macOS /bin/zsh")
     def test_llama_cpp_launcher_prefers_synced_runtime_config(self):
         script = Path(__file__).resolve().parents[1] / "bin" / "start_llama_cpp_server.sh"
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -139,6 +139,7 @@ class ModelTopologyContractTests(unittest.TestCase):
             contract,
         )
 
+    @unittest.skipUnless(Path("/bin/zsh").is_file(), "requires macOS /bin/zsh")
     def test_launcher_refuses_inactive_duplicate_profile(self):
         script = ROOT / "bin" / "start_llama_cpp_server.sh"
         with tempfile.TemporaryDirectory() as temp_dir:
