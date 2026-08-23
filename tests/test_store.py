@@ -1,4 +1,5 @@
 import json
+import stat
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -24,6 +25,14 @@ class EveStoreTests(unittest.TestCase):
             raw = path.read_text(encoding="utf-8")
             self.assertTrue(raw.endswith("\n"))
             self.assertEqual({"name": "Eve", "ready": True}, json.loads(raw))
+            self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
+
+    def test_append_jsonl_record_keeps_owner_only_permissions(self):
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "events.jsonl"
+            eve_store.append_jsonl_record(path, {"kind": "note"})
+
+            self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
 
     def test_file_lock_removes_zero_byte_dataless_placeholder(self):
         with TemporaryDirectory() as temp_dir:
@@ -37,10 +46,10 @@ class EveStoreTests(unittest.TestCase):
 
             original_stat = Path.stat
 
-            def fake_stat(candidate):
+            def fake_stat(candidate, *args, **kwargs):
                 if candidate == lock_path:
                     return DatalessStat()
-                return original_stat(candidate)
+                return original_stat(candidate, *args, **kwargs)
 
             with unittest.mock.patch.object(Path, "stat", fake_stat):
                 with eve_store.file_lock(path):

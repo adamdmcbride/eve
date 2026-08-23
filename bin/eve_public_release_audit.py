@@ -246,25 +246,9 @@ def mask_owner_identifier_exemptions(path: str, data: bytes, config: Dict[str, A
     return masked
 
 
-def scan_candidate(root: Path, path: str, config: Dict[str, Any]) -> List[Dict[str, Any]]:
-    full_path = root / path
+def scan_candidate_data(path: str, data: bytes, config: Dict[str, Any]) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
-    if full_path.is_symlink():
-        results.append(
-            finding(
-                "public.symlink_not_allowed",
-                "error",
-                "Public exports do not follow symlinks; replace this with an owned file.",
-                path=path,
-            )
-        )
-        return results
-    try:
-        size = full_path.stat().st_size
-        data = full_path.read_bytes()
-    except OSError as exc:
-        results.append(finding("public.file_unreadable", "error", str(exc), path=path))
-        return results
+    size = len(data)
     if size > config["max_file_bytes"]:
         results.append(
             finding(
@@ -370,6 +354,27 @@ def scan_candidate(root: Path, path: str, config: Dict[str, Any]) -> List[Dict[s
             if owner_item:
                 results.append(owner_item)
     return results
+
+
+def scan_candidate(root: Path, path: str, config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    full_path = root / path
+    results: List[Dict[str, Any]] = []
+    if full_path.is_symlink():
+        results.append(
+            finding(
+                "public.symlink_not_allowed",
+                "error",
+                "Public exports do not follow symlinks; replace this with an owned file.",
+                path=path,
+            )
+        )
+        return results
+    try:
+        data = full_path.read_bytes()
+    except OSError as exc:
+        results.append(finding("public.file_unreadable", "error", str(exc), path=path))
+        return results
+    return results + scan_candidate_data(path, data, config)
 
 
 def pyproject_findings(

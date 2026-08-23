@@ -1232,13 +1232,52 @@ def frontend_roots(app_root: Path) -> list[Path]:
     return [root for root in roots if (root / "index.html").exists()]
 
 
+def replace_followup_script_tags(html: str) -> tuple[str, int]:
+    """Replace owned follow-up script elements without using an HTML filter regex."""
+    lowered = html.lower()
+    pieces: list[str] = []
+    copied_through = 0
+    cursor = 0
+    replaced = 0
+    while True:
+        start = lowered.find("<script", cursor)
+        if start < 0:
+            break
+        name_end = start + len("<script")
+        if name_end < len(lowered) and lowered[name_end] not in {" ", "\t", "\r", "\n", ">"}:
+            cursor = name_end
+            continue
+        opening_end = lowered.find(">", name_end)
+        if opening_end < 0:
+            break
+        opening_tag = lowered[start : opening_end + 1]
+        if "data-eve-chat-followups" not in opening_tag and "eve-chat-followups.js" not in opening_tag:
+            cursor = opening_end + 1
+            continue
+        closing_start = lowered.find("</script", opening_end + 1)
+        if closing_start < 0:
+            break
+        closing_name_end = closing_start + len("</script")
+        if closing_name_end < len(lowered) and lowered[closing_name_end] not in {" ", "\t", "\r", "\n", ">"}:
+            cursor = closing_name_end
+            continue
+        closing_end = lowered.find(">", closing_name_end)
+        if closing_end < 0:
+            break
+        pieces.append(html[copied_through:start])
+        pieces.append(FOLLOWUP_SCRIPT_TAG)
+        copied_through = closing_end + 1
+        cursor = copied_through
+        replaced += 1
+    if not replaced:
+        return html, 0
+    pieces.append(html[copied_through:])
+    return "".join(pieces), replaced
+
+
 def install_followup_overlay(app_root: Path) -> dict[str, int]:
     scripts_written = 0
     index_changed = 0
-    script_tag_pattern = re.compile(
-        r'<script\b(?=[^>]*(?:data-eve-chat-followups|eve-chat-followups\.js))[^>]*></script>',
-        re.IGNORECASE,
-    )
     for root in frontend_roots(app_root):
         script_path = root / FOLLOWUP_SCRIPT_NAME
         old_script = script_path.read_text(encoding="utf-8") if script_path.exists() else ""
@@ -1248,7 +1287,7 @@ def install_followup_overlay(app_root: Path) -> dict[str, int]:
 
         index_path = root / "index.html"
         html = index_path.read_text(encoding="utf-8", errors="ignore")
-        html, replaced = script_tag_pattern.subn(FOLLOWUP_SCRIPT_TAG, html)
+        html, replaced = replace_followup_script_tags(html)
         if replaced:
             index_path.write_text(html, encoding="utf-8")
             index_changed += 1

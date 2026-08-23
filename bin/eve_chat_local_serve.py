@@ -10,7 +10,6 @@ import importlib.util
 import os
 import signal
 import sys
-import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -19,6 +18,17 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from eve_chat_brand_scrub import apply_branding  # noqa: E402
+
+
+def proxy_error_event_bytes() -> bytes:
+    """Return a stable public error without exposing backend exception detail."""
+    event = {
+        "type": "ERROR",
+        "error": "The local Eve chat backend is unavailable.",
+        "code": "backend_unavailable",
+        "source": "eve_chat_ui_proxy",
+    }
+    return f"data: {json.dumps(event)}\n\n".encode("utf-8")
 
 
 def site_packages_root() -> Path:
@@ -166,14 +176,8 @@ def install_eve_chat_followup_routes() -> None:
                         if not chunk:
                             break
                         yield chunk
-            except Exception as exc:
-                message = str(exc.reason if isinstance(exc, urllib.error.URLError) else exc)
-                event = {
-                    "type": "ERROR",
-                    "error": message,
-                    "source": "eve_chat_ui_proxy",
-                }
-                yield f"data: {json.dumps(event)}\n\n".encode("utf-8")
+            except Exception:
+                yield proxy_error_event_bytes()
 
         return StreamingResponse(stream_backend(), media_type="text/event-stream")
 

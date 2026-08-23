@@ -172,16 +172,16 @@ class PublicReleaseAuditTests(unittest.TestCase):
         )
 
     def test_secret_values_are_never_returned_in_findings(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = self.make_public_root(tmp)
-            secret = "gh" + "p_" + "abcdefghijklmnopqrstuvwxyz1234567890"
-            (root / "app.py").write_text("TOKEN = %r\n" % secret, encoding="utf-8")
-            report = eve_public_release_audit.audit_repository(
-                root,
-                config(),
-                known_paths={"README.md", "LICENSE", "pyproject.toml", "app.py"},
-                include_git_posture=False,
-            )
+        secret = "gh" + "p_" + "abcdefghijklmnopqrstuvwxyz1234567890"
+        findings = eve_public_release_audit.scan_candidate_data(
+            "app.py",
+            ("TOKEN = %r\n" % secret).encode("utf-8"),
+            config(),
+        )
+        report = {
+            "ok": not any(item["severity"] == "error" for item in findings),
+            "findings": findings,
+        }
 
         serialized = json.dumps(report)
         self.assertFalse(report["ok"])

@@ -40,3 +40,18 @@ coordinate remediation privately, and credit reporters who want attribution.
 
 Local-only deployment reduces exposure; it does not remove the need for these
 controls.
+
+## Local data at rest
+
+Eve's continuity store contains conversations, evidence, and runtime state in
+local plaintext files. The store creates and replaces those files with
+owner-only permissions (`0600`), but it is **not** a credential vault and does
+not provide application-level encryption at rest. Do not put passwords, API
+keys, access tokens, recovery codes, or other credentials into Eve's prompts,
+configuration, logs, or state files. Use the operating system keychain or the
+secret facility owned by an admitted integration instead.
+
+Full-disk encryption and a locked user session provide additional host-level
+protection but do not change this application boundary. Application-level
+encrypted continuity is future work and must include migration, recovery, and
+data-loss tests before it can replace the current format.

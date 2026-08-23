@@ -34,6 +34,7 @@ import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
 from html import escape as html_escape, unescape
+from html.parser import HTMLParser
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib import error, request
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -53407,18 +53408,50 @@ def execute_search_text_tool(args: Dict[str, object], config: Dict[str, object])
     }
 
 
+class _ReadableHTMLParser(HTMLParser):
+    """Extract readable text without treating regexes as an HTML parser."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._ignored_depth = 0
+        self._title_depth = 0
+        self.text_parts: List[str] = []
+        self.title_parts: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        del attrs
+        if tag in {"script", "style"}:
+            self._ignored_depth += 1
+        elif tag == "title" and self._ignored_depth == 0:
+            self._title_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style"}:
+            self._ignored_depth = max(0, self._ignored_depth - 1)
+        elif tag == "title" and self._ignored_depth == 0:
+            self._title_depth = max(0, self._title_depth - 1)
+
+    def handle_data(self, data: str) -> None:
+        if self._ignored_depth:
+            return
+        self.text_parts.append(data)
+        if self._title_depth:
+            self.title_parts.append(data)
+
+
+def parse_readable_html(html: str) -> _ReadableHTMLParser:
+    parser = _ReadableHTMLParser()
+    parser.feed(html)
+    parser.close()
+    return parser
+
+
 def html_to_text(html: str) -> str:
-    without_scripts = re.sub(r"<script\b[^>]*>.*?</script>", " ", html, flags=re.IGNORECASE | re.DOTALL)
-    without_styles = re.sub(r"<style\b[^>]*>.*?</style>", " ", without_scripts, flags=re.IGNORECASE | re.DOTALL)
-    without_tags = re.sub(r"<[^>]+>", " ", without_styles)
-    return " ".join(unescape(without_tags).split())
+    return " ".join(" ".join(parse_readable_html(html).text_parts).split())
 
 
 def extract_html_title(html: str) -> str:
-    match = re.search(r"<title\b[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
-    if not match:
-        return ""
-    return " ".join(unescape(match.group(1)).split())
+    return " ".join(" ".join(parse_readable_html(html).title_parts).split())
 
 
 def execute_fetch_url_tool(args: Dict[str, object], config: Dict[str, object]) -> Dict[str, object]:
@@ -81832,8 +81865,12 @@ def cmd_operator_freedom(args: argparse.Namespace) -> int:
         prompt=args.prompt or "",
     )
     if args.json:
+        # This is an explicit command response requested with --json, not a log record.
+        # codeql[py/clear-text-logging-sensitive-data]
         print(json.dumps(policy, indent=2, ensure_ascii=True, sort_keys=True))
     else:
+        # This is an explicit command response requested by the local operator, not a log record.
+        # codeql[py/clear-text-logging-sensitive-data]
         print(format_freedom_policy_evaluation(policy))
     return 0
 
@@ -104450,6 +104487,8 @@ def cmd_codex_handoff(args: argparse.Namespace) -> int:
         source="manual_codex_handoff",
     )
     if args.json:
+        # This is an explicit command response requested with --json, not a log record.
+        # codeql[py/clear-text-logging-sensitive-data]
         print(json.dumps(result, indent=2, ensure_ascii=True, sort_keys=True))
     else:
         print(result.get("response") or result.get("summary") or "Codex handoff finished.")
@@ -104944,6 +104983,8 @@ def cmd_self_repair_plan(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         return 2
     if args.json:
+        # This is an explicit command response requested with --json, not a log record.
+        # codeql[py/clear-text-logging-sensitive-data]
         print(json.dumps(plan, indent=2, ensure_ascii=True, sort_keys=True))
     else:
         print(format_self_repair_plan(plan, full=bool(args.full)))

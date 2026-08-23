@@ -98,6 +98,16 @@ EVE_CHAT_FOLLOWUP_WAIT_SLICE_SECONDS = 5.0
 EVE_CHAT_FOLLOWUP_LEASE_SECONDS = 15 * 60
 SENSORY_SESSION_MIN_SECONDS = 30
 SENSORY_SESSION_MAX_SECONDS = 60 * 60
+
+
+def canonical_eve_chat_local_origin(value: object) -> str:
+    """Return a fixed allowlist value rather than reflecting a request header."""
+    origin = str(value or "").strip()
+    if origin == "http://127.0.0.1:3000":
+        return "http://127.0.0.1:3000"
+    if origin == "http://localhost:3000":
+        return "http://localhost:3000"
+    return ""
 SENSORY_SESSION_MAX_BATCHES_PER_10_SECONDS = 10
 SENSORY_SESSION_MAX_EVENTS = 5_000
 SENSORY_SESSION_MAX_ACTIVE = 4
@@ -5589,8 +5599,8 @@ class EveAppHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/eve-chat/followups/") and parsed.path.endswith("/seen"):
             return self.handle_post_eve_chat_followup_seen(parsed)
         if parsed.path == "/api/sensory/session":
-            origin = str(self.headers.get("Origin") or "").strip()
-            if origin not in EVE_CHAT_FOLLOWUP_POLL_ORIGINS:
+            origin = canonical_eve_chat_local_origin(self.headers.get("Origin"))
+            if not origin:
                 return self.send_error_json(
                     HTTPStatus.FORBIDDEN,
                     "Sensory control is restricted to the local Eve app origin.",
@@ -5603,8 +5613,8 @@ class EveAppHandler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": True, "data": self.service.stop_sensory_session(payload)})
             raise ValueError("sensory session action must be start or stop")
         if parsed.path == "/api/sensory/events":
-            origin = str(self.headers.get("Origin") or "").strip()
-            if origin not in EVE_CHAT_FOLLOWUP_POLL_ORIGINS:
+            origin = canonical_eve_chat_local_origin(self.headers.get("Origin"))
+            if not origin:
                 return self.send_error_json(
                     HTTPStatus.FORBIDDEN,
                     "Sensory control is restricted to the local Eve app origin.",
@@ -5669,8 +5679,8 @@ class EveAppHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def send_cors_headers(self) -> None:
-        origin = str(self.headers.get("Origin") or "").strip()
-        if origin in EVE_CHAT_FOLLOWUP_POLL_ORIGINS:
+        origin = canonical_eve_chat_local_origin(self.headers.get("Origin"))
+        if origin:
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Access-Control-Allow-Credentials", "true")
             self.send_header("Vary", "Origin")

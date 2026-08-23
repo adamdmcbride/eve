@@ -27,6 +27,30 @@ class CountingService(eve_web.EveRuntimeService):
         return {"sequence": self.status_builds}
 
 
+class HeaderCapture:
+    def __init__(self, origin: str):
+        self.headers = {"Origin": origin}
+        self.sent = []
+
+    def send_header(self, name: str, value: str) -> None:
+        self.sent.append((name, value))
+
+
+class EveWebSecurityTests(unittest.TestCase):
+    def test_cors_reflects_only_canonical_local_origins(self):
+        allowed = HeaderCapture("http://localhost:3000")
+        eve_web.EveAppHandler.send_cors_headers(allowed)
+        self.assertIn(("Access-Control-Allow-Origin", "http://localhost:3000"), allowed.sent)
+
+        injected = HeaderCapture("http://localhost:3000\r\nX-Eve-Test: injected")
+        eve_web.EveAppHandler.send_cors_headers(injected)
+        self.assertEqual([], injected.sent)
+
+        foreign = HeaderCapture("https://example.com")
+        eve_web.EveAppHandler.send_cors_headers(foreign)
+        self.assertEqual([], foreign.sent)
+
+
 class GovernanceService(CountingService):
     def governance(self, limit: int = 20, runtime: bool = True):
         return {

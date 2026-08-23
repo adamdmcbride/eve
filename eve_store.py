@@ -2,6 +2,7 @@
 
 import json
 import os
+import tempfile
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -17,10 +18,6 @@ _LOCK_REGISTRY_GUARD = threading.Lock()
 _THREAD_LOCAL = threading.local()
 _PATH_LOCKS: dict[str, threading.RLock] = {}
 _MACOS_DATALESS_FLAG = 0x40000000
-
-
-def _temp_path(path: Path) -> Path:
-    return path.with_name(f".{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
 
 
 def _path_key(path: Path) -> str:
@@ -71,9 +68,24 @@ def _thread_depths() -> dict[str, int]:
 
 def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = _temp_path(path)
-    temp_path.write_text(content, encoding=encoding)
-    temp_path.replace(path)
+    descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.tmp.", dir=path.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding=encoding) as handle:
+            # Eve's local continuity store intentionally persists non-credential
+            # state. Files are owner-only; SECURITY.md forbids using it as a
+            # credential store and documents the at-rest boundary.
+            # codeql[py/clear-text-storage-sensitive-data]
+            handle.write(content)
+        os.chmod(temp_path, 0o600)
+        temp_path.replace(path)
+        os.chmod(path, 0o600)
+    except BaseException:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 @contextmanager
@@ -99,6 +111,10 @@ def file_lock(path: Path) -> Iterator[None]:
     lock_path = path.with_name(f".{path.name}.lock")
     _remove_dataless_lock_placeholder(lock_path)
     with lock_path.open("w", encoding="utf-8") as handle:
+        try:
+            os.chmod(lock_path, 0o600)
+        except OSError:
+            pass
         if fcntl is not None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
@@ -128,7 +144,12 @@ def parse_jsonl_line(line: str) -> Optional[Dict[str, object]]:
 def append_jsonl_record(path: Path, record: Dict[str, object], ensure_ascii: bool = True) -> Dict[str, object]:
     path.parent.mkdir(parents=True, exist_ok=True)
     with file_lock(path):
-        with path.open("a", encoding="utf-8") as handle:
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+            # See atomic_write_text: this is owner-only local continuity data,
+            # not a credential store.
+            # codeql[py/clear-text-storage-sensitive-data]
             handle.write(json.dumps(record, ensure_ascii=ensure_ascii) + "\n")
     return record
 

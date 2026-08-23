@@ -14,6 +14,18 @@ import eve_platform
 
 
 class EvePlatformTests(unittest.TestCase):
+    def test_html_text_extraction_ignores_script_and_style_content(self):
+        html = (
+            "<html><head><title>Eve &amp; Guide</title>"
+            "<style>body { display: none }</style></head>"
+            "<body><p>Visible <strong>story</strong>.</p>"
+            "<script>window.secret = '<p>not visible</p>';</script></body></html>"
+        )
+
+        self.assertEqual("Eve & Guide Visible story .", eve.html_to_text(html))
+        self.assertEqual("Eve & Guide", eve.extract_html_title(html))
+        self.assertNotIn("window.secret", eve.html_to_text(html))
+
     def test_llama_cpp_compatible_messages_preserve_leading_system_and_current_user_roles(self):
         messages = [
             {"role": "system", "content": "identity"},

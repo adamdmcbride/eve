@@ -1,5 +1,6 @@
 import unittest
 import importlib.util
+import json
 import tempfile
 from pathlib import Path
 
@@ -9,6 +10,12 @@ SPEC = importlib.util.spec_from_file_location("eve_chat_brand_scrub", SCRIPT_PAT
 eve_chat_brand_scrub = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(eve_chat_brand_scrub)
+
+LOCAL_SERVE_PATH = Path(__file__).resolve().parents[1] / "bin" / "eve_chat_local_serve.py"
+LOCAL_SERVE_SPEC = importlib.util.spec_from_file_location("eve_chat_local_serve", LOCAL_SERVE_PATH)
+eve_chat_local_serve = importlib.util.module_from_spec(LOCAL_SERVE_SPEC)
+assert LOCAL_SERVE_SPEC.loader is not None
+LOCAL_SERVE_SPEC.loader.exec_module(eve_chat_local_serve)
 
 
 class EveChatBrandScrubTests(unittest.TestCase):
@@ -75,6 +82,35 @@ class EveChatBrandScrubTests(unittest.TestCase):
         self.assertEqual(1, report["index_changed"])
         self.assertIn("?v=20260508-copilotkit-panel-anchor", html)
         self.assertNotIn('src="/eve-chat-followups.js" data-eve-chat-followups', html)
+
+    def test_followup_overlay_handles_whitespace_in_script_end_tag(self) -> None:
+        html = (
+            '<html><body><script data-eve-chat-followups="true" '
+            'src="/eve-chat-followups.js"></script   ></body></html>'
+        )
+
+        replaced, count = eve_chat_brand_scrub.replace_followup_script_tags(html)
+
+        self.assertEqual(1, count)
+        self.assertEqual(1, replaced.count("data-eve-chat-followups"))
+        self.assertIn("?v=20260508-copilotkit-panel-anchor", replaced)
+
+    def test_followup_overlay_does_not_replace_unrelated_scripts(self) -> None:
+        html = '<html><body><script src="/app.js"></script></body></html>'
+
+        replaced, count = eve_chat_brand_scrub.replace_followup_script_tags(html)
+
+        self.assertEqual(0, count)
+        self.assertEqual(html, replaced)
+
+    def test_local_proxy_error_does_not_expose_exception_details(self) -> None:
+        payload = eve_chat_local_serve.proxy_error_event_bytes().decode("utf-8")
+        event = json.loads(payload.removeprefix("data: ").strip())
+
+        self.assertEqual("backend_unavailable", event["code"])
+        self.assertEqual("The local Eve chat backend is unavailable.", event["error"])
+        self.assertNotIn("traceback", payload.lower())
+        self.assertNotIn("127.0.0.1:8797", payload)
 
 
 if __name__ == "__main__":
