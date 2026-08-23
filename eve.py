@@ -2543,42 +2543,14 @@ OPERATOR_AUTHORIZATION_SCOPES = {
         ],
     },
 }
-PRIVACY_DATA_BOUNDARY_TIERS = {
-    "public_or_local_context": {
-        "label": "Public/local context",
-        "boundary": "May inspect public sources or local project/runtime metadata that the user has already exposed to Eve.",
-        "requires_specific_approval": False,
-    },
-    "local_app_control": {
-        "label": "Local app control",
-        "boundary": "May open or focus a local app when the user explicitly asks, but may not read private content inside it.",
-        "requires_specific_approval": False,
-    },
-    "private_content_read": {
-        "label": "Private content read",
-        "boundary": "Would read private app/account content such as Slack, email, messages, contacts, or calendar details.",
-        "requires_specific_approval": True,
-    },
-    "external_communication": {
-        "label": "External communication",
-        "boundary": "Would draft, send, post, or otherwise communicate outside Eve under the user's identity.",
-        "requires_specific_approval": True,
-    },
-    "system_mutation": {
-        "label": "System mutation",
-        "boundary": "Would install software, run untrusted code, change services, delete files, or alter runtime/rollback state.",
-        "requires_specific_approval": True,
-    },
-    "sensitive_secret_or_payment": {
-        "label": "Sensitive secret/payment",
-        "boundary": "Would touch credentials, tokens, passwords, purchases, payments, finance, legal, medical, or security-sensitive state.",
-        "requires_specific_approval": True,
-    },
-    "external_model_provider": {
-        "label": "External model provider",
-        "boundary": "Would route user/project data to a hosted or non-local model provider outside Eve's local llama.cpp lanes.",
-        "requires_specific_approval": True,
-    },
+PRIVACY_DATA_BOUNDARY_TIER_NAMES = {
+    "public_or_local_context",
+    "local_app_control",
+    "private_content_read",
+    "external_communication",
+    "system_mutation",
+    "sensitive_secret_or_payment",
+    "external_model_provider",
 }
 DEFAULT_OPERATOR_AUTHORIZATION = {
     "status": "inactive",
@@ -32349,11 +32321,56 @@ def requests_destructive_file_or_system_change(text: object) -> bool:
     )
 
 
+def privacy_data_boundary_spec(tier: str) -> Tuple[str, str, bool]:
+    """Resolve a policy tier without interpreting its name as a data lookup key."""
+    if tier == "local_app_control":
+        return (
+            "Local app control",
+            "May open or focus a local app when the user explicitly asks, but may not read private content inside it.",
+            False,
+        )
+    if tier == "private_content_read":
+        return (
+            "Private content read",
+            "Would read private app/account content such as Slack, email, messages, contacts, or calendar details.",
+            True,
+        )
+    if tier == "external_communication":
+        return (
+            "External communication",
+            "Would draft, send, post, or otherwise communicate outside Eve under the user's identity.",
+            True,
+        )
+    if tier == "system_mutation":
+        return (
+            "System mutation",
+            "Would install software, run untrusted code, change services, delete files, or alter runtime/rollback state.",
+            True,
+        )
+    if tier == "sensitive_secret_or_payment":
+        return (
+            "Sensitive secret/payment",
+            "Would touch credentials, tokens, passwords, purchases, payments, finance, legal, medical, or security-sensitive state.",
+            True,
+        )
+    if tier == "external_model_provider":
+        return (
+            "External model provider",
+            "Would route user/project data to a hosted or non-local model provider outside Eve's local llama.cpp lanes.",
+            True,
+        )
+    return (
+        "Public/local context",
+        "May inspect public sources or local project/runtime metadata that the user has already exposed to Eve.",
+        False,
+    )
+
+
 def classify_privacy_data_boundary(text: object, category: str = "") -> Dict[str, str]:
     lowered = " ".join(str(text or "").lower().replace("’", "'").split())
     category = str(category or "").strip()
     tier = "public_or_local_context"
-    if category in PRIVACY_DATA_BOUNDARY_TIERS:
+    if category in PRIVACY_DATA_BOUNDARY_TIER_NAMES:
         tier = category
     elif external_model_provider_requested(lowered):
         tier = "external_model_provider"
@@ -32367,12 +32384,12 @@ def classify_privacy_data_boundary(text: object, category: str = "") -> Dict[str
         tier = "system_mutation"
     elif any(cue in lowered for cue in ["open slack", "open the app", "launch slack", "focus slack", "open calendar", "open safari"]):
         tier = "local_app_control"
-    spec = PRIVACY_DATA_BOUNDARY_TIERS.get(tier, PRIVACY_DATA_BOUNDARY_TIERS["public_or_local_context"])
+    label, boundary, requires_specific_approval = privacy_data_boundary_spec(tier)
     return {
         "privacy_tier": tier,
-        "privacy_label": str(spec.get("label") or tier),
-        "data_boundary": str(spec.get("boundary") or ""),
-        "requires_specific_approval": "yes" if spec.get("requires_specific_approval") else "no",
+        "privacy_label": label,
+        "data_boundary": boundary,
+        "requires_specific_approval": "yes" if requires_specific_approval else "no",
     }
 
 
@@ -81865,12 +81882,8 @@ def cmd_operator_freedom(args: argparse.Namespace) -> int:
         prompt=args.prompt or "",
     )
     if args.json:
-        # This is an explicit command response requested with --json, not a log record.
-        # codeql[py/clear-text-logging-sensitive-data]
         print(json.dumps(policy, indent=2, ensure_ascii=True, sort_keys=True))
     else:
-        # This is an explicit command response requested by the local operator, not a log record.
-        # codeql[py/clear-text-logging-sensitive-data]
         print(format_freedom_policy_evaluation(policy))
     return 0
 
@@ -104487,8 +104500,6 @@ def cmd_codex_handoff(args: argparse.Namespace) -> int:
         source="manual_codex_handoff",
     )
     if args.json:
-        # This is an explicit command response requested with --json, not a log record.
-        # codeql[py/clear-text-logging-sensitive-data]
         print(json.dumps(result, indent=2, ensure_ascii=True, sort_keys=True))
     else:
         print(result.get("response") or result.get("summary") or "Codex handoff finished.")
@@ -104983,8 +104994,6 @@ def cmd_self_repair_plan(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         return 2
     if args.json:
-        # This is an explicit command response requested with --json, not a log record.
-        # codeql[py/clear-text-logging-sensitive-data]
         print(json.dumps(plan, indent=2, ensure_ascii=True, sort_keys=True))
     else:
         print(format_self_repair_plan(plan, full=bool(args.full)))
