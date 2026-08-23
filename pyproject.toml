@@ -14,7 +14,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "pytest==9.0.3",
+  "pytest==9.1.1",
 ]
 infra = [
   "dagster>=1.13.19",
