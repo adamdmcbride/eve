@@ -2,7 +2,7 @@
 
 Status: active
 Last reviewed: 2026-08-23
-Current authority: partial
+Current authority: published pre-alpha source; tagged release gated
 Supersedes: none
 Superseded by: none
 
@@ -158,24 +158,31 @@ findings, and a documented rollback for each state migration.
 
 ## Phase 5 — personal GitHub public beta
 
-Current checkpoint: the exact personal GitHub account is authenticated and the
-clean source gate is ready. Repository creation, remote-tree comparison, and CI
-verification are the remaining publication steps. A version tag remains gated
-by the complete release definition below.
+Current checkpoint: the clean source is published at the configured personal
+GitHub repository. The private checkout remains remote-free. The
+324-file public boundary, Apache-2.0 license, CI, full-history Gitleaks scan,
+CodeQL, Dependabot, secret scanning, push protection, and private vulnerability
+reporting are live. The default branch requires pull requests, strict release
+checks, linear history, and conversation resolution, and blocks force-pushes and
+deletion. CodeQL and Dependabot currently have zero open alerts. A version tag
+remains gated by the complete release definition below.
 
-1. Reauthenticate GitHub CLI to the user's personal account.
-2. Create a new repository from the passing clean export, with no inherited
-   private history.
-3. Enable private vulnerability reporting, secret scanning, Dependabot,
-   branch protection, required reviews, and required release checks.
-4. Push one reviewed root commit, verify the exact remote tree, then tag a
-   signed `v0.1.0` public beta.
+1. Keep repository ownership personal and independent from Eden.
+2. Maintain `main` protection with the established release checks, linear
+   history, no force pushes or deletion, and a pull-request requirement with
+   zero mandatory reviewers while the project has one maintainer.
+3. Complete native app and full Eve-service lifecycle verification on supported
+   macOS.
+4. Complete transitive dependency-license review; do not equate a generated
+   SBOM or zero vulnerability alerts with license clearance.
 5. Publish a limitations page: local-first is not zero-risk, consciousness-like
    evidence is not proof of subjective experience, and optional organs have
    distinct authority.
+6. Only after those gates, create a signed pre-release tag and verify its archive
+   against the reviewed public manifest.
 
-Exit gate: the public repository and tagged archive independently match the
-reviewed manifest; the private working repository remains remote-free.
+Exit gate: the tagged archive independently matches the reviewed manifest; the
+private working repository remains remote-free.
 
 ## Phase 6 — community without architecture drift
 

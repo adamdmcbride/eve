@@ -2,15 +2,15 @@
 
 Status: evidence-log  
 Last reviewed: 2026-08-23  
-Current authority: initial source-publication gate  
+Current authority: published pre-alpha source gate
 Supersedes: none  
 Superseded by: none
 
 ## Decision
 
-**Ready for an initial public source publication; not ready for a tagged stable
-release.** The public repository must be created from the passing clean export,
-not from the private checkout or its history.
+**The initial public source is published; Eve is not ready for a version tag or
+stable-release claim.** The public repository was created from the passing clean
+export, not from the private checkout or its history.
 
 The publication target is the maintainer's personal repository configured in
 `public_release.json`. Eve is not an Eden product and must not be published by
@@ -21,16 +21,18 @@ or on behalf of an Eden account or organization.
 The current private checkout intentionally remains remote-free. Its runtime,
 continuity, and development history are not publication material.
 
-The deterministic release policy currently selects 324 source files and
-reports:
+The deterministic release policy selected 324 source files. The initial clean
+root and each subsequent public hardening commit independently retained that
+same file boundary. The current public tree reports:
 
-- public-candidate errors: 0;
-- source-checkout warnings: 3;
-- private tracked paths excluded from the candidate: 40.
+- public-tree audit errors: 0;
+- candidate files: 324;
+- tracked public files: 324;
+- private tracked paths included: 0.
 
-The three source warnings are expected at this boundary: the private worktree
-is dirty, it has no Git remote, and private tracked material is being excluded.
-They must disappear when the exported tree is re-audited independently.
+The private source checkout still has no Git remote. Its dirty-worktree,
+remote-free, and excluded-private-material warnings remain evidence about the
+source boundary, not findings in the published repository.
 
 The export policy excludes, among other things:
 
@@ -78,9 +80,10 @@ honestly marking optional learned artifacts unavailable.
 - External runtimes and model weights retain their own licenses and are not
   distributed as Eve source.
 
-The complete transitive dependency-graph SBOM and license review remains a gate
-for the first public tag. Weekly `uv` and GitHub Actions Dependabot updates plus
-GitHub dependency submission support that review; they do not replace it.
+GitHub currently generates an SPDX dependency-graph SBOM with 187 package
+records, and Dependabot reports zero open alerts. The complete transitive
+license review remains a gate for the first public tag. Weekly `uv` and GitHub
+Actions Dependabot updates support that review; they do not replace it.
 
 ## Security evidence
 
@@ -89,19 +92,33 @@ the candidate. A checksum-verified Gitleaks 8.30.0 scan also reported no leak in
 the private history, but the private history remains non-public because it
 contains personal material that is not a credential.
 
-The new public history begins from one clean root commit. CI independently runs
-the deterministic release audit, direct dependency-license audit, portable
+The new public history begins from clean root commit `cb45f3a`. CI independently
+runs the deterministic release audit, direct dependency-license audit, portable
 runtime contracts, full-root Gitleaks scan, and pull-request dependency review.
-The repository also includes a security policy and is intended to use GitHub
-private vulnerability reporting.
+
+On public commit `c09d412`, release run `32659127007` passed `core-contracts`,
+`release-audit`, and `secret-history`. CodeQL run `32659126815` passed all
+configured language jobs and left zero open code-scanning alerts after the
+reviewed HTTP, HTML, local-storage, proxy-error, and policy-classification
+hardening. Dependabot also reports zero open alerts.
+
+The personal repository has secret scanning, push protection, Dependabot
+security updates, and private vulnerability reporting enabled. Local continuity
+files are created owner-only (`0600`); `SECURITY.md` explicitly documents that
+they remain plaintext application data and are not a credential vault.
+
+`main` is protected for the single-maintainer phase: pull requests are required
+with zero mandatory reviewers, the four public-release jobs are required and
+strict, administrators are included, linear history and conversation resolution
+are required, and force-pushes and branch deletion are disabled.
 
 ## Local verification
 
 Observed passing checks include:
 
 - 27 release-audit, bootstrap, dependency, and portability contracts;
-- 207 capability-intelligence, topology, OpenClaw, bootstrap, and runtime
-  contracts;
+- 245 capability-intelligence, topology, OpenClaw, bootstrap, and portable
+  runtime contracts in the current public CI group;
 - 37 specialist-substrate contracts, including strict Hermes JSON behavior;
 - direct dependency inventory: 17 dependencies, 0 errors, 0 warnings;
 - `uv lock --check`;
@@ -113,15 +130,11 @@ an inflated unique-test count.
 
 ## Remaining gates before a public tag
 
-1. Re-audit the final clean export with zero findings.
-2. Verify the exact GitHub tree and CI against the exported manifest.
-3. Review the GitHub dependency-graph SBOM and every unresolved transitive
+1. Review the GitHub dependency-graph SBOM and every unresolved transitive
    license.
-4. Verify native app launch, chat, and service status on supported macOS.
-5. Verify start/stop restores every Eve-owned service without ambiguous state.
-6. Enable repository security controls and branch protection after the initial
-   checks exist.
-7. Only then consider a signed pre-release tag; do not describe the current
+2. Verify native app launch, chat, and service status on supported macOS.
+3. Verify start/stop restores every Eve-owned service without ambiguous state.
+4. Only then consider a signed pre-release tag; do not describe the current
    pre-alpha source as stable.
 
 ## Reproduction
@@ -136,8 +149,6 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run python -m unittest \
 uv run python bin/eve_dependency_license_audit.py --json
 python3 bin/eve_public_release_audit.py \
   --root . \
-  --candidate-only \
-  --include-untracked \
   --full
 ```
 
