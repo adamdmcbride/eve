@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,6 +72,61 @@ class PublicReleaseAuditTests(unittest.TestCase):
         self.assertIn("src/eve.py", selected)
         self.assertNotIn("private/memory.md", selected)
         self.assertIn("private/memory.md", tracked)
+
+    def test_repository_exports_focused_public_architecture_contracts(self):
+        release_config = eve_public_release_audit.load_config(ROOT / "public_release.json")
+        required_contracts = {
+            "docs/architecture/EVE_ATTACHMENT_BOUNDARY_2026_08_23.md",
+            "docs/architecture/EVE_APP_REFRESH_CONTRACT_2026_08_23.md",
+            "docs/architecture/EVE_LOOPBACK_HTTP_SECURITY_2026_08_23.md",
+            "docs/architecture/EVE_STORE_CONCURRENCY_2026_08_23.md",
+            "docs/evidence/PERFORMANCE_OBSERVATION_CONTRACT_2026_08_23.md",
+        }
+        self.assertTrue(required_contracts.issubset(set(release_config["force_include"])))
+        selected, _tracked = eve_public_release_audit.candidate_paths(
+            ROOT,
+            release_config,
+            include_untracked=True,
+        )
+        self.assertTrue(required_contracts.issubset(set(selected)))
+
+    def test_public_runtime_imports_are_selected(self):
+        # Check startup imports without importing Eve or starting local services.
+        import ast
+
+        policy = eve_public_release_audit.load_config(ROOT / "public_release.json")
+        selected, _ = eve_public_release_audit.candidate_paths(ROOT, policy, include_untracked=True)
+        for stmt in ast.parse((ROOT / "eve.py").read_bytes()).body:
+            if isinstance(stmt, ast.Import):
+                modules = [alias.name for alias in stmt.names]
+            elif isinstance(stmt, ast.ImportFrom):
+                modules = [stmt.module or ""]
+            else:
+                continue
+            for module in modules:
+                if module.startswith("eve_"):
+                    path = module.replace(".", "/")
+                    self.assertTrue(path + ".py" in selected or path + "/__init__.py" in selected, module)
+
+    def test_placeholder_blocks_scan_hash_and_copy_without_opening(self):
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "eve.py"
+            source.write_text("pass")
+            original_stat = source.stat()
+            placeholder = SimpleNamespace(st_mode=original_stat.st_mode, st_size=4, st_flags=0x40000000)
+            with patch.object(Path, "lstat", return_value=placeholder), patch.object(
+                eve_public_release_audit.os, "open", side_effect=AssertionError("opened placeholder")
+            ):
+                findings = eve_public_release_audit.scan_candidate(root, "eve.py", config())
+                self.assertEqual([item["id"] for item in findings], ["public.source_not_local"])
+                with self.assertRaisesRegex(ValueError, "not local"):
+                    eve_public_release_audit.sha256_file(source)
+                with self.assertRaisesRegex(ValueError, "not local"):
+                    eve_public_release_audit._copy_regular_file(source, root / "copy", "eve.py")
+            self.assertFalse((root / "copy").exists())
 
     def test_github_remote_parser_accepts_personal_ssh_and_https_urls(self):
         self.assertEqual(
@@ -188,6 +244,76 @@ class PublicReleaseAuditTests(unittest.TestCase):
         self.assertIn("secret.github_token", {item["id"] for item in report["findings"]})
         self.assertNotIn(secret, serialized)
 
+    def test_oversized_candidate_is_rejected_before_reading_contents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "large.py"
+            path.write_bytes(b"x" * 32)
+            release_config = config()
+            release_config["max_file_bytes"] = 16
+            with patch.object(
+                eve_public_release_audit.os,
+                "read",
+                side_effect=AssertionError("oversized file must not be read"),
+            ) as read:
+                findings = eve_public_release_audit.scan_candidate(
+                    root,
+                    "large.py",
+                    release_config,
+                )
+
+        self.assertFalse(read.called)
+        self.assertEqual(
+            ["public.file_too_large"],
+            [item["id"] for item in findings],
+        )
+
+    def test_candidate_growth_after_open_is_still_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "growing.py").write_bytes(b"x")
+            release_config = config()
+            release_config["max_file_bytes"] = 16
+            with patch.object(
+                eve_public_release_audit.os,
+                "read",
+                side_effect=[b"x" * 16, b"y"],
+            ) as read:
+                findings = eve_public_release_audit.scan_candidate(
+                    root,
+                    "growing.py",
+                    release_config,
+                )
+
+        self.assertEqual(2, read.call_count)
+        self.assertEqual(
+            ["public.file_too_large"],
+            [item["id"] for item in findings],
+        )
+
+    @unittest.skipUnless(hasattr(eve_public_release_audit.os, "mkfifo"), "FIFO requires POSIX")
+    def test_non_regular_candidate_is_rejected_without_opening_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fifo = root / "blocked.py"
+            eve_public_release_audit.os.mkfifo(fifo)
+            with patch.object(
+                eve_public_release_audit.os,
+                "open",
+                side_effect=AssertionError("non-regular file must not be opened"),
+            ) as opened:
+                findings = eve_public_release_audit.scan_candidate(
+                    root,
+                    "blocked.py",
+                    config(),
+                )
+
+        self.assertFalse(opened.called)
+        self.assertEqual(
+            ["public.non_regular_file"],
+            [item["id"] for item in findings],
+        )
+
     def test_user_home_in_source_and_owner_specific_prompt_are_blockers(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self.make_public_root(tmp)
@@ -257,11 +383,118 @@ class PublicReleaseAuditTests(unittest.TestCase):
             destination = base / "export"
             eve_public_release_audit.export_tree(root, destination, report["candidate_paths"])
             manifest = eve_public_release_audit.manifest_for(root, report["candidate_paths"])
+            verification = eve_public_release_audit.verify_manifest(
+                destination,
+                manifest,
+                expected_paths=report["candidate_paths"],
+                exact_tree=True,
+            )
             exported_readme = (destination / "README.md").is_file()
 
         self.assertTrue(report["ok"])
         self.assertTrue(exported_readme)
+        self.assertEqual(2, manifest["schema_version"])
+        self.assertEqual(3, manifest["file_count"])
+        self.assertEqual(64, len(manifest["tree_sha256"]))
         self.assertEqual(64, len(manifest["files"][0]["sha256"]))
+        self.assertTrue(verification["ok"])
+        self.assertEqual(3, verification["verified_file_count"])
+
+    def test_manifest_verification_detects_same_size_tampering_and_extra_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.make_public_root(tmp)
+            tracked = ["LICENSE", "README.md", "pyproject.toml"]
+            manifest = eve_public_release_audit.manifest_for(root, tracked)
+            (root / "README.md").write_text("# Eva\n", encoding="utf-8")
+            (root / "unreviewed.txt").write_text("extra\n", encoding="utf-8")
+            verification = eve_public_release_audit.verify_manifest(
+                root,
+                manifest,
+                expected_paths=tracked,
+                exact_tree=True,
+            )
+
+        self.assertFalse(verification["ok"])
+        ids = {item["id"] for item in verification["findings"]}
+        self.assertIn("manifest.sha256_mismatch", ids)
+        self.assertIn("manifest.exact_tree_extra_path", ids)
+
+    def test_manifest_validation_rejects_path_traversal_and_summary_tampering(self):
+        traversal = {
+            "schema_version": 1,
+            "files": [{"path": "../secret", "bytes": 1, "sha256": "0" * 64}],
+        }
+        with self.assertRaisesRegex(ValueError, "escapes"):
+            eve_public_release_audit.validate_manifest(traversal)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.make_public_root(tmp)
+            manifest = eve_public_release_audit.manifest_for(root, ["README.md"])
+            manifest["total_bytes"] += 1
+            with self.assertRaisesRegex(ValueError, "total_bytes"):
+                eve_public_release_audit.validate_manifest(manifest)
+
+    def test_failed_export_validation_leaves_no_partial_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = self.make_public_root(base / "source")
+            destination = base / "export"
+
+            def reject(_staging):
+                raise ValueError("simulated post-copy failure")
+
+            with self.assertRaisesRegex(ValueError, "simulated"):
+                eve_public_release_audit.export_tree(
+                    root,
+                    destination,
+                    ["README.md", "LICENSE", "pyproject.toml"],
+                    validator=reject,
+                )
+
+            destination_exists = destination.exists()
+            staging_paths = list(base.glob(".export.eve-export-*"))
+
+        self.assertFalse(destination_exists)
+        self.assertEqual([], staging_paths)
+
+    def test_cli_writes_external_manifest_and_verifies_export_exactly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = self.make_public_root(base / "source")
+            release_config = config()
+            config_path = root / "public_release.json"
+            config_path.write_text(json.dumps(release_config), encoding="utf-8")
+            manifest_path = base / "eve-manifest.json"
+            destination = base / "export"
+            with contextlib.redirect_stdout(io.StringIO()):
+                export_code = eve_public_release_audit.main(
+                    [
+                        "--root",
+                        str(root),
+                        "--config",
+                        str(config_path),
+                        "--write-manifest",
+                        str(manifest_path),
+                        "--export",
+                        str(destination),
+                    ]
+                )
+                verify_code = eve_public_release_audit.main(
+                    [
+                        "--root",
+                        str(destination),
+                        "--config",
+                        str(config_path),
+                        "--verify-manifest",
+                        str(manifest_path),
+                        "--exact-tree",
+                    ]
+                )
+            manifest_exists = manifest_path.is_file()
+
+        self.assertEqual(0, export_code)
+        self.assertEqual(0, verify_code)
+        self.assertTrue(manifest_exists)
 
     def test_cli_refuses_export_when_audit_is_blocked(self):
         with tempfile.TemporaryDirectory() as tmp:

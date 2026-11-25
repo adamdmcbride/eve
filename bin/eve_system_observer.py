@@ -335,6 +335,41 @@ def top_processes(limit: int = TOP_PROCESS_LIMIT) -> List[Dict[str, object]]:
     return processes
 
 
+def plain_process_service_state(name: str) -> Optional[Dict[str, object]]:
+    """Service state from running processes and fresh status files when no service manager owns Eve."""
+    try:
+        if name == "daemon":
+            code, stdout, _ = run_command(["pgrep", "-f", "eve.py daemon run"], timeout=5)
+            pids = [line.strip() for line in stdout.splitlines() if line.strip()]
+            if code == 0 and pids:
+                return {"label": "eve-daemon", "loaded": True, "state": "running", "mode": "plain_process", "pid": safe_int(pids[0])}
+        elif name == "model_warm":
+            code, stdout, _ = run_command(["pgrep", "-f", "llama-server"], timeout=5)
+            pids = [line.strip() for line in stdout.splitlines() if line.strip()]
+            if code == 0 and pids:
+                return {"label": "eve-model-lanes", "loaded": True, "state": "running", "mode": "plain_process", "process_count": len(pids)}
+        elif name == "model_watchdog":
+            status_path = APP_DIR / "model_watchdog_status.json"
+            if status_path.exists():
+                payload = json.loads(status_path.read_text(encoding="utf-8"))
+                updated = parse_iso(payload.get("updated_at") or payload.get("timestamp"))
+                if updated is not None:
+                    age_seconds = (datetime.now(timezone.utc) - updated).total_seconds()
+                    if age_seconds < 15 * 60:
+                        return {
+                            "label": "eve-model-watchdog",
+                            "loaded": True,
+                            "state": "scheduled",
+                            "mode": "plain_process_supervised",
+                            "last_exit_code": "0",
+                            "run_interval_seconds": 300,
+                            "status_age_seconds": int(age_seconds),
+                        }
+    except Exception:
+        return None
+    return None
+
+
 def launch_agent_state(label: str) -> Dict[str, object]:
     if eve_platform.is_windows() and eve_platform.command_available("schtasks"):
         code, stdout, stderr = run_command(["schtasks", "/Query", "/TN", label, "/FO", "LIST", "/V"], timeout=5)
@@ -826,6 +861,15 @@ def observe_system() -> int:
             "model_warm": launch_agent_state(eve_profile.service_label("model-warm")),
             "model_watchdog": launch_agent_state(eve_profile.service_label("model-watchdog")),
         }
+        # Eve's services may run as plain processes (no launchd): the daemon as
+        # `eve.py daemon run`, the lanes as llama-server processes, the watchdog
+        # as a supervised periodic pass that refreshes its status file. Reporting
+        # them "missing" made Eve try to repair services that were running.
+        for name, state in list(eve_services.items()):
+            if str(state.get("state") or "") == "missing":
+                plain = plain_process_service_state(name)
+                if plain is not None:
+                    eve_services[name] = plain
 
         snapshot = {
             "timestamp": utc_now(),

@@ -1,0 +1,17 @@
+{
+  "schema_id": "eve_daemon_activity.v1",
+  "cycle_id": "fixture-cycle-idle",
+  "owner_id": "fixture-owner",
+  "run_mode": "recurrent",
+  "pid": 12345,
+  "status": "idle",
+  "cycle_started_at": "2026-09-17T05:14:13+00:00",
+  "last_heartbeat_at": "2026-09-17T05:14:21+00:00",
+  "heartbeat_count": 1,
+  "heartbeat_interval_seconds": 15,
+  "max_active_cycle_seconds": 900,
+  "completed_jobs": ["sensory_attention", "workspace_tick"],
+  "elapsed_seconds": 8.37,
+  "cycle_completed_at": "2026-09-17T05:14:21+00:00",
+  "failure": ""
+}

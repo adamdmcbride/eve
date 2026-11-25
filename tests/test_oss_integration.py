@@ -76,14 +76,29 @@ class OssIntegrationTests(unittest.TestCase):
 
     def passing_trainer_gate(self):
         return {
-            "status": "ready_for_supervised_no_download_dry_run",
+            "status": "passed",
+            "no_train_validation_performed": True,
             "blockers": [],
             "boundary": {
                 "no_download": True,
                 "no_training_started": True,
+                "adapter_loaded": False,
+                "adapter_written": False,
                 "writes_eve_memory": False,
                 "promotes_models": False,
                 "changes_live_routing": False,
+            },
+        }
+
+    def passing_dvc_snapshot(self):
+        return {
+            "status": "verified",
+            "file_count": 2,
+            "dvc": {"available": True, "initialized": True},
+            "restore": {"verified": True, "hashes_match": True},
+            "boundary": {
+                "grants_live_authority": False,
+                "copies_private_holdout": False,
             },
         }
 
@@ -142,6 +157,19 @@ class OssIntegrationTests(unittest.TestCase):
             trace_path = root / "latest_openinference.jsonl"
             trace_path.write_text(json.dumps({"schema_version": "eve_openinference_span.v1"}) + "\n", encoding="utf-8")
             (recipe_dir / "mlx_lm_lora_recipe.yaml").write_text("train: false\n", encoding="utf-8")
+            (root / ".dvc").mkdir()
+            dvc = root / "dvc"
+            dvc.write_text("fixture", encoding="utf-8")
+
+            def verified_snapshot(**kwargs):
+                snapshot = eve.eve_oss_validation.build_dvc_snapshot_manifest(kwargs["dataset_dir"])
+                return {
+                    "schema_id": eve.eve_oss_validation.DVC_SNAPSHOT_SCHEMA_ID,
+                    "status": "verified",
+                    "snapshot": snapshot,
+                    "restore": {"verified": True, "hashes_match": True},
+                    "blockers": [],
+                }
 
             with patch.object(eve, "TRAINING_DATASETS_DIR", dataset_dir), patch.object(
                 eve, "TRACE_EXPORT_LATEST_PATH", trace_path
@@ -150,14 +178,33 @@ class OssIntegrationTests(unittest.TestCase):
             ), patch.object(
                 eve, "mirror_store_file_to_runtime", lambda _: None
             ), patch.object(
-                eve, "oss_resolve_executable", return_value=""
+                eve, "eve_checkout_root_for_marker", return_value=root
+            ), patch.object(
+                eve, "oss_resolve_executable", return_value=str(dvc)
+            ), patch.object(
+                eve, "oss_run_command", return_value={"status": "ok", "stdout_tail": "3.67.1"}
+            ), patch.object(
+                eve.eve_oss_validation, "perform_dvc_snapshot_restore", side_effect=verified_snapshot
             ):
                 manifest = eve.build_oss_dvc_dataset_manifest(write=True)
 
+                sidecar = Path(str(root / eve.OSS_DVC_SNAPSHOT_PAYLOAD_RELATIVE_PATH) + ".dvc")
+                sidecar.parent.mkdir(parents=True, exist_ok=True)
+                sidecar.touch()
+                for verified, expected in [(True, "verified"), (False, "ready_for_snapshot"),
+                                           ("false", "ready_for_snapshot"), (None, "ready_for_snapshot")]:
+                    with self.subTest(cached_restore=verified):
+                        cached = {**manifest, "restore": {"verified": verified}}
+                        integration_manifest.write_text(json.dumps(cached), encoding="utf-8")
+                        replay = eve.build_oss_dvc_dataset_manifest(write=False)
+                        self.assertEqual(expected, replay["status"])
+
         serialized = json.dumps(manifest)
-        self.assertEqual("ready", manifest["status"])
+        self.assertEqual("verified", manifest["status"])
+        self.assertTrue(manifest["restore"]["verified"])
         self.assertTrue(manifest["artifact"].endswith("dvc_dataset_manifest.json"))
-        self.assertFalse(manifest["boundary"]["writes_dvc_metadata"])
+        self.assertTrue(manifest["boundary"]["writes_dvc_metadata"])
+        self.assertFalse(manifest["boundary"]["initializes_dvc_repo"])
         self.assertFalse(manifest["boundary"]["contains_row_text"])
         self.assertNotIn("private training prompt text", serialized)
         self.assertNotIn("corrected answer text", serialized)
@@ -265,17 +312,12 @@ class OssIntegrationTests(unittest.TestCase):
 
     def test_status_report_makes_oss_a_governed_eve_substrate(self) -> None:
         fake_lab = FakeOssLab()
-        dvc_manifest = {
-            "status": "ready",
-            "file_count": 4,
-            "dvc": {"available": True, "initialized": False},
-            "boundary": {"grants_live_authority": False},
-        }
+        dvc_manifest = self.passing_dvc_snapshot()
 
         with patch.object(eve, "build_oss_dvc_dataset_manifest", return_value=dvc_manifest), patch.object(
             eve, "load_latest_oss_lab_report", return_value={}
         ), patch.object(eve, "load_latest_oss_pressure_eval", return_value={}), patch.object(
-            eve, "load_latest_oss_trainer_dry_run", return_value={}
+            eve, "load_latest_oss_trainer_dry_run", return_value=self.passing_trainer_gate()
         ), patch.object(
             eve, "load_latest_oss_copilotkit_report", return_value=self.passing_copilotkit_probe()
         ), patch.object(
@@ -287,7 +329,7 @@ class OssIntegrationTests(unittest.TestCase):
             )
 
         self.assertEqual("healthy", report["status"])
-        self.assertEqual(7, report["readiness"]["ready_checks"])
+        self.assertEqual(8, report["readiness"]["ready_checks"])
         self.assertFalse(report["grants_live_authority"])
         self.assertFalse(report["authority_boundary"]["writes_eve_memory"])
         self.assertFalse(report["authority_boundary"]["changes_live_routing"])
@@ -301,12 +343,7 @@ class OssIntegrationTests(unittest.TestCase):
 
     def test_public_eval_requires_public_artifacts_and_intact_boundaries(self) -> None:
         fake_lab = FakeOssLab()
-        dvc_manifest = {
-            "status": "ready",
-            "file_count": 4,
-            "dvc": {"available": True, "initialized": False},
-            "boundary": {"grants_live_authority": False},
-        }
+        dvc_manifest = self.passing_dvc_snapshot()
         with patch.object(eve, "build_oss_dvc_dataset_manifest", return_value=dvc_manifest), patch.object(
             eve, "load_latest_oss_lab_report", return_value={}
         ), patch.object(eve, "load_latest_oss_pressure_eval", return_value={}), patch.object(
@@ -324,19 +361,16 @@ class OssIntegrationTests(unittest.TestCase):
 
         self.assertEqual("partial", eval_report["status"])
         self.assertIn("conversation_pressure_eval", eval_report["blocking"])
-        self.assertIn("trainer_no_download_dry_run_gate", eval_report["blocking"])
+        self.assertIn("trainer_no_download_forward_validation", eval_report["blocking"])
         self.assertIn("Public OSS evals must not include hidden evaluator prompts", eval_report["hidden_probe_policy"])
 
     def test_public_eval_passes_when_pressure_and_trainer_gate_pass(self) -> None:
         fake_lab = FakeOssLab()
-        dvc_manifest = {
-            "status": "ready",
-            "file_count": 4,
-            "dvc": {"available": True, "initialized": False},
-            "boundary": {"grants_live_authority": False},
-        }
+        dvc_manifest = self.passing_dvc_snapshot()
         with patch.object(eve, "build_oss_dvc_dataset_manifest", return_value=dvc_manifest), patch.object(
             eve, "load_latest_oss_lab_report", return_value={}
+        ), patch.object(
+            eve, "load_latest_oss_trainer_dry_run", return_value=self.passing_trainer_gate()
         ), patch.object(
             eve, "load_latest_oss_copilotkit_report", return_value=self.passing_copilotkit_probe()
         ), patch.object(
@@ -602,7 +636,7 @@ class OssIntegrationTests(unittest.TestCase):
                 }
             ]
             with patch.object(eve, "OSS_LAB_TRAINER_RECIPE_DIR", recipe_dir), patch.object(
-                eve, "oss_run_command", return_value={"status": "ok", "stdout_tail": "help", "returncode": 0}
+                eve, "resolve_oss_mlx_validation_model_path", return_value=(None, "missing")
             ):
                 report = eve.build_oss_trainer_dry_run_gate(save=False, lab_module=fake_lab)
 
@@ -611,14 +645,60 @@ class OssIntegrationTests(unittest.TestCase):
         self.assertTrue(report["boundary"]["no_download"])
         self.assertTrue(report["boundary"]["no_training_started"])
 
+    def test_trainer_gate_requires_real_no_train_forward_validation(self) -> None:
+        fake_lab = FakeOssLab()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            recipe_dir = root / "recipes"
+            recipe_dir.mkdir()
+            (recipe_dir / "mlx_lm_lora_recipe.yaml").write_text(
+                'model: "REPLACE_WITH_APPROVED_LOCAL_MLX_MODEL_PATH"\ntrain: false\ntest: true\n',
+                encoding="utf-8",
+            )
+            model = root / "model"
+            model.mkdir()
+            venv = root / "mlx-lm-py314"
+            cli = venv / "bin" / "mlx_lm.lora"
+            cli.parent.mkdir(parents=True)
+            cli.write_text("fixture", encoding="utf-8")
+            fake_lab.trainer_lab_envs = lambda verify=False: [
+                {
+                    "id": "mlx_lm",
+                    "status": "installed",
+                    "venv_path": str(venv),
+                    "expected_cli": "mlx_lm.lora",
+                }
+            ]
+            validation = {
+                "status": "passed",
+                "no_train_validation_performed": True,
+                "metrics": {"test_loss": 5.627, "test_perplexity": 277.738},
+                "blockers": [],
+                "boundary": {
+                    "no_download": True,
+                    "no_training_started": True,
+                    "adapter_loaded": False,
+                    "adapter_written": False,
+                },
+            }
+            with patch.object(eve, "OSS_LAB_TRAINER_RECIPE_DIR", recipe_dir), patch.object(
+                eve.eve_oss_validation, "perform_mlx_no_train_validation", return_value=validation
+            ) as forward:
+                report = eve.build_oss_trainer_dry_run_gate(
+                    base_model_path=str(model),
+                    save=False,
+                    lab_module=fake_lab,
+                )
+
+        self.assertEqual("passed", report["status"])
+        self.assertTrue(report["no_train_validation_performed"])
+        self.assertEqual(5.627, report["metrics"]["test_loss"])
+        self.assertFalse(report["boundary"]["adapter_written"])
+        forward.assert_called_once()
+
     def test_cycle_composes_trace_dataset_manifest_recipes_workflow_and_eval(self) -> None:
         fake_lab = FakeOssLab()
-        dvc_manifest = {
-            "status": "ready",
-            "file_count": 4,
-            "dvc": {"available": True, "initialized": False},
-            "boundary": {"grants_live_authority": False},
-        }
+        dvc_manifest = self.passing_dvc_snapshot()
         workflow = {"status": "completed", "engine": "native_replayable_fallback", "steps": []}
         dataset_report = {
             "status": "ready",
@@ -649,10 +729,10 @@ class OssIntegrationTests(unittest.TestCase):
         self.assertEqual("completed", report["status"])
         self.assertIn("trace_export", report["actions"])
         self.assertIn("training_dataset_build", report["actions"])
-        self.assertIn("dvc_manifest", report["actions"])
+        self.assertIn("dvc_snapshot_restore", report["actions"])
         self.assertIn("trainer_recipe_write", report["actions"])
         self.assertIn("conversation_pressure_eval", report["actions"])
-        self.assertIn("trainer_no_download_dry_run_gate", report["actions"])
+        self.assertIn("trainer_no_download_forward_validation", report["actions"])
         self.assertIn("copilotkit_exposure_map", report["actions"])
         self.assertEqual("passed", report["public_eval"]["status"])
         self.assertFalse(report["authority_boundary"]["promotes_models"])

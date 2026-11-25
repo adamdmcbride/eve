@@ -43,13 +43,36 @@ DISPLAY_NAMES = {
 }
 
 
-def provider_context_size(config: Mapping[str, object], profile: str) -> int:
+def provider_server_context_size(config: Mapping[str, object], profile: str) -> int:
     field = eve_model_topology.profile_config_field(profile, "ctx_size")
     defaults = {"fast": 16384, "deep": 32768, "observer": 16384}
     try:
         return max(2048, int(config.get(field) or defaults.get(profile, 8192)))
     except (TypeError, ValueError):
         return defaults.get(profile, 8192)
+
+
+def provider_parallel_slots(config: Mapping[str, object], profile: str) -> int:
+    field = eve_model_topology.profile_config_field(profile, "parallel_slots")
+    try:
+        return max(1, int(config.get(field) or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def provider_context_size(config: Mapping[str, object], profile: str) -> int:
+    """Return the config-derived context available to one provider request.
+
+    llama.cpp divides ``--ctx-size`` across ``--parallel`` slots. OpenClaw's
+    ``contextWindow`` is per request, so publishing the server-wide total makes
+    its compaction planner overrun any shared substrate. Live capability
+    attestation independently checks this conservative declaration against
+    ``/props`` and ``/slots`` after the profile is rendered.
+    """
+
+    total_context = provider_server_context_size(config, profile)
+    parallel_slots = provider_parallel_slots(config, profile)
+    return max(2048, total_context // parallel_slots)
 
 
 def default_provider(
@@ -163,6 +186,8 @@ def reconcile_openclaw_topology_config(
             else {}
         )
         context_window = provider_context_size(eve_config, substrate_profile)
+        server_context_window = provider_server_context_size(eve_config, substrate_profile)
+        parallel_slots = provider_parallel_slots(eve_config, substrate_profile)
         max_tokens = 1024 if substrate_profile == "deep" else 512
         shared = lane != substrate_profile
         display_name = DISPLAY_NAMES[lane]
@@ -220,6 +245,9 @@ def reconcile_openclaw_topology_config(
                 "substrate_profile": substrate_profile,
                 "substrate_model": substrate_model,
                 "base_url": provider["baseUrl"],
+                "server_context_window": server_context_window,
+                "parallel_slots": parallel_slots,
+                "context_window": context_window,
                 "shared": shared,
             }
         )

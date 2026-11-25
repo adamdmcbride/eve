@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ MANIFEST_PATH = ROOT / "eve_epistemic_event_v1.json"
 TRAINER_PATH = ROOT / "bin" / "eve_epistemic_event_train.py"
 WORKER_PATH = ROOT / "bin" / "eve_epistemic_event_worker.py"
 MODEL_CONTRACT_PATH = ROOT / "bin" / "eve_epistemic_event_model.py"
+CURRICULUM_GENERATOR_PATH = ROOT / "bin" / "eve_boundary_curriculum.py"
 TECHLAB_PYTHON = ROOT / ".venv-techlab" / "bin" / "python"
 
 
@@ -27,6 +29,40 @@ def file_sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def model_dir_candidates(manifest) -> list:
+    """Where the manifest's model directory may live, in the worker's search order.
+
+    Mirrors the model-directory search in bin/eve_epistemic_event_worker.py.
+    """
+    model_path = Path(str(manifest.get("model_path") or ""))
+    if model_path.is_absolute():
+        return [model_path]
+    candidates = [ROOT / model_path]
+    for env_name in ("EVE_SOURCE_DIR", "EVE_PROJECT_ROOT"):
+        if os.environ.get(env_name, "").strip():
+            candidates.append(Path(os.environ[env_name]).expanduser() / model_path)
+    candidates.append(Path.home() / "Documents" / "Finances" / "Eve" / model_path)
+    return candidates
+
+
+def resolve_model_dir(manifest):
+    """The first candidate directory holding model.safetensors, else None."""
+    for candidate in model_dir_candidates(manifest):
+        if (candidate / "model.safetensors").is_file():
+            return candidate
+    return None
+
+
+def real_worker_missing_artifacts(manifest) -> list:
+    """Paths the real worker needs that are not distributed with source."""
+    missing = []
+    if not TECHLAB_PYTHON.exists():
+        missing.append(str(TECHLAB_PYTHON))
+    if resolve_model_dir(manifest) is None:
+        missing.append(str(model_dir_candidates(manifest)[0] / "model.safetensors"))
+    return missing
 
 
 class TypedEpistemicEventModelTests(unittest.TestCase):
@@ -39,6 +75,29 @@ class TypedEpistemicEventModelTests(unittest.TestCase):
         cls.manifest = eve_epistemic.validate_event_manifest(
             json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
         )
+        # data/eve_training/* is not checked in, so the public curriculum is
+        # rebuilt from its deterministic in-repo generator into a temp dir;
+        # test_public_dataset_has_four_disjoint_splits pins its digest to the
+        # manifest's curriculum_sha256.
+        generator_spec = importlib.util.spec_from_file_location(
+            "eve_boundary_curriculum_event_test", CURRICULUM_GENERATOR_PATH
+        )
+        generator = importlib.util.module_from_spec(generator_spec)
+        assert generator_spec.loader is not None
+        generator_spec.loader.exec_module(generator)
+        cls._curriculum_dir = tempfile.TemporaryDirectory()
+        cls.curriculum_path = (
+            Path(cls._curriculum_dir.name) / "public_boundary_curriculum.jsonl"
+        )
+        cls.curriculum_path.write_text(
+            generator.jsonl_text(generator.build_curriculum()), encoding="utf-8"
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        curriculum_dir = getattr(cls, "_curriculum_dir", None)
+        if curriculum_dir is not None:
+            curriculum_dir.cleanup()
 
     @staticmethod
     def _with_passing_public_gate(manifest, trainer):
@@ -174,13 +233,29 @@ class TypedEpistemicEventModelTests(unittest.TestCase):
             self.assertFalse(public_gate["passed"])
             self.assertEqual("deferred", manifest["validation"]["status"])
             self.assertFalse(eve_epistemic.event_manifest_live_admitted(manifest))
-        self.assertEqual(file_sha256(TRAINER_PATH), manifest["training"]["trainer_sha256"])
-        model_file = ROOT / manifest["model_path"] / "model.safetensors"
-        self.assertTrue(model_file.is_file())
+        self.assertEqual(
+            file_sha256(TRAINER_PATH),
+            manifest["training"]["trainer_sha256"],
+            f"{TRAINER_PATH.relative_to(ROOT)} no longer matches the trainer that "
+            f"produced {MANIFEST_PATH.name} (model {manifest['model_id']}): the trainer "
+            "source changed after training, so the checked-in manifest's provenance is "
+            "stale; retrain or re-finalize the candidate with the current trainer, or "
+            "restore the recorded trainer",
+        )
+        # The trainer-provenance assertion above must stay ahead of this guard:
+        # the weights are not distributed with source, and a missing model must
+        # never hide a stale manifest.
+        model_dir = resolve_model_dir(manifest)
+        if model_dir is None:
+            raise unittest.SkipTest(
+                "model weights are not distributed with source: "
+                + str(model_dir_candidates(manifest)[0] / "model.safetensors")
+            )
+        model_file = model_dir / "model.safetensors"
         self.assertEqual(manifest["model_file_sha256"], file_sha256(model_file))
         self.assertEqual(manifest["model_file_sha256"], manifest["model_files_sha256"]["model.safetensors"])
         for relative, expected in manifest["model_files_sha256"].items():
-            self.assertEqual(expected, file_sha256(ROOT / manifest["model_path"] / relative))
+            self.assertEqual(expected, file_sha256(model_dir / relative))
 
     def test_event_input_preserves_case_for_cased_nli_attribution(self):
         self.assertEqual(
@@ -217,7 +292,12 @@ class TypedEpistemicEventModelTests(unittest.TestCase):
         trainer = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
         spec.loader.exec_module(trainer)
-        splits = trainer.public_records(trainer.DEFAULT_CURRICULUM)
+        self.assertEqual(
+            self.manifest["training"]["curriculum_sha256"],
+            file_sha256(self.curriculum_path),
+            "bin/eve_boundary_curriculum.py output drifted from the manifest's curriculum",
+        )
+        splits = trainer.public_records(self.curriculum_path)
         self.assertEqual(4, len(splits))
         ids = [{record["id"] for record in records} for records in splits]
         texts = [
@@ -236,15 +316,24 @@ class TypedEpistemicEventModelTests(unittest.TestCase):
             )
         )
         expected_digests = self.manifest["training"]["split_sha256"]
+        actual_digests = {
+            name: trainer.records_sha256(records)
+            for name, records in zip(
+                ("train", "calibration", "selection", "validation"),
+                splits,
+            )
+        }
+        drifted = sorted(
+            name for name in expected_digests if actual_digests.get(name) != expected_digests[name]
+        )
         self.assertEqual(
             expected_digests,
-            {
-                name: trainer.records_sha256(records)
-                for name, records in zip(
-                    ("train", "calibration", "selection", "validation"),
-                    splits,
-                )
-            },
+            actual_digests,
+            f"public_records split digests drifted for {drifted}: the curriculum still "
+            f"matches {MANIFEST_PATH.name} curriculum_sha256, so the trainer's generated "
+            "and structural records changed after this model was trained (its "
+            "trainer_sha256 no longer matches bin/eve_epistemic_event_train.py); retrain "
+            "or re-finalize the candidate with the current trainer",
         )
 
     def test_typed_slot_targets_roundtrip_every_public_event(self):
@@ -260,7 +349,7 @@ class TypedEpistemicEventModelTests(unittest.TestCase):
         contract = importlib.util.module_from_spec(model_spec)
         assert model_spec.loader is not None
         model_spec.loader.exec_module(contract)
-        for records in trainer.public_records(trainer.DEFAULT_CURRICULUM):
+        for records in trainer.public_records(self.curriculum_path):
             for record in records:
                 expected = set(record.get("epistemic_labels") or [])
                 target = contract.labels_to_slot_targets(expected)
@@ -343,7 +432,7 @@ class TypedEpistemicEventModelTests(unittest.TestCase):
         trainer = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
         spec.loader.exec_module(trainer)
-        splits = trainer.public_records(trainer.DEFAULT_CURRICULUM)
+        splits = trainer.public_records(self.curriculum_path)
         required = {
             "external_preference_question",
             "action_proposed_contrast",
@@ -370,7 +459,7 @@ class TypedEpistemicEventModelTests(unittest.TestCase):
         assert spec.loader is not None
         spec.loader.exec_module(trainer)
         train, calibration, selection, validation = trainer.public_records(
-            trainer.DEFAULT_CURRICULUM
+            self.curriculum_path
         )
         challenge = lambda records: [
             record
@@ -522,45 +611,27 @@ class TypedEpistemicEventModelTests(unittest.TestCase):
         self.assertFalse(normalize(opened_v12) & normalize(validation))
 
     def test_threshold_tie_prefers_the_stricter_boundary(self):
-        script = f"""
-import importlib.util, json
-spec = importlib.util.spec_from_file_location('trainer', {str(TRAINER_PATH)!r})
-trainer = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(trainer)
-threshold, metrics = trainer.choose_threshold([0.9, 0.8, 0.1], [True, True, False])
-print(json.dumps({{'threshold': threshold, 'metrics': metrics}}))
-"""
-        completed = subprocess.run(
-            [str(TECHLAB_PYTHON), "-c", script],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
+        spec = importlib.util.spec_from_file_location(
+            "eve_epistemic_event_train_threshold_tie", TRAINER_PATH
         )
-        payload = json.loads(completed.stdout)
+        trainer = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(trainer)
+        threshold, metrics = trainer.choose_threshold([0.9, 0.8, 0.1], [True, True, False])
+        payload = json.loads(json.dumps({"threshold": threshold, "metrics": metrics}))
         self.assertGreater(payload["threshold"], 0.5)
         self.assertEqual(1.0, payload["metrics"]["precision"])
         self.assertEqual(1.0, payload["metrics"]["recall"])
 
     def test_threshold_calibration_never_admits_near_zero_entailment(self):
-        script = f"""
-import importlib.util, json
-spec = importlib.util.spec_from_file_location('trainer', {str(TRAINER_PATH)!r})
-trainer = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(trainer)
-threshold, metrics = trainer.choose_threshold([0.24, 0.02, 0.01], [True, False, False])
-print(json.dumps({{'threshold': threshold, 'metrics': metrics}}))
-"""
-        completed = subprocess.run(
-            [str(TECHLAB_PYTHON), "-c", script],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
+        spec = importlib.util.spec_from_file_location(
+            "eve_epistemic_event_train_threshold_floor", TRAINER_PATH
         )
-        payload = json.loads(completed.stdout)
+        trainer = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(trainer)
+        threshold, metrics = trainer.choose_threshold([0.24, 0.02, 0.01], [True, False, False])
+        payload = json.loads(json.dumps({"threshold": threshold, "metrics": metrics}))
         self.assertGreaterEqual(payload["threshold"], 0.25)
 
     def test_threshold_calibration_cannot_hide_structural_recall_in_aggregate(self):
@@ -862,6 +933,12 @@ print(json.dumps({{'threshold': threshold, 'metrics': metrics}}))
         self.assertTrue(merged["flags"]["observer_attention"])
 
     def test_real_worker_returns_provenance_without_echoing_prompt(self):
+        missing = real_worker_missing_artifacts(self.manifest)
+        if missing:
+            raise unittest.SkipTest(
+                "real epistemic-event worker artifacts are not distributed with "
+                "source: " + ", ".join(missing)
+            )
         non_echo_sentinel = "sentinel-amber-417"
         completed = subprocess.run(
             [

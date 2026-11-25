@@ -3,8 +3,9 @@
 
 This installer deliberately stops short of downloading models, enabling hosted
 providers, or installing a background service.  It creates the locked Python
-environment and, unless asked not to, builds Eve's local runtime mirror.  The
-operator chooses models and service installation after reviewing ``eve doctor``.
+environment, installs a relocation-safe ``eve`` source command, and, unless
+asked not to, builds Eve's local runtime mirror.  The operator chooses models
+and service installation after reviewing ``eve doctor``.
 """
 
 from __future__ import annotations
@@ -15,20 +16,48 @@ import os
 import platform
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
 
 MIN_PYTHON = (3, 12)
 MAX_PYTHON = (3, 15)
+BOOTSTRAP_REPORT_SCHEMA_VERSION = 2
 REQUIRED_SOURCE_FILES = (
     "eve.py",
     "eve_platform.py",
     "pyproject.toml",
     "uv.lock",
 )
+INSTALL_OUTPUT_TAIL_BYTES = 8 * 1024
+
+
+class InstallCommandError(RuntimeError):
+    """Describe one failed install step without losing partial-progress truth."""
+
+    def __init__(
+        self,
+        *,
+        command_index: int,
+        command: Sequence[str],
+        returncode: int | None,
+        output_tail: str = "",
+        cause: BaseException | None = None,
+    ) -> None:
+        self.command_index = command_index
+        self.command = tuple(command)
+        self.returncode = returncode
+        self.output_tail = output_tail
+        self.cause = cause
+        if returncode is None:
+            detail = str(cause) if cause else "the command could not be started"
+        else:
+            detail = f"the command exited with code {returncode}"
+        super().__init__(detail)
 
 
 def source_root() -> Path:
@@ -137,7 +166,7 @@ def preflight_report(
     failures = [item for item in checks if item["required"] and item["status"] == "fail"]
     warnings = [item for item in checks if item["status"] == "warning"]
     return {
-        "schema_version": 1,
+        "schema_version": BOOTSTRAP_REPORT_SCHEMA_VERSION,
         "root": str(root),
         "platform": system_name,
         "ok": not failures,
@@ -153,6 +182,83 @@ def venv_python(root: Path, *, system: str | None = None) -> Path:
     return root / ".venv" / "bin" / "python"
 
 
+def source_cli_path(root: Path, *, system: str | None = None) -> Path:
+    """Return the source-install launcher path for the current platform."""
+
+    if (system or platform.system()) == "Windows":
+        return root / ".venv" / "Scripts" / "eve.cmd"
+    return root / ".venv" / "bin" / "eve"
+
+
+def source_cli_content(*, system: str | None = None) -> str:
+    """Build a relocation-safe launcher for a source checkout.
+
+    This deliberately remains a source launcher rather than pretending the
+    monolith is already a distributable Python package.  Both forms resolve
+    ``eve.py`` relative to the launcher inside ``.venv`` so moving or renaming
+    the checkout does not leave an embedded absolute path behind.
+    """
+
+    if (system or platform.system()) == "Windows":
+        return (
+            "@echo off\r\n"
+            "setlocal\r\n"
+            'set "SCRIPT_DIR=%~dp0"\r\n'
+            'for %%I in ("%SCRIPT_DIR%\\..\\..") do set "ROOT_DIR=%%~fI"\r\n'
+            '"%SCRIPT_DIR%python.exe" "%ROOT_DIR%\\eve.py" %*\r\n'
+            "exit /b %ERRORLEVEL%\r\n"
+        )
+    return (
+        "#!/bin/sh\n"
+        "set -eu\n"
+        'SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"\n'
+        'ROOT_DIR="$(CDPATH= cd -- "${SCRIPT_DIR}/../.." && pwd -P)"\n'
+        'exec "${SCRIPT_DIR}/python" "${ROOT_DIR}/eve.py" "$@"\n'
+    )
+
+
+def install_source_cli(root: Path, *, system: str | None = None) -> Path:
+    """Atomically install the stable ``eve`` source-checkout command."""
+
+    root = root.expanduser().resolve()
+    python = venv_python(root, system=system)
+    if not python.is_file():
+        raise FileNotFoundError(
+            f"Eve's locked interpreter is missing at {python}; run `uv sync --frozen` first."
+        )
+    if not (root / "eve.py").is_file():
+        raise FileNotFoundError(f"Eve's compatibility entrypoint is missing at {root / 'eve.py'}.")
+
+    destination = source_cli_path(root, system=system)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=str(destination.parent),
+        text=True,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            handle.write(source_cli_content(system=system))
+            handle.flush()
+            os.fsync(handle.fileno())
+        if (system or platform.system()) != "Windows":
+            temporary.chmod(
+                stat.S_IRUSR
+                | stat.S_IWUSR
+                | stat.S_IXUSR
+                | stat.S_IRGRP
+                | stat.S_IXGRP
+                | stat.S_IROTH
+                | stat.S_IXOTH
+            )
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
 def install_plan(
     root: Path,
     *,
@@ -166,8 +272,17 @@ def install_plan(
     for extra in dict.fromkeys(item.strip() for item in extras if item.strip()):
         sync_command.extend(["--extra", extra])
     commands = [sync_command]
+    python = str(venv_python(root, system=system))
+    commands.append(
+        [
+            python,
+            str(root / "bin" / "eve_bootstrap.py"),
+            "--root",
+            str(root),
+            "install-cli",
+        ]
+    )
     if sync_runtime:
-        python = str(venv_python(root, system=system))
         commands.extend(
             [
                 [python, str(root / "eve.py"), "runtime", "sync"],
@@ -188,7 +303,7 @@ def completion_lines(*, runtime_synced: bool) -> tuple[str, ...]:
         ready = "Eve's source environment is ready; the runtime mirror was intentionally not created."
     return (
         ready,
-        "Next: configure a local llama.cpp host, then run `.venv/bin/python eve.py doctor`.",
+        "Next: configure a local llama.cpp host, then run `.venv/bin/eve doctor`.",
         "Background services are not installed automatically.",
     )
 
@@ -208,23 +323,103 @@ def render_report(report: Mapping[str, object]) -> str:
     return "\n".join(lines)
 
 
+def install_output_tail(handle, *, limit: int = INSTALL_OUTPUT_TAIL_BYTES) -> str:
+    """Read a bounded UTF-8 tail from a seekable binary command-output file."""
+
+    handle.flush()
+    handle.seek(0, os.SEEK_END)
+    size = handle.tell()
+    start = max(0, size - max(1, limit))
+    handle.seek(start)
+    output = handle.read().decode("utf-8", errors="replace").strip()
+    return f"…\n{output}" if start > 0 and output else output
+
+
 def execute_install(
     root: Path,
     commands: Sequence[Sequence[str]],
     *,
     env: Mapping[str, str] | None = None,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-) -> None:
+    isolate_output: bool = False,
+) -> list[dict[str, object]]:
     process_env = dict(os.environ if env is None else env)
-    process_env.setdefault("PYTHONPYCACHEPREFIX", "/tmp/eve_bootstrap_pycache")
-    for command in commands:
-        runner(
-            list(command),
-            cwd=str(root),
-            env=process_env,
-            text=True,
-            check=True,
-        )
+    process_env.setdefault(
+        "PYTHONPYCACHEPREFIX",
+        str(Path(tempfile.gettempdir()) / "eve_bootstrap_pycache"),
+    )
+    receipts: list[dict[str, object]] = []
+    for index, command in enumerate(commands):
+        command_parts = list(command)
+        try:
+            if isolate_output:
+                with tempfile.TemporaryFile(mode="w+b") as command_output:
+                    try:
+                        completed = runner(
+                            command_parts,
+                            cwd=str(root),
+                            env=process_env,
+                            text=True,
+                            check=True,
+                            stdout=command_output,
+                            stderr=subprocess.STDOUT,
+                        )
+                    except subprocess.CalledProcessError as exc:
+                        raise InstallCommandError(
+                            command_index=index,
+                            command=command_parts,
+                            returncode=exc.returncode,
+                            output_tail=install_output_tail(command_output),
+                            cause=exc,
+                        ) from exc
+            else:
+                completed = runner(
+                    command_parts,
+                    cwd=str(root),
+                    env=process_env,
+                    text=True,
+                    check=True,
+                )
+        except InstallCommandError:
+            raise
+        except subprocess.CalledProcessError as exc:
+            raise InstallCommandError(
+                command_index=index,
+                command=command_parts,
+                returncode=exc.returncode,
+                cause=exc,
+            ) from exc
+        except OSError as exc:
+            raise InstallCommandError(
+                command_index=index,
+                command=command_parts,
+                returncode=None,
+                cause=exc,
+            ) from exc
+
+        returncode = int(getattr(completed, "returncode", 0))
+        receipts.append({"command_index": index, "command": command_parts, "returncode": returncode})
+    return receipts
+
+
+def install_failure_payload(
+    payload: Mapping[str, object],
+    failure: InstallCommandError,
+) -> dict[str, object]:
+    result = {
+        **payload,
+        "ok": False,
+        "install_status": "failed",
+        "completed_command_count": failure.command_index,
+        "failed_command_index": failure.command_index,
+        "failed_command": list(failure.command),
+        "returncode": failure.returncode,
+        "error": str(failure),
+        "rollback_performed": False,
+    }
+    if failure.output_tail:
+        result["output_tail"] = failure.output_tail
+    return result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -234,6 +429,11 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     check_parser = subparsers.add_parser("check", help="Check prerequisites without changing the machine")
     check_parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    install_cli = subparsers.add_parser(
+        "install-cli",
+        help="Install the relocation-safe eve command into the locked source environment",
+    )
+    install_cli.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     install = subparsers.add_parser("install", help="Create the locked environment and local runtime mirror")
     install.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     install.add_argument("--extra", action="append", default=[], choices=("dev", "infra", "techlab", "oss-lab"))
@@ -245,6 +445,34 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     root = args.root.expanduser().resolve()
+    if args.command == "install-cli":
+        try:
+            path = install_source_cli(root)
+        except (FileNotFoundError, OSError) as exc:
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "schema_version": BOOTSTRAP_REPORT_SCHEMA_VERSION,
+                            "ok": False,
+                            "error": str(exc),
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+            else:
+                print(f"Could not install Eve's source command: {exc}", file=sys.stderr)
+            return 1
+        payload = {
+            "schema_version": BOOTSTRAP_REPORT_SCHEMA_VERSION,
+            "ok": True,
+            "launcher": str(path),
+            "source_root": str(root),
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True) if args.json else f"Installed Eve source command at {path}")
+        return 0
+
     report = preflight_report(root)
     if args.command == "check":
         print(json.dumps(report, indent=2, sort_keys=True) if args.json else render_report(report))
@@ -258,21 +486,57 @@ def main(argv: Sequence[str] | None = None) -> int:
         extras=args.extra,
         sync_runtime=not args.skip_runtime_sync,
     )
-    payload = {**report, "dry_run": bool(args.dry_run), "commands": [list(item) for item in commands]}
-    if args.json:
-        print(json.dumps(payload, indent=2, sort_keys=True))
-    else:
+    payload = {
+        **report,
+        "dry_run": bool(args.dry_run),
+        "commands": [list(item) for item in commands],
+        "completed_command_count": 0,
+    }
+    if not args.json:
         print(render_report(report))
         print("\nInstall plan:")
         for command in commands:
             print("  " + command_text(command))
 
     if not report["ok"]:
+        if args.json:
+            print(json.dumps({**payload, "install_status": "blocked"}, indent=2, sort_keys=True))
         return 1
     if args.dry_run:
+        if args.json:
+            print(json.dumps({**payload, "install_status": "planned"}, indent=2, sort_keys=True))
         return 0
-    execute_install(root, commands)
-    if not args.json:
+    try:
+        receipts = execute_install(root, commands, isolate_output=args.json)
+    except InstallCommandError as exc:
+        failure = install_failure_payload(payload, exc)
+        if args.json:
+            print(json.dumps(failure, indent=2, sort_keys=True))
+        else:
+            print(
+                f"\nInstall stopped at step {exc.command_index + 1} of {len(commands)}: "
+                f"{command_text(exc.command)}",
+                file=sys.stderr,
+            )
+            print(f"Reason: {exc}", file=sys.stderr)
+            if exc.output_tail:
+                print("Command output (bounded tail):", file=sys.stderr)
+                print(exc.output_tail, file=sys.stderr)
+            print("No later install steps were run; completed earlier steps were not rolled back.", file=sys.stderr)
+        return 1
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    **payload,
+                    "install_status": "completed",
+                    "completed_command_count": len(receipts),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
         print()
         for line in completion_lines(runtime_synced=not args.skip_runtime_sync):
             print(line)

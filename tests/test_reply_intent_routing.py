@@ -11,6 +11,51 @@ import eve
 
 
 class ReplyIntentRoutingTests(unittest.TestCase):
+    def setUp(self):
+        # Routing fixtures must not poll launchd, initialize canonical stores,
+        # or launch the live semantic-model worker as incidental preflight.
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(patch.object(eve, "active_reply_repair_flags", return_value=set()))
+        stack.enter_context(patch.object(eve, "daemon_runtime_running", return_value=False))
+        stack.enter_context(patch.object(eve, "ensure_store"))
+        # These repositories captured the original ensure_store callable at
+        # construction, so patching the facade alone cannot isolate their reads.
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        for name, filename in (("ENTRIES_PATH", "entries.jsonl"), ("MESSAGES_PATH", "messages.jsonl")):
+            stack.enter_context(patch.object(eve, name, Path(temporary.name) / filename))
+        repositories = (eve.CONFIG_REPOSITORY, eve.STATE_REPOSITORY, eve.SELF_MODEL_REPOSITORY,
+                        eve.WORLD_MODEL_REPOSITORY, eve.CONSCIOUS_STATE_REPOSITORY, eve.GLOBAL_WORKSPACE_REPOSITORY,
+                        eve.HOMEOSTASIS_REPOSITORY)
+        for index, repository in enumerate(repositories):
+            isolated_path = Path(temporary.name) / f"repository-{index}.json"
+            stack.enter_context(patch.object(repository, "_ensure_store"))
+            stack.enter_context(patch.object(repository, "local_path", isolated_path))
+            stack.enter_context(patch.object(repository, "_read_path_resolver", side_effect=lambda path, prefer_runtime: path))
+        identity = eve.normalize_runtime_identity({})
+        stack.enter_context(patch.object(eve, "ensure_runtime_identity", return_value=identity))
+        stack.enter_context(patch.object(eve, "load_runtime_identity", return_value=identity))
+        stack.enter_context(patch.object(eve, "load_human_context", return_value=eve.normalize_human_context({})))
+        stack.enter_context(patch.object(eve, "load_active_mind", return_value={}))
+        # These fixtures assert routing, not live recurrence or learned memory.
+        # Lineage/cycle tests explicitly replace these neutral port receipts.
+        stack.enter_context(patch.object(eve, "observe_inbound_reply_consequence", return_value=None))
+        stack.enter_context(patch.object(eve, "build_reply_other_minds_preflight_state", return_value={}))
+        stack.enter_context(patch.object(eve, "build_recurrent_conscious_state", return_value={}))
+        stack.enter_context(patch.object(eve, "complete_recurrent_conscious_cycle", return_value={}))
+        stack.enter_context(patch.object(eve, "record_user_correction", return_value=None))
+        stack.enter_context(patch.object(eve, "interactive_human_context", return_value=eve.normalize_human_context({})))
+        stack.enter_context(patch.object(eve, "_running_llama_behavior_specs", return_value=[]))
+        # Individual model/prompt tests override this with their declared fixture.
+        # An unstubbed critic is unavailable evidence, never a live model call.
+        stack.enter_context(patch.object(eve, "model_chat", side_effect=SystemExit("unconfigured routing-fixture model call")))
+        original_frame = eve.build_epistemic_perception_frame
+        def sparse_frame(*args, **kwargs):
+            kwargs["allow_semantic"] = False
+            return original_frame(*args, **kwargs)
+        stack.enter_context(patch.object(eve, "build_epistemic_perception_frame", side_effect=sparse_frame))
+
     def test_existential_question_rejects_openclaw_status_reply(self):
         issues = eve.reply_quality_issues(
             "What is the purpose of life?",
@@ -2281,6 +2326,12 @@ class ReplyIntentRoutingTests(unittest.TestCase):
                 },
             ) as run_agent,
             patch.object(eve, "run_operational_action_tree") as action_tree,
+            patch.object(
+                eve,
+                "rewrite_reply_for_clarity",
+                side_effect=lambda config, base_messages, inbound_body, draft, issues, **kwargs: draft,
+            ) as rewrite_reply,
+            patch.object(eve, "verify_epistemic_semantic_candidates", return_value=([], "", "")),
         ):
             exit_code = eve.cmd_chat(args)
 

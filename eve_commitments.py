@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 import uuid
 
-import eve_store
+import eve_records
+from eve_records import normalize_text, normalize_text_list, utc_now
 
 
 COMMITMENT_KINDS = {"suggestion", "offer", "plan", "commitment"}
@@ -20,38 +20,6 @@ COMMITMENT_STATUSES = {
     "capability_gap",
     "cancelled",
 }
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def normalize_text(value: object, fallback: str = "", limit: int = 320) -> str:
-    text = " ".join(str(value or "").split()).strip()
-    if not text:
-        return fallback
-    if limit > 0 and len(text) > limit:
-        return text[: max(0, limit - 1)].rstrip() + "..."
-    return text
-
-
-def normalize_text_list(value: object, limit: int = 8, item_limit: int = 180) -> List[str]:
-    if not isinstance(value, list):
-        return []
-    items: List[str] = []
-    seen = set()
-    for raw in value:
-        text = normalize_text(raw, fallback="", limit=item_limit)
-        if not text:
-            continue
-        key = text.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        items.append(text)
-        if len(items) >= limit:
-            break
-    return items
 
 
 def normalize_commitment_record(payload: Dict[str, object]) -> Dict[str, object]:
@@ -134,9 +102,7 @@ def create_commitment_record(
 
 
 def append_commitment_record(path: Path, record: Dict[str, object]) -> Dict[str, object]:
-    normalized = normalize_commitment_record(record)
-    eve_store.append_jsonl_record(path, normalized, ensure_ascii=True)
-    return normalized
+    return eve_records.append_normalized_record(path, record, normalize=normalize_commitment_record)
 
 
 def read_commitment_records(
@@ -146,16 +112,15 @@ def read_commitment_records(
     status: Optional[str] = None,
     source: Optional[str] = None,
 ) -> List[Dict[str, object]]:
-    if limit is not None and not status and not source:
-        raw_records = eve_store.read_jsonl_tail_records(path, limit)
-    else:
-        raw_records = eve_store.read_jsonl_records(path)
-    records = [normalize_commitment_record(item) for item in raw_records]
+    filters = {}
     if status:
-        records = [item for item in records if item.get("status") == status]
+        filters["status"] = status
     if source:
-        records = [item for item in records if item.get("source") == source]
-    records.sort(key=lambda item: item.get("created_at") or item.get("updated_at") or "", reverse=True)
-    if limit is not None:
-        records = records[:limit]
-    return records
+        filters["source"] = source
+    return eve_records.read_normalized_records(
+        path,
+        normalize=normalize_commitment_record,
+        limit=limit,
+        filters=filters,
+        sort_key=lambda item: item.get("created_at") or item.get("updated_at") or "",
+    )

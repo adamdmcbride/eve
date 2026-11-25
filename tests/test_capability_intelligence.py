@@ -299,6 +299,23 @@ class FakeRunner:
         raise AssertionError(f"unexpected command: {args}")
 
 
+class PermissionLimitedOpenClawRunner:
+    def __call__(self, command, timeout, env=None):
+        del timeout, env
+        args = [str(item) for item in command]
+        if args[-1] == "--version" and "qmd" in args[0]:
+            return subprocess.CompletedProcess(args, 0, "qmd 2.8.3\n", "")
+        if args[-1] == "--version" and "mcporter" in args[0]:
+            return subprocess.CompletedProcess(args, 0, "0.13.7\n", "")
+        if args[-1] == "--version" and "openclaw" in args[0]:
+            return subprocess.CompletedProcess(args, 0, "OpenClaw 2026.7.1-2 (abc)\n", "")
+        error = (
+            "[state/db] skipped permission hardening: Error: EPERM: operation not permitted; "
+            "plugin loader failed to load runtime extension llama-cpp/dist/index.js"
+        )
+        return subprocess.CompletedProcess(args, 1, "", error)
+
+
 class CapabilityIntelligenceUnitTests(unittest.TestCase):
     def test_openclaw_source_surface_is_not_promoted_to_callable_or_verified(self):
         surface = {
@@ -564,6 +581,88 @@ mcp_servers:
         self.assertNotIn("private content must not be copied", repr(snapshot))
         self.assertNotIn("never-log-this", repr(snapshot))
 
+    def test_permission_limited_openclaw_probe_preserves_last_authoritative_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "openclaw.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "memory": {"backend": "qmd"},
+                        "gateway": {"bind": "loopback"},
+                        "agents": {"defaults": {"workspace": temp_dir}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            authoritative = intelligence.collect_openclaw_snapshot(
+                profile="eve-repair",
+                config_path=config_path,
+                command="/opt/homebrew/bin/openclaw",
+                runner=FakeRunner(),
+            )
+            changed_config = json.loads(config_path.read_text(encoding="utf-8"))
+            changed_config["update"] = {"channel": "stable"}
+            config_path.write_text(json.dumps(changed_config), encoding="utf-8")
+            attempted = intelligence.collect_openclaw_snapshot(
+                profile="eve-repair",
+                config_path=config_path,
+                command="/opt/homebrew/bin/openclaw",
+                runner=PermissionLimitedOpenClawRunner(),
+            )
+
+        self.assertEqual("authoritative", authoritative["observation"]["status"])
+        self.assertEqual("inconclusive", attempted["observation"]["status"])
+        self.assertTrue(attempted["observation"]["environment_limited"])
+        self.assertGreaterEqual(attempted["observation"]["failed_probe_count"], 6)
+        self.assertFalse(attempted["config_valid"])
+
+        eve_snapshot = {
+            "id": "eve",
+            "organs": [],
+            "components": [],
+            "config_catalog": [],
+            "feature_ids": [],
+            "fingerprint": "eve",
+        }
+        hermes_snapshot = {
+            "id": "hermes",
+            "capability_families": [],
+            "config_catalog": [],
+            "feature_ids": [],
+            "fingerprint": "hermes",
+        }
+        previous = intelligence.build_snapshot(
+            source="host-authoritative-test",
+            eve=eve_snapshot,
+            openclaw=authoritative,
+            hermes=hermes_snapshot,
+        )
+        current = intelligence.build_snapshot(
+            source="restricted-runner-test",
+            eve=eve_snapshot,
+            openclaw=attempted,
+            hermes=hermes_snapshot,
+            previous=previous,
+        )
+
+        effective_openclaw = current["subsystems"]["openclaw"]
+        self.assertEqual(authoritative["fingerprint"], effective_openclaw["fingerprint"])
+        self.assertTrue(effective_openclaw["config_valid"])
+        self.assertEqual(
+            "preserved_last_authoritative",
+            effective_openclaw["latest_observation"]["state_action"],
+        )
+        self.assertEqual(1, len(current["observation_receipts"]))
+        self.assertTrue(
+            current["observation_receipts"][0]["config_changed_from_preserved_state"]
+        )
+        self.assertFalse(current["changes"]["material_change"])
+        self.assertNotIn(
+            {"subsystem": "openclaw", "field": "config_valid", "from": True, "to": False},
+            current["changes"]["health_changes"],
+        )
+        self.assertIn("last authoritative state was preserved", current["summary"])
+
     def test_qmd_memory_health_does_not_require_hosted_embedding_probe(self):
         payload = [
             {
@@ -752,6 +851,70 @@ mcp_servers:
         self.assertEqual(
             ["research:future-channel", "research:future-plugin"],
             snapshot["research_feature_ids"],
+        )
+
+    def test_eve_component_snapshot_retains_local_and_refresh_provenance(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot = intelligence.collect_eve_snapshot(
+                root=Path(temp_dir),
+                config={"model": "eve-fast"},
+                component_state={
+                    "components": [
+                        {
+                            "id": "qmd",
+                            "local_version": "2.8.3",
+                            "local_probe_ok": True,
+                            "local_probe_detail": "qmd 2.8.3",
+                            "mirror_status": "ready",
+                            "errors": [
+                                "Command timed out after 20s: npm view @tobilu/qmd version --json"
+                            ],
+                        }
+                    ]
+                },
+            )
+
+        component = snapshot["components"][0]
+        self.assertTrue(component["local_probe_ok"])
+        self.assertEqual("qmd 2.8.3", component["local_probe_detail"])
+        self.assertEqual("ready", component["mirror_status"])
+        self.assertEqual(
+            "remote_refresh_inconclusive",
+            component["refresh_observation"]["status"],
+        )
+
+    def test_eve_app_server_counts_as_a_persisted_config_consumer(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "bin").mkdir()
+            app_server = root / "bin" / "eve_app_server.py"
+            app_server.write_text(
+                'config.get("spotlight_projection_enabled")\n'
+                'config.get("spotlight_projection_approval_source")\n',
+                encoding="utf-8",
+            )
+
+            snapshot = intelligence.collect_eve_snapshot(
+                root=root,
+                config={"model": "eve-fast", "spotlight_projection_enabled": True},
+                default_config={"model": "eve-fast"},
+                persisted_config={
+                    "model": "eve-fast",
+                    "spotlight_projection_enabled": True,
+                    "spotlight_projection_approval_source": "operator-test",
+                },
+            )
+
+        provenance = snapshot["config_provenance"]
+        self.assertEqual([], provenance["dead_persisted_extra_keys"])
+        expected_consumer = str(app_server)
+        self.assertEqual(
+            [expected_consumer],
+            provenance["persisted_extra_consumers"]["spotlight_projection_enabled"],
+        )
+        self.assertEqual(
+            [expected_consumer],
+            provenance["persisted_extra_consumers"]["spotlight_projection_approval_source"],
         )
 
     def test_research_surface_drift_is_not_an_installed_material_change(self):
@@ -996,6 +1159,89 @@ mcp_servers:
         self.assertIn("hermes_supply_chain_findings", opportunity_ids)
         self.assertIn("hermes_upstream_update_canary", opportunity_ids)
 
+    def test_component_remote_refresh_failure_does_not_become_local_configuration_failure(self):
+        remote_error = (
+            "fatal: unable to access 'https://github.com/example/tool.git/': "
+            "Could not resolve host: github.com"
+        )
+        subsystems = {
+            "eve": {
+                "organs": [],
+                "components": [
+                    {
+                        "id": "installed-tool",
+                        "kind": "git_binary",
+                        "release_feature_mode": "installed_version",
+                        "local_version": "1.2.3",
+                        "local_probe_ok": True,
+                        "status": "check_degraded",
+                        "errors": [remote_error],
+                    },
+                    {
+                        "id": "source-reference",
+                        "kind": "git_repo",
+                        "release_feature_mode": "installed_version",
+                        "local_version": "",
+                        "local_probe_ok": False,
+                        "local_probe_detail": "no local command configured",
+                        "mirror_status": "ready",
+                        "status": "check_degraded",
+                        "errors": [remote_error],
+                    },
+                    {
+                        "id": "missing-installed-plugin",
+                        "kind": "npm_package",
+                        "release_feature_mode": "installed_version",
+                        "local_version": "",
+                        "local_probe_ok": False,
+                        "local_probe_detail": "expected plugin not found",
+                        "status": "check_degraded",
+                        "errors": ["Command timed out after 20s: npm view expected-plugin version --json"],
+                    },
+                    {
+                        "id": "openclaw-acpx",
+                        "kind": "npm_package",
+                        "release_feature_mode": "installed_version",
+                        "local_version": "",
+                        "local_probe_ok": False,
+                        "local_probe_detail": "OpenClaw plugin acpx not found",
+                        "status": "check_degraded",
+                        "errors": ["Command timed out after 20s: npm view @openclaw/acpx version --json"],
+                    },
+                ],
+            },
+            "openclaw": {
+                "feature_family_reviews": [],
+                "plugins": [
+                    {"id": "acpx", "version": "2026.7.1", "enabled": True, "status": "loaded"}
+                ],
+            },
+            "hermes": {"capability_families": []},
+        }
+
+        reviews = intelligence.build_subsystem_feature_family_reviews(subsystems)
+        by_id = {item["id"]: item for item in reviews}
+
+        self.assertEqual("use_existing", by_id["eve:component:installed-tool"]["decision"])
+        self.assertEqual(
+            "installed_refresh_inconclusive",
+            by_id["eve:component:installed-tool"]["current_state"],
+        )
+        self.assertEqual("defer", by_id["eve:component:source-reference"]["decision"])
+        self.assertEqual(
+            "source_reference_refresh_inconclusive",
+            by_id["eve:component:source-reference"]["current_state"],
+        )
+        self.assertEqual(
+            "configure",
+            by_id["eve:component:missing-installed-plugin"]["decision"],
+        )
+        self.assertEqual("use_existing", by_id["eve:component:openclaw-acpx"]["decision"])
+        self.assertIn(
+            "profile_owned_evidence=openclaw_profile_plugin_inventory",
+            by_id["eve:component:openclaw-acpx"]["evidence"],
+        )
+
     def test_nonblocking_hermes_security_findings_remain_monitored_not_reconfigured(self):
         subsystems = {
             "eve": {"organs": [], "components": []},
@@ -1220,6 +1466,41 @@ mcp_servers:
         self.assertEqual("effective", by_id["eve:organ:beads_work_graph_substrate"]["status"])
         self.assertEqual("effective", by_id["eve:oss_deepeval_agent_boundaries"]["status"])
         self.assertEqual(1.0, by_id["eve:oss_deepeval_agent_boundaries"]["consequence"]["permission_score"])
+
+    def test_effective_attestation_does_not_turn_restricted_organ_probe_into_degradation(self):
+        subsystems = {
+            "eve": {
+                "config_provenance": {},
+                "organs": [
+                    {
+                        "id": "oss_improvement_substrate",
+                        "status": "partial",
+                        "operational_status": "working",
+                        "summary": "Seven checks passed; the MLX forward check could not observe Metal.",
+                        "evidence": ["ready_checks=7/8"],
+                        "observation_complete": False,
+                        "observation_authoritative": False,
+                        "observation_environment_limited": True,
+                        "observation_blockers": ["trainer_no_train_forward_validation"],
+                        "authority_boundary": "Evidence only.",
+                    }
+                ],
+            },
+            "openclaw": {"feature_family_reviews": []},
+            "hermes": {"capability_families": []},
+        }
+
+        attestations = intelligence.build_effective_configuration_attestations(subsystems)
+        item = next(
+            row
+            for row in attestations
+            if row["id"] == "eve:organ:oss_improvement_substrate"
+        )
+
+        self.assertEqual("inconclusive_environment", item["status"])
+        self.assertNotEqual("degraded", item["status"])
+        self.assertTrue(item["runtime"]["observation_environment_limited"])
+        self.assertEqual(["trainer_no_train_forward_validation"], item["blockers"])
 
     def test_component_watchlist_covers_installed_improvement_substrates(self):
         ids = {item["id"] for item in eve.component_watchlist(eve.load_config())}
@@ -1741,6 +2022,87 @@ class CapabilityIntelligenceIntegrationTests(unittest.TestCase):
         self.assertIn("Known Blocked Latests", briefing)
         self.assertIn("incompatible Python syntax", briefing)
         self.assertNotIn("configured_values", repr(history_records[0]))
+
+    def test_source_refresh_does_not_mirror_over_live_runtime_authority(self):
+        snapshot = {
+            "schema_id": intelligence.SCHEMA_ID,
+            "id": "source-snapshot",
+            "generated_at": "2026-08-23T00:00:00+00:00",
+            "source": "manual",
+            "summary": "restricted source observation",
+            "fingerprint": "source-only",
+            "refresh": {"local": True},
+            "subsystems": {},
+            "release_feeds": [],
+            "changes": {"material_change": False, "baseline_created": False, "counts": {}},
+            "opportunities": [],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            latest = root / "latest.json"
+            history = root / "history.jsonl"
+            report = root / "report.md"
+            event = root / "event.jsonl"
+            with (
+                patch.object(eve, "CAPABILITY_INTELLIGENCE_PATH", latest),
+                patch.object(eve, "CAPABILITY_INTELLIGENCE_HISTORY_PATH", history),
+                patch.object(eve, "CAPABILITY_INTELLIGENCE_REPORT_PATH", report),
+                patch.object(eve, "EVENT_LEDGER_PATH", event),
+                patch.object(eve, "ensure_store", lambda: None),
+                patch.object(eve, "running_from_runtime_bundle", return_value=False),
+                patch.object(eve, "daemon_runtime_running", return_value=True),
+                patch.object(eve, "mirror_store_file_to_runtime") as mirror,
+            ):
+                saved = eve.save_capability_intelligence(snapshot)
+
+        self.assertEqual("source_only_preserved_live_runtime", saved["state_authority"]["persistence"])
+        self.assertFalse(saved["state_authority"]["runtime_mirror_written"])
+        mirror.assert_not_called()
+
+    def test_source_component_and_radar_observations_preserve_live_runtime_authority(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            radar_path = root / "radar.json"
+            component_path = root / "components.json"
+            with (
+                patch.object(eve, "AGENT_CAPABILITY_RADAR_PATH", radar_path),
+                patch.object(eve, "COMPONENT_UPDATE_STATE_PATH", component_path),
+                patch.object(eve, "ensure_store", lambda: None),
+                patch.object(eve, "running_from_runtime_bundle", return_value=False),
+                patch.object(eve, "daemon_runtime_running", return_value=True),
+                patch.object(eve, "mirror_store_file_to_runtime") as mirror,
+            ):
+                radar = eve.save_agent_capability_radar({"summary": "restricted source radar"})
+                components = eve.save_component_update_state(
+                    {"summary": "restricted source update check", "components": []}
+                )
+
+        self.assertEqual("source_only_preserved_live_runtime", radar["state_authority"]["persistence"])
+        self.assertFalse(radar["state_authority"]["runtime_mirror_written"])
+        self.assertEqual("source_only_preserved_live_runtime", components["state_authority"]["persistence"])
+        self.assertFalse(components["state_authority"]["runtime_mirror_written"])
+        mirror.assert_not_called()
+
+    def test_explicit_runtime_capability_refresh_delegates_to_runtime_bundle(self):
+        args = Namespace(
+            intelligence_command="refresh",
+            runtime=True,
+            upstream=False,
+            components=False,
+            hermes=True,
+            all=False,
+            timeout=45,
+            full=True,
+            json=False,
+        )
+        with patch.object(eve, "delegate_cli_to_runtime", return_value=7) as delegate:
+            result = eve.cmd_capabilities_intelligence(args)
+
+        self.assertEqual(7, result)
+        delegated_args = delegate.call_args.args[0]
+        self.assertEqual(["capabilities", "intelligence", "refresh"], delegated_args[:3])
+        self.assertIn("--hermes", delegated_args)
+        self.assertIn("--runtime", delegated_args)
 
     def test_cli_history_reads_compact_runtime_ledger(self):
         records = [{"generated_at": "2026-07-20T00:00:00+00:00", "source": "daemon", "changes": {"material_change": False, "counts": {}}, "opportunities": []}]

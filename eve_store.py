@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import errno
 import os
 import tempfile
 import threading
@@ -13,11 +14,20 @@ try:
 except ImportError:
     fcntl = None  # type: ignore[assignment]
 
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None  # type: ignore[assignment]
+
 
 _LOCK_REGISTRY_GUARD = threading.Lock()
 _THREAD_LOCAL = threading.local()
 _PATH_LOCKS: dict[str, threading.RLock] = {}
 _MACOS_DATALESS_FLAG = 0x40000000
+
+
+class LockBusy(RuntimeError):
+    """A nonblocking lock attempt did not acquire ownership."""
 
 
 def _path_key(path: Path) -> str:
@@ -66,6 +76,16 @@ def _thread_depths() -> dict[str, int]:
     return depths
 
 
+def _release_thread_lock(key: str, local_lock: threading.RLock) -> None:
+    depths = _thread_depths()
+    remaining = depths.get(key, 1) - 1
+    if remaining > 0:
+        depths[key] = remaining
+    else:
+        depths.pop(key, None)
+    local_lock.release()
+
+
 def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.tmp.", dir=path.parent)
@@ -89,45 +109,74 @@ def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None
 
 
 @contextmanager
-def file_lock(path: Path) -> Iterator[None]:
+def file_lock(path: Path, *, blocking: bool = True, reentrant: bool = True) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
     key = _path_key(path)
     local_lock = _path_lock(path)
     depths = _thread_depths()
-    local_lock.acquire()
+    if not local_lock.acquire(blocking=blocking):
+        raise LockBusy(str(path))
     already_held = depths.get(key, 0) > 0
     depths[key] = depths.get(key, 0) + 1
-    if already_held:
-        try:
+    handle = None
+    windows_lock_acquired = False
+    try:
+        if already_held:
+            if not reentrant:
+                raise LockBusy(str(path))
             yield
-        finally:
-            remaining = depths.get(key, 1) - 1
-            if remaining > 0:
-                depths[key] = remaining
-            else:
-                depths.pop(key, None)
-            local_lock.release()
-        return
-    lock_path = path.with_name(f".{path.name}.lock")
-    _remove_dataless_lock_placeholder(lock_path)
-    with lock_path.open("w", encoding="utf-8") as handle:
+            return
+
+        lock_path = path.with_name(f".{path.name}.lock")
+        _remove_dataless_lock_placeholder(lock_path)
+        flags = os.O_RDWR | os.O_CREAT
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(lock_path, flags, 0o600)
         try:
-            os.chmod(lock_path, 0o600)
-        except OSError:
-            pass
+            os.fchmod(descriptor, 0o600)
+            handle = os.fdopen(descriptor, "r+b", buffering=0)
+            descriptor = -1
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
         if fcntl is not None:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            remaining = depths.get(key, 1) - 1
-            if remaining > 0:
-                depths[key] = remaining
-            else:
-                depths.pop(key, None)
-            local_lock.release()
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            except OSError as exc:
+                if not blocking and exc.errno in {errno.EAGAIN, errno.EACCES}:
+                    raise LockBusy(str(path)) from exc
+                raise
+        elif msvcrt is not None:  # pragma: no cover - exercised by contract mock on non-Windows
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                if not blocking and exc.errno in {errno.EAGAIN, errno.EACCES, errno.EDEADLK}:
+                    raise LockBusy(str(path)) from exc
+                raise
+            windows_lock_acquired = True
+        elif not blocking:
+            raise RuntimeError("A kernel file-lock backend is required for exclusive ownership")
+        yield
+    finally:
+        # Closing releases the kernel flock. Cleanup failures must not replace
+        # an exception raised by the protected operation.
+        if handle is not None:
+            if windows_lock_acquired and msvcrt is not None:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            try:
+                handle.close()
+            except OSError:
+                pass
+        _release_thread_lock(key, local_lock)
 
 
 def parse_jsonl_line(line: str) -> Optional[Dict[str, object]]:

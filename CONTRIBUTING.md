@@ -39,6 +39,34 @@ daemon, downloads a model, or enables a hosted provider by itself.
 Some integration tests require local models or optional organs. Keep those
 tests explicitly marked and make their absence a skip, not a false pass.
 
+## Maintainers: handing off a clean source tree
+
+The private development checkout is not the GitHub repository. Do not add a
+public remote to it or push its branches, tags, history, or ignored files.
+Prepare the candidate from a reviewed revision. Review any untracked source
+explicitly; an untracked module on one machine is not part of a Git backup.
+
+From the source root, choose a **new destination outside the checkout**. Keep
+the manifest outside both trees. Only proceed if every command succeeds:
+
+```sh
+handoff=$(mktemp -d) &&
+python3 bin/eve_public_release_audit.py --root . --candidate-only --include-untracked \
+  --export "$handoff/tree" --write-manifest "$handoff/source.manifest.json" &&
+python3 bin/eve_public_release_audit.py --root "$handoff/tree" \
+  --verify-manifest "$handoff/source.manifest.json" --exact-tree
+```
+
+Review that tree against a fresh clone of the configured GitHub repository;
+preserve its existing public history and submit the reviewed changes through
+a branch and pull request. Do not initialize Git in the private checkout for
+this handoff, force-push, or treat an older public revision as the latest local
+work. After merge, verify a fresh archive of the **merged commit** against the
+same manifest and run the documented bootstrap and tests from the restored
+source. A passing manifest verifies paths and file bytes, not a working
+runtime. Private state, weights, backups, and unpublished development work
+need separate verified recovery before retiring a machine or checkout.
+
 ## Pull requests
 
 A useful pull request includes:

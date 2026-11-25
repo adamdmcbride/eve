@@ -16,10 +16,12 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
 SECRET_RULES: Tuple[Tuple[str, re.Pattern[bytes]], ...] = (
@@ -45,6 +47,19 @@ EMAIL_ADDRESS = re.compile(
     re.IGNORECASE,
 )
 PRIVATE_CONVERSATION_LINK = re.compile(rb"https://claude\.ai/share/", re.IGNORECASE)
+MANIFEST_SCHEMA_VERSION = 2
+MANIFEST_MAX_BYTES = 16 * 1024 * 1024
+SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _is_dataless(info: os.stat_result) -> bool:
+    # macOS SF_DATALESS is absent from some supported Python stat modules.
+    return bool(getattr(info, "st_flags", 0) & 0x40000000)
+
+
+def _require_local(info: os.stat_result, path: str) -> None:
+    if _is_dataless(info):
+        raise ValueError("source not local (dataless placeholder): " + path)
 
 
 def normalize_rel_path(value: str) -> str:
@@ -72,6 +87,7 @@ def matches_any(path: str, patterns: Sequence[str]) -> bool:
 
 def load_config(path: Path) -> Dict[str, Any]:
     try:
+        _require_local(path.stat(), path.name)
         config = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("unable to read public release config %s: %s" % (path, exc)) from exc
@@ -229,6 +245,15 @@ def _rule_finding(
     )
 
 
+def _file_too_large_finding(path: str, size: int, maximum: int) -> Dict[str, Any]:
+    return finding(
+        "public.file_too_large",
+        "error",
+        "File is %d bytes; public source limit is %d bytes." % (size, maximum),
+        path=path,
+    )
+
+
 def mask_owner_identifier_exemptions(path: str, data: bytes, config: Dict[str, Any]) -> bytes:
     """Mask narrowly declared technical terms before owner-identity scanning.
 
@@ -250,14 +275,7 @@ def scan_candidate_data(path: str, data: bytes, config: Dict[str, Any]) -> List[
     results: List[Dict[str, Any]] = []
     size = len(data)
     if size > config["max_file_bytes"]:
-        results.append(
-            finding(
-                "public.file_too_large",
-                "error",
-                "File is %d bytes; public source limit is %d bytes." % (size, config["max_file_bytes"]),
-                path=path,
-            )
-        )
+        results.append(_file_too_large_finding(path, size, config["max_file_bytes"]))
     if b"\0" in data[:8192]:
         return results
 
@@ -359,7 +377,24 @@ def scan_candidate_data(path: str, data: bytes, config: Dict[str, Any]) -> List[
 def scan_candidate(root: Path, path: str, config: Dict[str, Any]) -> List[Dict[str, Any]]:
     full_path = root / path
     results: List[Dict[str, Any]] = []
-    if full_path.is_symlink():
+    try:
+        initial_stat = full_path.lstat()
+    except OSError as exc:
+        results.append(
+            finding(
+                "public.file_unreadable",
+                "error",
+                "Unable to inspect candidate safely: %s" % (exc.strerror or type(exc).__name__),
+                path=path,
+            )
+        )
+        return results
+    def unavailable():
+        return [finding("public.source_not_local", "error", "Candidate is a dataless placeholder.", path=path)]
+
+    if _is_dataless(initial_stat):
+        return unavailable()
+    if stat.S_ISLNK(initial_stat.st_mode):
         results.append(
             finding(
                 "public.symlink_not_allowed",
@@ -369,11 +404,66 @@ def scan_candidate(root: Path, path: str, config: Dict[str, Any]) -> List[Dict[s
             )
         )
         return results
-    try:
-        data = full_path.read_bytes()
-    except OSError as exc:
-        results.append(finding("public.file_unreadable", "error", str(exc), path=path))
+    if not stat.S_ISREG(initial_stat.st_mode):
+        results.append(
+            finding(
+                "public.non_regular_file",
+                "error",
+                "Public exports accept regular owned files only.",
+                path=path,
+            )
+        )
         return results
+
+    maximum = config["max_file_bytes"]
+    if initial_stat.st_size > maximum:
+        return [_file_too_large_finding(path, initial_stat.st_size, maximum)]
+
+    flags = os.O_RDONLY
+    for flag_name in ("O_BINARY", "O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK"):
+        flags |= getattr(os, flag_name, 0)
+    descriptor: Optional[int] = None
+    try:
+        descriptor = os.open(full_path, flags)
+        opened_stat = os.fstat(descriptor)
+        if _is_dataless(opened_stat):
+            return unavailable()
+        if not stat.S_ISREG(opened_stat.st_mode):
+            return [
+                finding(
+                    "public.non_regular_file",
+                    "error",
+                    "Public exports accept regular owned files only.",
+                    path=path,
+                )
+            ]
+        if opened_stat.st_size > maximum:
+            return [_file_too_large_finding(path, opened_stat.st_size, maximum)]
+
+        chunks: List[bytes] = []
+        remaining = maximum + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+    except OSError as exc:
+        results.append(
+            finding(
+                "public.file_unreadable",
+                "error",
+                "Unable to read candidate safely: %s" % (exc.strerror or type(exc).__name__),
+                path=path,
+            )
+        )
+        return results
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if len(data) > maximum:
+        return [_file_too_large_finding(path, len(data), maximum)]
     return results + scan_candidate_data(path, data, config)
 
 
@@ -386,6 +476,8 @@ def pyproject_findings(
     if not path.exists():
         return []
     try:
+        if _is_dataless(path.stat()):
+            return [finding("packaging.metadata_not_local", "error", "Packaging metadata is not local.", path="pyproject.toml")]
         text = path.read_text(encoding="utf-8")
     except OSError:
         return []
@@ -451,7 +543,7 @@ def github_remote_coordinates(remote_url: str) -> Optional[Tuple[str, str]]:
     return None
 
 
-def git_posture_findings(root: Path, config: Dict[str, Any]) -> List[Dict[str, Any]]:
+def git_posture_findings(root: Path, config: Dict[str, Any], *, check_worktree: bool = True) -> List[Dict[str, Any]]:
     if not (root / ".git").exists():
         return []
     results = []
@@ -490,6 +582,10 @@ def git_posture_findings(root: Path, config: Dict[str, Any]) -> List[Dict[str, A
                     "Origin must be the configured personal GitHub repository; organization or unrelated remotes are blocked.",
                 )
             )
+    if not check_worktree:
+        results.append(finding("git.worktree_unchecked", "warning",
+                               "Worktree status not checked while candidate files are unavailable."))
+        return results
     try:
         status = subprocess.check_output(
             ["git", "status", "--porcelain"],
@@ -570,7 +666,8 @@ def audit_repository(
         findings.extend(scan_candidate(root, path, config))
     findings.extend(pyproject_findings(root, config, selected))
     if include_git_posture:
-        findings.extend(git_posture_findings(root, config))
+        local = not any(item["id"] == "public.source_not_local" for item in findings)
+        findings.extend(git_posture_findings(root, config, check_worktree=local))
 
     findings.sort(key=lambda item: (item["severity"] != "error", item["id"], item.get("path", "")))
     error_count = sum(item["severity"] == "error" for item in findings)
@@ -592,25 +689,341 @@ def audit_repository(
     }
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+def _canonical_manifest_path(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("release manifest paths must be non-empty strings")
+    if value.startswith("/") or "\\" in value:
+        raise ValueError("release manifest paths must be relative POSIX paths: %r" % value)
+    parts = value.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise ValueError("release manifest path escapes or is not canonical: %r" % value)
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("release manifest paths may not contain control characters")
+    if normalize_rel_path(value) != value:
+        raise ValueError("release manifest path is not canonical: %r" % value)
+    return value
+
+
+def _file_state(stat_result: os.stat_result) -> Tuple[int, int, int, int]:
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000)),
+    )
+
+
+def _regular_file_digest(root: Path, relative_path: str) -> Tuple[int, str]:
+    relative_path = _canonical_manifest_path(relative_path)
+    full_path = root / relative_path
+    try:
+        initial_stat = full_path.lstat()
+    except OSError as exc:
+        raise ValueError(
+            "unable to inspect manifest path %s: %s"
+            % (relative_path, exc.strerror or type(exc).__name__)
+        ) from exc
+    _require_local(initial_stat, relative_path)
+    if not stat.S_ISREG(initial_stat.st_mode):
+        raise ValueError("manifest path is not a regular file: %s" % relative_path)
+
+    flags = os.O_RDONLY
+    for flag_name in ("O_BINARY", "O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK"):
+        flags |= getattr(os, flag_name, 0)
+    descriptor: Optional[int] = None
+    try:
+        descriptor = os.open(full_path, flags)
+        opened_stat = os.fstat(descriptor)
+        _require_local(opened_stat, relative_path)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise ValueError("manifest path is not a regular file: %s" % relative_path)
+        if (opened_stat.st_dev, opened_stat.st_ino) != (initial_stat.st_dev, initial_stat.st_ino):
+            raise ValueError("manifest path changed while it was opened: %s" % relative_path)
+
+        digest = hashlib.sha256()
+        byte_count = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            byte_count += len(chunk)
             digest.update(chunk)
-    return digest.hexdigest()
+        final_stat = os.fstat(descriptor)
+        if _file_state(opened_stat) != _file_state(final_stat) or byte_count != final_stat.st_size:
+            raise ValueError("manifest path changed while it was hashed: %s" % relative_path)
+        return byte_count, digest.hexdigest()
+    except OSError as exc:
+        raise ValueError(
+            "unable to hash manifest path %s: %s"
+            % (relative_path, exc.strerror or type(exc).__name__)
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def sha256_file(path: Path) -> str:
+    """Compatibility helper for callers that need one regular-file digest."""
+
+    return _regular_file_digest(path.parent.resolve(), path.name)[1]
+
+
+def _manifest_tree_sha256(files: Sequence[Dict[str, Any]]) -> str:
+    canonical = json.dumps(
+        list(files),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def manifest_for(root: Path, paths: Sequence[str]) -> Dict[str, Any]:
+    root = root.resolve()
+    canonical_paths = [_canonical_manifest_path(path) for path in paths]
+    if len(canonical_paths) != len(set(canonical_paths)):
+        raise ValueError("release manifest paths must be unique")
+    canonical_paths.sort()
+    files = []
+    for path in canonical_paths:
+        byte_count, digest = _regular_file_digest(root, path)
+        files.append({"path": path, "bytes": byte_count, "sha256": digest})
+    return {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "algorithm": "sha256",
+        "file_count": len(files),
+        "total_bytes": sum(item["bytes"] for item in files),
+        "tree_sha256": _manifest_tree_sha256(files),
+        "files": files,
+    }
+
+
+def validate_manifest(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("release manifest must be a JSON object")
+    schema_version = payload.get("schema_version")
+    if schema_version not in (1, MANIFEST_SCHEMA_VERSION):
+        raise ValueError("unsupported release manifest schema_version: %r" % schema_version)
+    files = payload.get("files")
+    if not isinstance(files, list):
+        raise ValueError("release manifest files must be a list")
+
+    validated_files: List[Dict[str, Any]] = []
+    previous_path: Optional[str] = None
+    for index, entry in enumerate(files):
+        if not isinstance(entry, dict):
+            raise ValueError("release manifest file entry %d must be an object" % index)
+        path = _canonical_manifest_path(entry.get("path"))
+        byte_count = entry.get("bytes")
+        digest = entry.get("sha256")
+        if isinstance(byte_count, bool) or not isinstance(byte_count, int) or byte_count < 0:
+            raise ValueError("release manifest bytes must be a non-negative integer for %s" % path)
+        if not isinstance(digest, str) or not SHA256_HEX.fullmatch(digest):
+            raise ValueError("release manifest sha256 must be lowercase hexadecimal for %s" % path)
+        if previous_path is not None and path <= previous_path:
+            raise ValueError("release manifest file paths must be unique and sorted")
+        previous_path = path
+        validated_files.append({"path": path, "bytes": byte_count, "sha256": digest})
+
+    result: Dict[str, Any] = {
+        "schema_version": schema_version,
+        "files": validated_files,
+    }
+    if schema_version == MANIFEST_SCHEMA_VERSION:
+        if payload.get("algorithm") != "sha256":
+            raise ValueError("release manifest algorithm must be sha256")
+        expected_count = len(validated_files)
+        expected_bytes = sum(item["bytes"] for item in validated_files)
+        expected_tree = _manifest_tree_sha256(validated_files)
+        if payload.get("file_count") != expected_count:
+            raise ValueError("release manifest file_count does not match its file entries")
+        if payload.get("total_bytes") != expected_bytes:
+            raise ValueError("release manifest total_bytes does not match its file entries")
+        if payload.get("tree_sha256") != expected_tree:
+            raise ValueError("release manifest tree_sha256 does not match its file entries")
+        result.update(
+            {
+                "algorithm": "sha256",
+                "file_count": expected_count,
+                "total_bytes": expected_bytes,
+                "tree_sha256": expected_tree,
+            }
+        )
+    return result
+
+
+def load_manifest(path: Path) -> Dict[str, Any]:
+    try:
+        file_stat = path.lstat()
+        _require_local(file_stat, path.name)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError("release manifest must be a regular file")
+        if file_stat.st_size > MANIFEST_MAX_BYTES:
+            raise ValueError("release manifest exceeds the %d-byte limit" % MANIFEST_MAX_BYTES)
+        raw = path.read_bytes()
+        if len(raw) > MANIFEST_MAX_BYTES:
+            raise ValueError("release manifest exceeds the %d-byte limit" % MANIFEST_MAX_BYTES)
+        payload = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "unable to read release manifest: %s"
+            % (getattr(exc, "strerror", None) or type(exc).__name__)
+        ) from exc
+    return validate_manifest(payload)
+
+
+def _exact_tree_paths(root: Path) -> Set[str]:
+    paths: Set[str] = set()
+    for current, dirnames, filenames in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        descend = []
+        for dirname in dirnames:
+            full_path = current_path / dirname
+            relative = full_path.relative_to(root).as_posix()
+            if relative == ".git" or relative.startswith(".git/"):
+                continue
+            if full_path.is_symlink():
+                paths.add(relative)
+            else:
+                descend.append(dirname)
+        dirnames[:] = descend
+        for filename in filenames:
+            relative = (current_path / filename).relative_to(root).as_posix()
+            if relative != ".git" and not relative.startswith(".git/"):
+                paths.add(relative)
+    return paths
+
+
+def verify_manifest(
+    root: Path,
+    manifest: Dict[str, Any],
+    expected_paths: Optional[Sequence[str]] = None,
+    exact_tree: bool = False,
+) -> Dict[str, Any]:
+    root = root.resolve()
+    manifest = validate_manifest(manifest)
+    entries = {entry["path"]: entry for entry in manifest["files"]}
+    manifest_paths = set(entries)
+    findings: List[Dict[str, Any]] = []
+
+    if expected_paths is not None:
+        expected = {_canonical_manifest_path(path) for path in expected_paths}
+        for path in sorted(expected - manifest_paths):
+            findings.append(
+                finding(
+                    "manifest.candidate_path_missing",
+                    "error",
+                    "The audited candidate path is absent from the release manifest.",
+                    path=path,
+                )
+            )
+        for path in sorted(manifest_paths - expected):
+            findings.append(
+                finding(
+                    "manifest.unexpected_path",
+                    "error",
+                    "The release manifest contains a path outside the audited candidate.",
+                    path=path,
+                )
+            )
+
+    if exact_tree:
+        actual_tree_paths = _exact_tree_paths(root)
+        for path in sorted(actual_tree_paths - manifest_paths):
+            findings.append(
+                finding(
+                    "manifest.exact_tree_extra_path",
+                    "error",
+                    "The release tree contains a path absent from the manifest.",
+                    path=path,
+                )
+            )
+
+    verified_count = 0
+    verified_bytes = 0
+    for path, entry in entries.items():
+        full_path = root / path
+        try:
+            current_stat = full_path.lstat()
+        except OSError:
+            findings.append(
+                finding(
+                    "manifest.file_missing",
+                    "error",
+                    "The release manifest path is missing from the verified tree.",
+                    path=path,
+                )
+            )
+            continue
+        if not stat.S_ISREG(current_stat.st_mode):
+            findings.append(
+                finding(
+                    "manifest.non_regular_file",
+                    "error",
+                    "The release manifest path is not a regular file.",
+                    path=path,
+                )
+            )
+            continue
+        if current_stat.st_size != entry["bytes"]:
+            findings.append(
+                finding(
+                    "manifest.size_mismatch",
+                    "error",
+                    "The release file size does not match the reviewed manifest.",
+                    path=path,
+                )
+            )
+            continue
+        try:
+            byte_count, digest = _regular_file_digest(root, path)
+        except ValueError as exc:
+            findings.append(
+                finding(
+                    "manifest.file_unreadable",
+                    "error",
+                    str(exc),
+                    path=path,
+                )
+            )
+            continue
+        if byte_count != entry["bytes"]:
+            findings.append(
+                finding(
+                    "manifest.size_mismatch",
+                    "error",
+                    "The release file size changed while it was verified.",
+                    path=path,
+                )
+            )
+            continue
+        if digest != entry["sha256"]:
+            findings.append(
+                finding(
+                    "manifest.sha256_mismatch",
+                    "error",
+                    "The release file digest does not match the reviewed manifest.",
+                    path=path,
+                )
+            )
+            continue
+        verified_count += 1
+        verified_bytes += byte_count
+
+    findings.sort(key=lambda item: (item["id"], item.get("path", "")))
     return {
         "schema_version": 1,
-        "files": [
-            {
-                "path": path,
-                "bytes": (root / path).stat().st_size,
-                "sha256": sha256_file(root / path),
-            }
-            for path in paths
-        ],
+        "manifest_schema_version": manifest["schema_version"],
+        "root": str(root),
+        "exact_tree": exact_tree,
+        "manifest_file_count": len(entries),
+        "verified_file_count": verified_count,
+        "verified_bytes": verified_bytes,
+        "error_count": len(findings),
+        "ok": not findings,
+        "findings": findings,
     }
 
 
@@ -619,7 +1032,59 @@ def write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def export_tree(root: Path, destination: Path, paths: Sequence[str]) -> None:
+def _copy_regular_file(source: Path, target: Path, relative_path: str) -> None:
+    try:
+        initial_stat = source.lstat()
+    except OSError as exc:
+        raise ValueError(
+            "unable to inspect export source %s: %s"
+            % (relative_path, exc.strerror or type(exc).__name__)
+        ) from exc
+    _require_local(initial_stat, relative_path)
+    if not stat.S_ISREG(initial_stat.st_mode):
+        raise ValueError("refusing to export non-regular file: %s" % relative_path)
+
+    flags = os.O_RDONLY
+    for flag_name in ("O_BINARY", "O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK"):
+        flags |= getattr(os, flag_name, 0)
+    descriptor: Optional[int] = None
+    copied = 0
+    try:
+        descriptor = os.open(source, flags)
+        opened_stat = os.fstat(descriptor)
+        _require_local(opened_stat, relative_path)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise ValueError("refusing to export non-regular file: %s" % relative_path)
+        if (opened_stat.st_dev, opened_stat.st_ino) != (initial_stat.st_dev, initial_stat.st_ino):
+            raise ValueError("export source changed while it was opened: %s" % relative_path)
+        with target.open("xb") as output:
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+                copied += len(chunk)
+        final_stat = os.fstat(descriptor)
+        if _file_state(opened_stat) != _file_state(final_stat) or copied != final_stat.st_size:
+            raise ValueError("export source changed while it was copied: %s" % relative_path)
+        os.chmod(target, stat.S_IMODE(opened_stat.st_mode))
+        os.utime(target, ns=(opened_stat.st_atime_ns, opened_stat.st_mtime_ns))
+    except OSError as exc:
+        raise ValueError(
+            "unable to copy export source %s: %s"
+            % (relative_path, exc.strerror or type(exc).__name__)
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def export_tree(
+    root: Path,
+    destination: Path,
+    paths: Sequence[str],
+    validator: Optional[Callable[[Path], None]] = None,
+) -> None:
     root = root.resolve()
     destination = destination.resolve()
     try:
@@ -628,16 +1093,30 @@ def export_tree(root: Path, destination: Path, paths: Sequence[str]) -> None:
         pass
     else:
         raise ValueError("export destination must be outside the private source tree: %s" % destination)
-    if destination.exists() and any(destination.iterdir()):
-        raise ValueError("export destination must not exist or must be empty: %s" % destination)
-    destination.mkdir(parents=True, exist_ok=True)
-    for path in paths:
-        source = root / path
-        target = destination / path
-        if source.is_symlink():
-            raise ValueError("refusing to export symlink: %s" % path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
+    if destination.exists():
+        if not destination.is_dir() or any(destination.iterdir()):
+            raise ValueError("export destination must not exist or must be empty: %s" % destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=".%s.eve-export-" % destination.name,
+            dir=destination.parent,
+        )
+    )
+    try:
+        for path in sorted(_canonical_manifest_path(path) for path in paths):
+            source = root / path
+            target = staging / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _copy_regular_file(source, target, path)
+        if validator is not None:
+            validator(staging)
+        if destination.exists():
+            destination.rmdir()
+        os.replace(staging, destination)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
 
 def render_human(report: Dict[str, Any], full: bool = False) -> str:
@@ -667,6 +1146,19 @@ def render_human(report: Dict[str, Any], full: bool = False) -> str:
     return "\n".join(lines)
 
 
+def _attach_manifest_verification(
+    report: Dict[str, Any],
+    verification: Dict[str, Any],
+) -> None:
+    report["manifest_verification"] = verification
+    report["findings"].extend(verification["findings"])
+    report["findings"].sort(
+        key=lambda item: (item["severity"] != "error", item["id"], item.get("path", ""))
+    )
+    report["error_count"] += verification["error_count"]
+    report["ok"] = report["error_count"] == 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="Eve source root")
@@ -680,8 +1172,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", help="Print structured JSON")
     parser.add_argument("--full", action="store_true", help="Print every finding")
     parser.add_argument("--fail-on-warning", action="store_true", help="Return nonzero for warnings as well as errors")
-    parser.add_argument("--write-manifest", type=Path, help="Write candidate paths, sizes, and SHA-256 hashes")
-    parser.add_argument("--export", type=Path, help="Copy a passing candidate into a new or empty directory")
+    parser.add_argument(
+        "--write-manifest",
+        type=Path,
+        help="Write a passing candidate manifest outside the audited source tree",
+    )
+    parser.add_argument(
+        "--verify-manifest",
+        type=Path,
+        help="Verify candidate paths, sizes, and SHA-256 hashes against a reviewed manifest",
+    )
+    parser.add_argument(
+        "--exact-tree",
+        action="store_true",
+        help="With --verify-manifest, reject every non-.git file absent from the manifest",
+    )
+    parser.add_argument(
+        "--export",
+        type=Path,
+        help="Transactionally copy and verify a passing candidate in a new or empty directory",
+    )
     return parser
 
 
@@ -690,6 +1200,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     root = args.root.resolve()
     config_path = (args.config or (root / "public_release.json")).resolve()
     try:
+        if args.exact_tree and not args.verify_manifest:
+            raise ValueError("--exact-tree requires --verify-manifest")
         config = load_config(config_path)
         candidate_only = args.candidate_only or bool(args.export)
         report = audit_repository(
@@ -698,22 +1210,73 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             include_untracked=args.include_untracked,
             enforce_tracked_private=not candidate_only,
         )
-        if args.write_manifest:
-            write_json(args.write_manifest.resolve(), manifest_for(root, report["candidate_paths"]))
-        if args.export:
-            if not report["ok"]:
-                raise ValueError("release audit has blocking findings; export refused")
-            export_tree(root, args.export, report["candidate_paths"])
-            exported_paths = filesystem_paths(args.export.resolve())
-            exported_report = audit_repository(
-                args.export.resolve(),
-                config,
-                known_paths=exported_paths,
-                include_git_posture=False,
-                enforce_tracked_private=True,
+        if args.verify_manifest:
+            verification = verify_manifest(
+                root,
+                load_manifest(args.verify_manifest.resolve()),
+                expected_paths=report["candidate_paths"],
+                exact_tree=args.exact_tree,
             )
-            if not exported_report["ok"]:
-                raise ValueError("post-copy export audit failed")
+            _attach_manifest_verification(report, verification)
+
+        if (args.write_manifest or args.export) and not report["ok"]:
+            noun = "export" if args.export else "manifest creation"
+            raise ValueError("release audit has blocking findings; %s refused" % noun)
+
+        source_manifest: Optional[Dict[str, Any]] = None
+        if args.write_manifest or args.export:
+            source_manifest = manifest_for(root, report["candidate_paths"])
+
+        if args.write_manifest:
+            manifest_path = args.write_manifest.resolve()
+            try:
+                manifest_path.relative_to(root)
+            except ValueError:
+                pass
+            else:
+                raise ValueError("release manifest output must be outside the audited source tree")
+
+        if args.export:
+            destination = args.export.resolve()
+            if args.write_manifest:
+                try:
+                    args.write_manifest.resolve().relative_to(destination)
+                except ValueError:
+                    pass
+                else:
+                    raise ValueError("release manifest output must be outside the exported tree")
+            assert source_manifest is not None
+
+            def validate_export(staging: Path) -> None:
+                exported_paths = _exact_tree_paths(staging)
+                exported_report = audit_repository(
+                    staging,
+                    config,
+                    known_paths=exported_paths,
+                    include_git_posture=False,
+                    enforce_tracked_private=True,
+                )
+                if not exported_report["ok"]:
+                    raise ValueError("post-copy export audit failed")
+                export_verification = verify_manifest(
+                    staging,
+                    source_manifest,
+                    expected_paths=report["candidate_paths"],
+                    exact_tree=True,
+                )
+                if not export_verification["ok"]:
+                    raise ValueError("post-copy export manifest verification failed")
+
+            export_tree(
+                root,
+                destination,
+                report["candidate_paths"],
+                validator=validate_export,
+            )
+
+        if args.write_manifest:
+            assert source_manifest is not None
+            write_json(args.write_manifest.resolve(), source_manifest)
     except ValueError as exc:
         print("eve-public-release-audit: %s" % exc, file=sys.stderr)
         return 2

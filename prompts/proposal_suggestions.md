@@ -18,3 +18,9 @@ Requirements:
 - Keep it practical for a local-first system on one Mac
 - If the strongest proposal is "change nothing yet," say that clearly and explain why
 - Do not propose unsupervised weight modification
+
+## Grounded In
+List the exact tension or experiment ids this proposal answers, from the support packet above. If none apply, say "none" and expect this to stay a note rather than a change.
+
+## Rollback
+One line: exactly how to undo this if it makes things worse (the config key and its old value, the block to lift, the commit to revert).

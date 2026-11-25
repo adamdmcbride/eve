@@ -15,6 +15,7 @@ second scheduler or authority surface.
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import json
 import os
@@ -25,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
-from urllib import error, request
+from urllib import error, parse, request
 
 
 SCHEMA_ID = "eve_capability_intelligence.v4"
@@ -52,6 +53,40 @@ SENSITIVE_KEY_PARTS = {
     "token",
     "webhook_secret",
 }
+
+OPENCLAW_STATE_PROBE_IDS = (
+    "version",
+    "schema",
+    "plugins",
+    "validate",
+    "update",
+    "memory",
+    "memory_retrieval",
+    "status",
+    "health",
+    "gateway_probe",
+    "tasks",
+    "tasks_list",
+    "commitments",
+    "security",
+    "mcp",
+    "skills",
+    "hooks",
+    "worktrees",
+    "sandbox",
+    "approvals",
+    "cron",
+    "wiki_status",
+    "wiki_search",
+)
+OPENCLAW_CRITICAL_OBSERVATION_PROBES = (
+    "schema",
+    "plugins",
+    "validate",
+    "status",
+    "health",
+    "gateway_probe",
+)
 
 
 CommandRunner = Callable[[Sequence[str], int, Optional[Dict[str, str]]], subprocess.CompletedProcess]
@@ -288,6 +323,208 @@ def run_command_text(
     evidence["ok"] = True
     evidence["stdout_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return text, evidence
+
+
+def classify_openclaw_observation(
+    evidence: Dict[str, object],
+    *,
+    config_read_ok: bool,
+    configured_values_sha256: str,
+) -> Dict[str, object]:
+    """Classify whether this process could actually observe OpenClaw.
+
+    An OpenClaw command failing is normally evidence about OpenClaw.  A large
+    set of commands failing behind the same state-database EPERM guard is
+    instead evidence about the *runner*.  Treating that second case as live
+    subsystem truth previously let a restricted Codex process erase verified
+    gateway, plugin, skill, and memory state from Eve's persisted self-model.
+
+    The classification is intentionally narrow: a missing command, malformed
+    config, ordinary plugin error, or isolated failed probe remains an actual
+    observation.  Only a repeated permission-hardening signature across many
+    independent probes is marked inconclusive.
+    """
+
+    probe_evidence = {
+        probe_id: evidence.get(probe_id)
+        for probe_id in OPENCLAW_STATE_PROBE_IDS
+        if isinstance(evidence.get(probe_id), dict)
+    }
+    attempted = sorted(probe_evidence)
+    failed = sorted(
+        probe_id
+        for probe_id, item in probe_evidence.items()
+        if not bool(item.get("ok"))
+    )
+    succeeded = sorted(set(attempted) - set(failed))
+    failed_errors = {
+        probe_id: str(probe_evidence[probe_id].get("error") or "")
+        for probe_id in failed
+    }
+    permission_limited = [
+        probe_id
+        for probe_id, error_text in failed_errors.items()
+        if (
+            "skipped permission hardening" in error_text.lower()
+            and (
+                "eperm" in error_text.lower()
+                or "operation not permitted" in error_text.lower()
+            )
+        )
+    ]
+    plugin_runtime_limited = [
+        probe_id
+        for probe_id, error_text in failed_errors.items()
+        if any(
+            marker in error_text.lower()
+            for marker in (
+                "plugin loader",
+                "plugin runtime",
+                "runtime extension",
+                "failed to load plugin",
+                "cannot find module",
+                "dist/index.js",
+            )
+        )
+    ]
+    broad_failure_floor = max(6, len(attempted) // 3)
+    repeated_permission_floor = max(3, len(failed) // 2)
+    environment_limited = bool(
+        len(failed) >= broad_failure_floor
+        and len(permission_limited) >= repeated_permission_floor
+    )
+    critical_failed = sorted(
+        probe_id
+        for probe_id in OPENCLAW_CRITICAL_OBSERVATION_PROBES
+        if probe_id in probe_evidence and not bool(probe_evidence[probe_id].get("ok"))
+    )
+    if environment_limited:
+        status = "inconclusive"
+        reason = "runner_permission_limited"
+    elif config_read_ok and not critical_failed:
+        status = "authoritative"
+        reason = "critical_probes_completed"
+    elif not config_read_ok:
+        status = "failed"
+        reason = "active_config_unreadable"
+    else:
+        status = "partial"
+        reason = "critical_probe_failure"
+    return {
+        "status": status,
+        "reason": reason,
+        "environment_limited": environment_limited,
+        "attempted_probe_count": len(attempted),
+        "successful_probe_count": len(succeeded),
+        "failed_probe_count": len(failed),
+        "failed_probe_ids": failed,
+        "critical_failed_probe_ids": critical_failed,
+        "permission_limited_probe_ids": permission_limited,
+        "plugin_runtime_limited_probe_ids": plugin_runtime_limited,
+        "config_read_ok": bool(config_read_ok),
+        "attempted_config_sha256": str(configured_values_sha256 or ""),
+        "state_can_replace_prior": status != "inconclusive",
+    }
+
+
+def _legacy_openclaw_state_is_authoritative(subsystem: Dict[str, object]) -> bool:
+    observation = subsystem.get("observation") if isinstance(subsystem.get("observation"), dict) else {}
+    if observation:
+        return str(observation.get("status") or "") in {
+            "authoritative",
+            "preserved_authoritative",
+        }
+    evidence = subsystem.get("evidence") if isinstance(subsystem.get("evidence"), dict) else {}
+    critical_known = [
+        evidence.get(probe_id)
+        for probe_id in OPENCLAW_CRITICAL_OBSERVATION_PROBES
+        if isinstance(evidence.get(probe_id), dict)
+    ]
+    if critical_known:
+        return bool(
+            subsystem.get("config_valid")
+            and all(bool(item.get("ok")) for item in critical_known)
+        )
+    # Compatibility for pre-observation-ledger fixtures and old snapshots.
+    return bool(subsystem.get("config_valid") and subsystem.get("fingerprint"))
+
+
+def reconcile_inconclusive_subsystem_observations(
+    subsystems: Dict[str, object],
+    previous: Optional[Dict[str, object]],
+) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
+    """Preserve last verified state when the current runner was not a witness.
+
+    This does not turn stale evidence into current evidence.  It retains the
+    last authoritative state, records the failed observation attempt and any
+    unverified config drift, and lets the next host-authoritative cycle replace
+    it.  The receipt remains visible in history even when no material subsystem
+    transition is emitted.
+    """
+
+    reconciled = copy.deepcopy(subsystems)
+    previous = previous if isinstance(previous, dict) else {}
+    previous_subsystems = (
+        previous.get("subsystems")
+        if isinstance(previous.get("subsystems"), dict)
+        else {}
+    )
+    receipts: List[Dict[str, object]] = []
+    current_openclaw = (
+        reconciled.get("openclaw")
+        if isinstance(reconciled.get("openclaw"), dict)
+        else {}
+    )
+    observation = (
+        current_openclaw.get("observation")
+        if isinstance(current_openclaw.get("observation"), dict)
+        else {}
+    )
+    if str(observation.get("status") or "") != "inconclusive":
+        return reconciled, receipts
+
+    prior_openclaw = (
+        previous_subsystems.get("openclaw")
+        if isinstance(previous_subsystems.get("openclaw"), dict)
+        else {}
+    )
+    receipt = copy.deepcopy(observation)
+    receipt.update(
+        {
+            "subsystem": "openclaw",
+            "attempted_fingerprint": str(current_openclaw.get("fingerprint") or ""),
+            "preserved_snapshot_id": str(previous.get("id") or ""),
+            "preserved_generated_at": str(previous.get("generated_at") or ""),
+            "prior_config_sha256": str(prior_openclaw.get("configured_values_sha256") or ""),
+        }
+    )
+    receipt["config_changed_from_preserved_state"] = bool(
+        receipt.get("attempted_config_sha256")
+        and receipt.get("prior_config_sha256")
+        and receipt.get("attempted_config_sha256") != receipt.get("prior_config_sha256")
+    )
+    if prior_openclaw and _legacy_openclaw_state_is_authoritative(prior_openclaw):
+        preserved = copy.deepcopy(prior_openclaw)
+        prior_observation = (
+            preserved.get("observation")
+            if isinstance(preserved.get("observation"), dict)
+            else {}
+        )
+        if not prior_observation:
+            preserved["observation"] = {
+                "status": "preserved_authoritative",
+                "reason": "legacy_verified_snapshot",
+                "state_can_replace_prior": True,
+            }
+        preserved["latest_observation"] = receipt
+        reconciled["openclaw"] = preserved
+        receipt["state_action"] = "preserved_last_authoritative"
+    else:
+        receipt["state_action"] = "no_authoritative_state_available"
+        current_openclaw["latest_observation"] = receipt
+        reconciled["openclaw"] = current_openclaw
+    receipts.append(receipt)
+    return reconciled, receipts
 
 
 def _compact_plugins(payload: object) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
@@ -824,6 +1061,171 @@ def _compact_openclaw_context_management(current_config: object) -> Dict[str, ob
     }
 
 
+def _loopback_json_fetcher(url: str, timeout: int) -> Dict[str, object]:
+    """Fetch bounded JSON from an already-configured local model endpoint."""
+
+    req = request.Request(url, headers={"Accept": "application/json"})
+    try:
+        with request.urlopen(req, timeout=max(1, min(10, int(timeout)))) as response:
+            raw = response.read(2_000_000)
+    except (error.HTTPError, error.URLError, TimeoutError, OSError) as exc:
+        return {"ok": False, "error": compact_text(exc, 220)}
+    try:
+        return {"ok": True, "payload": json.loads(raw.decode("utf-8"))}
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return {"ok": False, "error": f"invalid JSON: {compact_text(exc, 180)}"}
+
+
+def _openclaw_loopback_model_base_url(value: object) -> str:
+    """Return a provider's origin only when it is an explicit loopback URL."""
+
+    text = str(value or "").strip()
+    try:
+        parsed = parse.urlparse(text)
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.username
+        or parsed.password
+        or not parsed.netloc
+    ):
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _compact_openclaw_model_context_capacity(
+    current_config: object,
+    *,
+    timeout: int = 5,
+    fetcher: JsonFetcher = _loopback_json_fetcher,
+) -> Dict[str, object]:
+    """Compare OpenClaw declarations with llama.cpp's real per-slot window.
+
+    ``llama-server --ctx-size`` is shared across parallel slots. OpenClaw's
+    ``contextWindow`` is a per-request planning limit. Treating the former as
+    the latter lets compaction admit prompts the selected slot cannot hold.
+    Only configured loopback providers are probed, and no prompt/model content
+    or filesystem paths enter the resulting evidence.
+    """
+
+    config = current_config if isinstance(current_config, dict) else {}
+    models = config.get("models") if isinstance(config.get("models"), dict) else {}
+    providers = models.get("providers") if isinstance(models.get("providers"), dict) else {}
+    endpoint_cache: Dict[str, Dict[str, object]] = {}
+    records: List[Dict[str, object]] = []
+    remote_declaration_count = 0
+
+    for provider_id, provider_value in sorted(providers.items()):
+        provider = provider_value if isinstance(provider_value, dict) else {}
+        provider_models = provider.get("models") if isinstance(provider.get("models"), list) else []
+        origin = _openclaw_loopback_model_base_url(provider.get("baseUrl"))
+        if not origin:
+            remote_declaration_count += len([item for item in provider_models if isinstance(item, dict)])
+            continue
+        if origin not in endpoint_cache:
+            props_result = fetcher(f"{origin}/props", timeout)
+            slots_result = fetcher(f"{origin}/slots", timeout)
+            props = props_result.get("payload") if props_result.get("ok") else None
+            slots = slots_result.get("payload") if slots_result.get("ok") else None
+            generation = (
+                props.get("default_generation_settings")
+                if isinstance(props, dict) and isinstance(props.get("default_generation_settings"), dict)
+                else {}
+            )
+            try:
+                props_context = int(generation.get("n_ctx") or 0)
+            except (TypeError, ValueError):
+                props_context = 0
+            slot_contexts: List[int] = []
+            for slot in slots if isinstance(slots, list) else []:
+                if not isinstance(slot, dict):
+                    continue
+                try:
+                    context = int(slot.get("n_ctx") or 0)
+                except (TypeError, ValueError):
+                    context = 0
+                if context > 0:
+                    slot_contexts.append(context)
+            observed_contexts = [value for value in [props_context, *slot_contexts] if value > 0]
+            effective_context = min(observed_contexts) if observed_contexts else 0
+            probe_consistent = bool(
+                effective_context
+                and all(value == effective_context for value in observed_contexts)
+            )
+            endpoint_cache[origin] = {
+                "effective_context_tokens": effective_context,
+                "slot_count": len(slot_contexts),
+                "probe_consistent": probe_consistent,
+                "props_probe_ok": bool(props_result.get("ok") and props_context),
+                "slots_probe_ok": bool(slots_result.get("ok") and slot_contexts),
+                "probe_error": compact_text(
+                    props_result.get("error") or slots_result.get("error"),
+                    180,
+                ),
+            }
+        endpoint = endpoint_cache[origin]
+        for model in provider_models:
+            if not isinstance(model, dict):
+                continue
+            try:
+                declared_context = int(model.get("contextWindow") or 0)
+            except (TypeError, ValueError):
+                declared_context = 0
+            effective_context = int(endpoint.get("effective_context_tokens") or 0)
+            if not declared_context or not effective_context:
+                status = "unverified"
+            elif not endpoint.get("probe_consistent"):
+                status = "probe_inconsistent"
+            elif declared_context > effective_context:
+                status = "overdeclared"
+            elif declared_context < effective_context:
+                status = "conservative"
+            else:
+                status = "exact"
+            records.append(
+                {
+                    "provider": str(provider_id),
+                    "model": str(model.get("id") or ""),
+                    "declared_context_tokens": declared_context,
+                    "effective_context_tokens": effective_context,
+                    "slot_count": int(endpoint.get("slot_count") or 0),
+                    "probe_consistent": bool(endpoint.get("probe_consistent")),
+                    "props_probe_ok": bool(endpoint.get("props_probe_ok")),
+                    "slots_probe_ok": bool(endpoint.get("slots_probe_ok")),
+                    "status": status,
+                    "probe_error": str(endpoint.get("probe_error") or ""),
+                }
+            )
+
+    attention = [
+        item
+        for item in records
+        if item.get("status") in {"overdeclared", "probe_inconsistent", "unverified"}
+    ]
+    verified = [
+        item for item in records if item.get("status") in {"exact", "conservative"}
+    ]
+    exact = [item for item in records if item.get("status") == "exact"]
+    return {
+        "configured_local_model_count": len(records),
+        "remote_model_declaration_count": remote_declaration_count,
+        "endpoint_count": len(endpoint_cache),
+        "verified_count": len(verified),
+        "exact_count": len(exact),
+        "attention_count": len(attention),
+        "overdeclared_ids": [
+            f"{item['provider']}/{item['model']}"
+            for item in attention
+            if item.get("status") == "overdeclared"
+        ],
+        "records": records,
+        "ok": bool(records) and len(verified) == len(records),
+        "content_persisted": False,
+    }
+
+
 def build_capability_lifecycle(
     *,
     discovered: bool,
@@ -867,6 +1269,280 @@ def build_capability_lifecycle(
     }
 
 
+def _receipt_timestamp(value: object) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def collect_openclaw_resident_tool_receipts(
+    state_dir: Path,
+    *,
+    tool_names: Sequence[str],
+    max_age_seconds: int = 6 * 60 * 60,
+    max_files: int = 40,
+    max_file_bytes: int = 5_000_000,
+) -> List[Dict[str, object]]:
+    """Extract privacy-safe, causally ordered resident-tool receipts.
+
+    Configuration or self-report never promotes a capability.  A receipt needs
+    a fresh compiled catalog, a successful model event containing the exact
+    tool call and matching non-error result, and a later successful session
+    end. Prompt text, arguments, result content, paths, and raw identifiers are
+    never retained.
+    """
+
+    requested = {str(value).strip() for value in tool_names if str(value).strip()}
+    if not requested:
+        return []
+    agents_dir = Path(state_dir).expanduser() / "agents"
+    if not agents_dir.exists():
+        return []
+    now_timestamp = datetime.now(timezone.utc).timestamp()
+    age_limit = max(1, int(max_age_seconds))
+    candidates: List[Tuple[float, Path]] = []
+    try:
+        for path in agents_dir.glob("*/sessions/*.trajectory.jsonl"):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if stat.st_size <= 0 or stat.st_size > max(1, int(max_file_bytes)):
+                continue
+            file_age = now_timestamp - stat.st_mtime
+            if file_age < -300 or file_age > age_limit:
+                continue
+            candidates.append((stat.st_mtime, path))
+    except OSError:
+        return []
+    candidates.sort(key=lambda item: item[0], reverse=True)
+
+    receipts_by_tool: Dict[str, Dict[str, object]] = {}
+    for file_mtime, path in candidates[: max(1, int(max_files))]:
+        runs: Dict[str, Dict[str, object]] = {}
+        try:
+            handle = path.open("r", encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with handle:
+            for line_index, line in enumerate(handle, start=1):
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                run_id = str(event.get("runId") or "").strip()
+                event_type = str(event.get("type") or "").strip()
+                event_time = _receipt_timestamp(event.get("ts"))
+                if (
+                    not run_id
+                    or event_time is None
+                    or event_type
+                    not in {"context.compiled", "model.completed", "session.ended"}
+                ):
+                    continue
+                run = runs.setdefault(
+                    run_id,
+                    {
+                        "catalog_tools": set(),
+                        "catalog_indices": {},
+                        "catalog_times": {},
+                        "calls": {},
+                        "results": {},
+                        "successful_model_indices": set(),
+                        "run_success": False,
+                        "end_index": None,
+                        "end_time": None,
+                    },
+                )
+                data = event.get("data") if isinstance(event.get("data"), dict) else {}
+                if event_type == "context.compiled":
+                    for tool in data.get("tools") or []:
+                        if not isinstance(tool, dict):
+                            continue
+                        name = str(tool.get("name") or "").strip()
+                        if name not in requested:
+                            continue
+                        run["catalog_tools"].add(name)
+                        run["catalog_indices"].setdefault(name, line_index)
+                        run["catalog_times"].setdefault(name, event_time)
+                    continue
+                if event_type == "session.ended":
+                    run["run_success"] = str(data.get("status") or "").lower() == "success"
+                    run["end_index"] = line_index
+                    run["end_time"] = event_time
+                    continue
+                model_completed_successfully = bool(
+                    data.get("timedOut") is False
+                    and not data.get("promptError")
+                    and not data.get("idleTimedOut")
+                )
+                if not model_completed_successfully:
+                    continue
+                run["successful_model_indices"].add(line_index)
+                calls = run["calls"]
+                results = run["results"]
+                for message_index, message in enumerate(data.get("messagesSnapshot") or []):
+                    if not isinstance(message, dict):
+                        continue
+                    role = str(message.get("role") or "")
+                    content = message.get("content") if isinstance(message.get("content"), list) else []
+                    if role == "toolResult":
+                        call_id = str(message.get("toolCallId") or "").strip()
+                        name = str(message.get("toolName") or "").strip()
+                        if not call_id or name not in requested:
+                            continue
+                        text_parts = [
+                            str(part.get("text"))
+                            for part in content
+                            if isinstance(part, dict)
+                            and part.get("type") == "text"
+                            and isinstance(part.get("text"), str)
+                        ]
+                        details = message.get("details") if isinstance(message.get("details"), dict) else {}
+                        result_items = details.get("results") if isinstance(details.get("results"), list) else []
+                        structural_shape = {
+                            "tool": name,
+                            "ok": message.get("isError") is not True,
+                            "result_count": len(result_items),
+                            "detail_key_count": len(details),
+                            "text_part_count": len(text_parts),
+                            "text_char_count": sum(len(value) for value in text_parts),
+                        }
+                        results[call_id] = {
+                            **structural_shape,
+                            "index": line_index,
+                            "position": (line_index, message_index, 0),
+                            "observed_at": event_time,
+                            "consequence_shape_sha256": stable_json_hash(structural_shape),
+                        }
+                        continue
+                    for item_index, item in enumerate(content):
+                        if not isinstance(item, dict) or item.get("type") != "toolCall":
+                            continue
+                        name = str(item.get("name") or "").strip()
+                        call_id = str(item.get("id") or "").strip()
+                        if name in requested and call_id:
+                            calls[call_id] = {
+                                "tool": name,
+                                "index": line_index,
+                                "position": (line_index, message_index, item_index),
+                                "observed_at": event_time,
+                            }
+
+        for run_id, run in runs.items():
+            catalog = run.get("catalog_tools")
+            catalog_indices = run.get("catalog_indices")
+            catalog_times = run.get("catalog_times")
+            calls = run.get("calls")
+            results = run.get("results")
+            successful_model_indices = run.get("successful_model_indices")
+            end_index = run.get("end_index")
+            end_time = run.get("end_time")
+            if not (
+                isinstance(catalog, set)
+                and isinstance(catalog_indices, dict)
+                and isinstance(catalog_times, dict)
+                and isinstance(calls, dict)
+                and isinstance(results, dict)
+                and isinstance(successful_model_indices, set)
+                and run.get("run_success")
+                and isinstance(end_index, int)
+                and isinstance(end_time, datetime)
+            ):
+                continue
+            for call_id, call in calls.items():
+                if not isinstance(call, dict):
+                    continue
+                tool_name = str(call.get("tool") or "")
+                result = results.get(call_id)
+                if not isinstance(result, dict):
+                    continue
+                call_index = int(call.get("index") or 0)
+                result_index = int(result.get("index") or 0)
+                call_position = call.get("position")
+                result_position = result.get("position")
+                catalog_index = int(catalog_indices.get(tool_name) or 0)
+                catalog_time = catalog_times.get(tool_name)
+                call_time = call.get("observed_at")
+                result_time = result.get("observed_at")
+                if not (
+                    tool_name in catalog
+                    and result.get("ok")
+                    and str(result.get("tool") or "") == tool_name
+                    and call_index in successful_model_indices
+                    and isinstance(call_position, tuple)
+                    and isinstance(result_position, tuple)
+                    and catalog_index < call_index
+                    and call_position < result_position
+                    and result_index < end_index
+                    and isinstance(catalog_time, datetime)
+                    and isinstance(call_time, datetime)
+                    and isinstance(result_time, datetime)
+                    and catalog_time <= call_time <= result_time <= end_time
+                ):
+                    continue
+                event_age = now_timestamp - result_time.timestamp()
+                if event_age < -300 or event_age > age_limit:
+                    continue
+                result_count = int(result.get("result_count") or 0)
+                text_char_count = int(result.get("text_char_count") or 0)
+                detail_key_count = int(result.get("detail_key_count") or 0)
+                consequence_verified = bool(
+                    result_count > 0
+                    if tool_name == "wiki_search"
+                    else text_char_count > 0 or detail_key_count > 0
+                )
+                receipt = {
+                    "schema_version": "eve_openclaw_resident_tool_receipt.v1",
+                    "tool": tool_name,
+                    "run_id_sha256": hashlib.sha256(run_id.encode("utf-8")).hexdigest(),
+                    "session_id_sha256": hashlib.sha256(
+                        path.name.replace(".trajectory.jsonl", "").encode("utf-8")
+                    ).hexdigest(),
+                    "agent_id_sha256": hashlib.sha256(
+                        path.parent.parent.name.encode("utf-8")
+                    ).hexdigest(),
+                    "observed_at": result_time.isoformat(),
+                    "trajectory_mtime": datetime.fromtimestamp(
+                        file_mtime, tz=timezone.utc
+                    ).replace(microsecond=0).isoformat(),
+                    "catalog_admitted": True,
+                    "tool_call_observed": True,
+                    "tool_result_ok": True,
+                    "run_success": True,
+                    "result_count": result_count,
+                    "result_text_part_count": int(result.get("text_part_count") or 0),
+                    "result_text_char_count": text_char_count,
+                    "result_detail_key_count": detail_key_count,
+                    "consequence_shape_sha256": str(
+                        result.get("consequence_shape_sha256") or ""
+                    ),
+                    "consequence_verified": consequence_verified,
+                    "verifier": "eve_deterministic_trajectory_observer",
+                    "content_persisted": False,
+                    "_observed_epoch": result_time.timestamp(),
+                }
+                previous = receipts_by_tool.get(tool_name)
+                if previous is None or float(receipt["_observed_epoch"]) > float(
+                    previous.get("_observed_epoch") or 0.0
+                ):
+                    receipts_by_tool[tool_name] = receipt
+    receipts: List[Dict[str, object]] = []
+    for tool_name in sorted(receipts_by_tool):
+        receipt = dict(receipts_by_tool[tool_name])
+        receipt.pop("_observed_epoch", None)
+        receipts.append(receipt)
+    return receipts
+
 def build_openclaw_feature_family_reviews(
     *,
     current_config: Dict[str, object],
@@ -885,6 +1561,8 @@ def build_openclaw_feature_family_reviews(
     runtime_status: Dict[str, object],
     deterministic_audit: Dict[str, object],
     wiki_status: Optional[Dict[str, object]] = None,
+    resident_tool_receipts: Optional[Sequence[Dict[str, object]]] = None,
+    model_context_capacity: Optional[Dict[str, object]] = None,
 ) -> List[Dict[str, object]]:
     """Classify OpenClaw feature families against Eve's existing contracts."""
 
@@ -932,6 +1610,9 @@ def build_openclaw_feature_family_reviews(
     live_gateway_ok = bool(runtime_status.get("ok"))
     audit_ok = bool(deterministic_audit.get("ok") and deterministic_audit.get("status") == "ready")
     context_management = _compact_openclaw_context_management(current_config)
+    model_context_capacity = (
+        model_context_capacity if isinstance(model_context_capacity, dict) else {}
+    )
     wiki_status = wiki_status if isinstance(wiki_status, dict) else {}
     tools_config = current_config.get("tools") if isinstance(current_config.get("tools"), dict) else {}
     global_also_allow = {str(value) for value in tools_config.get("alsoAllow") or []}
@@ -943,6 +1624,32 @@ def build_openclaw_feature_family_reviews(
         "wiki_status",
     }
     wiki_resident_config_admitted = expected_wiki_tools.issubset(global_also_allow)
+    resident_tool_receipts = resident_tool_receipts or []
+    wiki_callable_receipts = [
+        item
+        for item in resident_tool_receipts
+        if isinstance(item, dict)
+        and str(item.get("tool") or "") in expected_wiki_tools
+        and item.get("catalog_admitted")
+        and item.get("tool_call_observed")
+        and item.get("tool_result_ok")
+        and item.get("run_success")
+    ]
+    wiki_consequence_receipts = [
+        item for item in wiki_callable_receipts if item.get("consequence_verified")
+    ]
+    wiki_resident_callable = bool(
+        wiki_resident_config_admitted and wiki_callable_receipts
+    )
+    wiki_resident_consequence_verified = bool(
+        wiki_resident_config_admitted and wiki_consequence_receipts
+    )
+    wiki_callable_tools = sorted(
+        {str(item.get("tool") or "") for item in wiki_callable_receipts}
+    )
+    wiki_consequence_verified_tools = sorted(
+        {str(item.get("tool") or "") for item in wiki_consequence_receipts}
+    )
 
     def review(
         family: str,
@@ -1000,6 +1707,36 @@ def build_openclaw_feature_family_reviews(
             ],
         ),
         review(
+            "model_context_capacity",
+            current_state=(
+                f"verified={int(model_context_capacity.get('verified_count') or 0)}/"
+                f"{int(model_context_capacity.get('configured_local_model_count') or 0)},"
+                f"overdeclared={len(model_context_capacity.get('overdeclared_ids') or [])}"
+            ),
+            decision=(
+                "use_existing"
+                if model_context_capacity.get("ok")
+                else "configure"
+                if int(model_context_capacity.get("attention_count") or 0) > 0
+                else "canary"
+                if int(model_context_capacity.get("configured_local_model_count") or 0) > 0
+                else "defer"
+            ),
+            rationale=(
+                "OpenClaw plans and compacts against each provider's per-request contextWindow, while llama.cpp divides "
+                "the server context across parallel slots. Declared capacity must not exceed the live slot window."
+            ),
+            configuration_action=(
+                "Derive every loopback provider contextWindow from the effective llama.cpp per-slot context, then re-run "
+                "the host attestation; do not copy total --ctx-size into a multi-slot provider declaration."
+            ),
+            evidence=[
+                "OpenClaw models.providers.*.models[].contextWindow",
+                "llama.cpp /props default_generation_settings.n_ctx",
+                "llama.cpp /slots[].n_ctx",
+            ],
+        ),
+        review(
             "memory_qmd",
             current_state="healthy" if memory_status.get("ok") else "degraded",
             decision="use_existing" if memory_status.get("ok") else "configure",
@@ -1013,11 +1750,13 @@ def build_openclaw_feature_family_reviews(
                 f"vault={wiki_status.get('vault_path') or 'unknown'},"
                 f"cli_callable={bool(wiki_status.get('cli_callable'))},"
                 f"resident_tools_configured={wiki_resident_config_admitted},"
-                "resident_consequence_verified=False"
+                f"resident_consequence_verified={wiki_resident_consequence_verified}"
             ),
             decision=(
                 "configure"
                 if not wiki_status.get("status_ok")
+                else "use_existing"
+                if wiki_resident_consequence_verified
                 else "canary"
             ),
             rationale=(
@@ -1241,6 +1980,13 @@ def build_openclaw_feature_family_reviews(
             callable_now=bool(live_gateway_ok),
             consequence_verified=False,
         ),
+        "model_context_capacity": build_capability_lifecycle(
+            discovered=True,
+            configured=int(model_context_capacity.get("configured_local_model_count") or 0) > 0,
+            enabled=int(model_context_capacity.get("configured_local_model_count") or 0) > 0,
+            callable_now=bool(model_context_capacity.get("ok")),
+            consequence_verified=bool(model_context_capacity.get("ok")),
+        ),
         "memory_qmd": build_capability_lifecycle(
             discovered=True,
             configured=memory_configured,
@@ -1256,8 +2002,8 @@ def build_openclaw_feature_family_reviews(
             enabled=bool(
                 "memory-wiki" in plugin_ids and wiki_status.get("status_ok")
             ),
-            callable_now=False,
-            consequence_verified=False,
+            callable_now=wiki_resident_callable,
+            consequence_verified=wiki_resident_consequence_verified,
         ),
         "skills": build_capability_lifecycle(
             discovered=True,
@@ -1372,8 +2118,12 @@ def build_openclaw_feature_family_reviews(
             item["lifecycle"]["interfaces"] = {
                 "cli_callable": bool(wiki_status.get("cli_callable")),
                 "resident_config_admitted": wiki_resident_config_admitted,
-                "resident_callable": False,
-                "resident_consequence_verified": False,
+                "resident_callable": wiki_resident_callable,
+                "resident_consequence_verified": wiki_resident_consequence_verified,
+                "configured_tools": sorted(expected_wiki_tools),
+                "resident_callable_tools": wiki_callable_tools,
+                "consequence_verified_tools": wiki_consequence_verified_tools,
+                "receipt_count": len(wiki_callable_receipts),
             }
     return reviews
 
@@ -1549,7 +2299,15 @@ def collect_openclaw_snapshot(
         probe_payload("wiki_status"),
         probe_payload("wiki_search"),
     )
+    resident_tool_receipts = collect_openclaw_resident_tool_receipts(
+        config_path.parent,
+        tool_names=["wiki_apply", "wiki_get", "wiki_lint", "wiki_search", "wiki_status"],
+    )
     context_management_status = _compact_openclaw_context_management(current_config)
+    model_context_capacity = _compact_openclaw_model_context_capacity(
+        current_config,
+        timeout=min(10, max(1, int(timeout))),
+    )
     deterministic_audit = deterministic_audit if isinstance(deterministic_audit, dict) else {}
     compact_deterministic_audit = {
         "generated_at": str(deterministic_audit.get("generated_at") or ""),
@@ -1582,6 +2340,8 @@ def collect_openclaw_snapshot(
         runtime_status=openclaw_runtime,
         deterministic_audit=compact_deterministic_audit,
         wiki_status=wiki_status,
+        resident_tool_receipts=resident_tool_receipts,
+        model_context_capacity=model_context_capacity,
     )
     feature_ids = sorted(
         {
@@ -1592,6 +2352,24 @@ def collect_openclaw_snapshot(
         }
     )
     version_match = re.search(r"OpenClaw\s+([^\s]+)", version_text)
+    configured_values_sha256 = stable_json_hash(safe_config)
+    observation_evidence: Dict[str, object] = {
+        "version": version_evidence,
+        "schema": schema_evidence,
+        "plugins": plugins_evidence,
+        "validate": validate_evidence,
+        "update": update_evidence,
+        "memory": memory_evidence,
+        "memory_retrieval": memory_search_evidence,
+        "qmd_version": qmd_version_evidence,
+        "mcporter_version": mcporter_version_evidence,
+        **{key: probe_evidence(key) for key in sorted(probe_specs)},
+    }
+    observation = classify_openclaw_observation(
+        observation_evidence,
+        config_read_ok=not bool(config_error),
+        configured_values_sha256=configured_values_sha256,
+    )
     snapshot: Dict[str, object] = {
         "id": "openclaw",
         "role": "body_action_nervous_system",
@@ -1604,7 +2382,7 @@ def collect_openclaw_snapshot(
         "config_warnings": list(validate_payload.get("warnings") or []) if isinstance(validate_payload, dict) else [],
         "configured_paths": flatten_mapping_paths(safe_config),
         "configured_values": safe_config,
-        "configured_values_sha256": stable_json_hash(safe_config),
+        "configured_values_sha256": configured_values_sha256,
         "config_schema_catalog": schema_catalog,
         "config_schema_sha256": stable_json_hash(schema_catalog),
         "config_schema_path_count": len(schema_catalog),
@@ -1626,7 +2404,9 @@ def collect_openclaw_snapshot(
             "isolation": isolation_status,
             "approvals": approvals_status,
             "context_management": context_management_status,
+            "model_context_capacity": model_context_capacity,
             "memory_wiki": wiki_status,
+            "resident_tool_receipts": resident_tool_receipts,
             "deterministic_audit": compact_deterministic_audit,
         },
         "feature_family_reviews": family_reviews,
@@ -1647,18 +2427,8 @@ def collect_openclaw_snapshot(
             },
         },
         "update_dry_run": redact_payload(update_payload or {}),
-        "evidence": {
-            "version": version_evidence,
-            "schema": schema_evidence,
-            "plugins": plugins_evidence,
-            "validate": validate_evidence,
-            "update": update_evidence,
-            "memory": memory_evidence,
-            "memory_retrieval": memory_search_evidence,
-            "qmd_version": qmd_version_evidence,
-            "mcporter_version": mcporter_version_evidence,
-            **{key: probe_evidence(key) for key in sorted(probe_specs)},
-        },
+        "observation": observation,
+        "evidence": observation_evidence,
     }
     snapshot["fingerprint"] = stable_json_hash(
         {
@@ -1898,6 +2668,79 @@ def extract_hermes_config_catalog(source_root: Path, configured: object) -> List
     return catalog
 
 
+def collect_hermes_automation_receipts(
+    *,
+    profile_home: Path,
+    command: str,
+    timeout: int,
+    runner: CommandRunner = default_command_runner,
+) -> Dict[str, object]:
+    """Observe Hermes automation without retaining job or hook content.
+
+    Hermes currently exposes human-readable listings for these surfaces rather
+    than a JSON status contract. The empty-state phrases are stable CLI
+    contracts in the installed release. Any other successful output is treated
+    conservatively as present, while command failures remain unverified. Only
+    status, booleans, and output hashes enter Eve's consulted capability ledger.
+    """
+
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(profile_home)
+    cron_text, cron_evidence = run_command_text(
+        runner,
+        [command, "cron", "list", "--all"],
+        timeout=timeout,
+        env=env,
+    )
+    hooks_text, hooks_evidence = run_command_text(
+        runner,
+        [command, "hooks", "list"],
+        timeout=timeout,
+        env=env,
+    )
+
+    cron_ok = bool(cron_evidence.get("ok"))
+    cron_empty = bool(cron_ok and re.search(r"\bno scheduled jobs\b", cron_text, re.IGNORECASE))
+    cron_present = bool(cron_ok and not cron_empty and cron_text.strip())
+
+    hooks_ok = bool(hooks_evidence.get("ok"))
+    hooks_empty = bool(
+        hooks_ok
+        and re.search(
+            r"\bno shell hooks(?:\s+or\s+outbound webhooks)? configured\b",
+            hooks_text,
+            re.IGNORECASE,
+        )
+    )
+    hooks_present = bool(hooks_ok and not hooks_empty and hooks_text.strip())
+
+    def compact_receipt(
+        evidence: Dict[str, object],
+        *,
+        empty: bool,
+        present: bool,
+    ) -> Dict[str, object]:
+        return {
+            "observed": bool(evidence.get("ok")),
+            "status": "empty" if empty else "present" if present else "unverified",
+            "configured": False if empty else True if present else None,
+            "returncode": evidence.get("returncode"),
+            "stdout_sha256": str(evidence.get("stdout_sha256") or ""),
+            "error": compact_text(evidence.get("error"), 240),
+        }
+
+    cron = compact_receipt(cron_evidence, empty=cron_empty, present=cron_present)
+    hooks = compact_receipt(hooks_evidence, empty=hooks_empty, present=hooks_present)
+    return {
+        "profile_scoped": True,
+        "cron": cron,
+        "hooks": hooks,
+        "all_observed": bool(cron.get("observed") and hooks.get("observed")),
+        "any_configured": bool(cron.get("configured") is True or hooks.get("configured") is True),
+        "raw_content_retained": False,
+    }
+
+
 def collect_hermes_snapshot(
     *,
     profile_home: Path,
@@ -1919,6 +2762,12 @@ def collect_hermes_snapshot(
     status = inventory.get("hermes_status") if isinstance(inventory.get("hermes_status"), dict) else {}
     families = inventory.get("capability_families") if isinstance(inventory.get("capability_families"), list) else []
     features = feature_policy.get("features") if isinstance(feature_policy.get("features"), list) else []
+    automation_receipts = collect_hermes_automation_receipts(
+        profile_home=profile_home,
+        command=command,
+        timeout=timeout,
+        runner=runner,
+    )
     family_ids = [str(item.get("id")) for item in families if isinstance(item, dict) and item.get("id")]
     feature_ids = [str(item.get("id")) for item in features if isinstance(item, dict) and item.get("id")]
     latest_run = latest_run if isinstance(latest_run, dict) else {}
@@ -1959,6 +2808,7 @@ def collect_hermes_snapshot(
         "feature_policy_summary": redact_payload(feature_policy.get("summary") or {}),
         "feature_policy": [redact_payload(item) for item in features if isinstance(item, dict)],
         "feature_ids": sorted(set([*family_ids, *feature_ids])),
+        "automation_receipts": automation_receipts,
         # Never copy a run's prompt, trace, proposal bodies, or hidden evaluator
         # material into this broadly consulted ledger.
         "latest_run": latest_run_summary,
@@ -1975,9 +2825,70 @@ def collect_hermes_snapshot(
             "catalog": snapshot["config_catalog_sha256"],
             "families": snapshot["capability_families"],
             "policy": snapshot["feature_policy"],
+            "automation_receipts": snapshot["automation_receipts"],
         }
     )
     return snapshot
+
+
+def classify_component_refresh_errors(errors: Sequence[object]) -> Dict[str, object]:
+    """Separate unavailable upstream refreshes from local capability failure."""
+
+    normalized = [compact_text(value, 300) for value in errors if str(value or "").strip()]
+    remote_inconclusive: List[str] = []
+    local_or_actionable: List[str] = []
+    for value in normalized:
+        lowered = value.lower()
+        unreachable = any(
+            marker in lowered
+            for marker in (
+                "could not resolve host",
+                "temporary failure in name resolution",
+                "name or service not known",
+                "nodename nor servname provided",
+                "network is unreachable",
+                "failed to connect",
+                "connection timed out",
+                "connection reset by peer",
+                "remote end closed connection",
+                "getaddrinfo failed",
+            )
+        )
+        remote_timeout = bool(
+            ("timed out" in lowered or "timeout" in lowered)
+            and any(
+                marker in lowered
+                for marker in (
+                    "npm view",
+                    "git fetch",
+                    "git ls-remote",
+                    "github.com",
+                    "pypi.org",
+                    "huggingface.co",
+                    "http://",
+                    "https://",
+                    "urlopen",
+                )
+            )
+        )
+        if unreachable or remote_timeout:
+            remote_inconclusive.append(value)
+        else:
+            local_or_actionable.append(value)
+    if normalized and not local_or_actionable:
+        status = "remote_refresh_inconclusive"
+    elif local_or_actionable:
+        status = "actionable_error"
+    else:
+        status = "complete"
+    return {
+        "status": status,
+        "error_count": len(normalized),
+        "remote_inconclusive_count": len(remote_inconclusive),
+        "actionable_error_count": len(local_or_actionable),
+        "remote_inconclusive_errors": remote_inconclusive,
+        "actionable_errors": local_or_actionable,
+    }
 
 
 def collect_eve_snapshot(
@@ -2018,24 +2929,36 @@ def collect_eve_snapshot(
     for item in component_state.get("components") or []:
         if not isinstance(item, dict):
             continue
+        errors = [compact_text(value, 220) for value in item.get("errors") or []]
+        refresh_observation = classify_component_refresh_errors(errors)
         components.append(
             {
                 "id": str(item.get("id") or ""),
                 "name": str(item.get("name") or ""),
                 "kind": str(item.get("kind") or ""),
+                "package": str(item.get("package") or ""),
                 "repository": str(item.get("repository") or ""),
                 "release_repository": str(item.get("release_repository") or ""),
                 "release_feature_mode": str(item.get("release_feature_mode") or "installed_version"),
                 "local_version": str(item.get("local_version") or ""),
+                "local_probe_ok": (
+                    bool(item.get("local_probe_ok"))
+                    if "local_probe_ok" in item
+                    else None
+                ),
+                "local_probe_detail": compact_text(item.get("local_probe_detail"), 300),
+                "local_path": str(item.get("local_path") or ""),
                 "latest_version": str(item.get("latest_version") or ""),
                 "update_available": bool(item.get("update_available")),
                 "remote_head": str(item.get("remote_head") or ""),
                 "mirror_head": str(item.get("mirror_head") or ""),
+                "mirror_status": str(item.get("mirror_status") or ""),
                 "status": str(item.get("status") or ""),
                 "blocked_latest_version": str(item.get("blocked_latest_version") or ""),
                 "blocked_version_reason": compact_text(item.get("blocked_version_reason"), 360),
                 "adoption": compact_text(item.get("adoption"), 300),
-                "errors": [compact_text(value, 220) for value in item.get("errors") or []],
+                "errors": errors,
+                "refresh_observation": refresh_observation,
             }
         )
     radar_surfaces = [
@@ -2093,6 +3016,7 @@ def collect_eve_snapshot(
     consumer_candidates = [
         root / "eve.py",
         root / "eve_model_topology.py",
+        root / "bin" / "eve_app_server.py",
         root / "bin" / "eve_model_watchdog.py",
         root / "bin" / "start_llama_cpp_server.sh",
     ]
@@ -2378,6 +3302,61 @@ def _component_for_release(
     return {}
 
 
+def _normalized_package_name(value: object) -> str:
+    return re.sub(r"[-_.]+", "-", str(value or "").strip().lower()).strip("-")
+
+
+def release_tag_track(
+    release: Dict[str, object],
+    component: Dict[str, object],
+) -> Dict[str, object]:
+    """Classify whether a monorepo tag belongs to the watched package track."""
+
+    tag = str(release.get("tag") or "").strip()
+    kind = str(component.get("kind") or "").strip().lower()
+    package = _normalized_package_name(component.get("package"))
+    result: Dict[str, object] = {
+        "compatible": True,
+        "version": "",
+        "tag_prefix": "",
+        "reason": "non_package_component",
+    }
+    if kind not in {"python_package", "npm_package"} or not package:
+        return result
+    direct = re.fullmatch(r"v?([0-9]+(?:\.[0-9]+){1,3}(?:[-+][A-Za-z0-9._-]+)?)", tag)
+    if direct:
+        result.update({"version": direct.group(1), "reason": "direct_version_tag"})
+        return result
+    prefixed = re.fullmatch(
+        r"(.+?)[-_]v?([0-9]+(?:\.[0-9]+){1,3}(?:[-+][A-Za-z0-9._-]+)?)",
+        tag,
+    )
+    if not prefixed:
+        result.update({"compatible": False, "reason": "unrecognized_package_tag"})
+        return result
+    prefix = _normalized_package_name(prefixed.group(1))
+    package_leaf = package.rsplit("/", 1)[-1].lstrip("@")
+    compatible = bool(prefix in {package, package_leaf})
+    result.update(
+        {
+            "compatible": compatible,
+            "version": prefixed.group(2),
+            "tag_prefix": prefix,
+            "reason": "matching_package_prefix" if compatible else "different_monorepo_package_track",
+        }
+    )
+    return result
+
+
+def stable_numeric_version_tuple(value: object) -> Optional[Tuple[int, ...]]:
+    text = str(value or "").strip().lower().lstrip("v")
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+){1,3})(?:-[0-9]+)?", text)
+    if not match:
+        return None
+    parts = tuple(int(part) for part in match.group(1).split("."))
+    return (*parts, *(0 for _ in range(4 - len(parts))))
+
+
 def build_feature_reviews(
     subsystems: Dict[str, object],
     release_feeds: Sequence[Dict[str, object]],
@@ -2425,6 +3404,15 @@ def build_feature_reviews(
             is_review_head = index == 0 or index == stable_head_index
             installed_match = release_mentions_installed_version(release, installed_version)
             blocked_match = release_mentions_installed_version(release, blocked_version)
+            tag_track = release_tag_track(release, component)
+            installed_numeric = stable_numeric_version_tuple(installed_version)
+            target_numeric = stable_numeric_version_tuple(tag_track.get("version"))
+            older_than_installed = bool(
+                tag_track.get("compatible")
+                and installed_numeric is not None
+                and target_numeric is not None
+                and target_numeric < installed_numeric
+            )
             if not is_review_head and not installed_match:
                 state = "historical"
                 priority = "info"
@@ -2437,6 +3425,17 @@ def build_feature_reviews(
                 state = "research_only"
                 priority = "low"
                 reason = "This repository is an upstream research source; its release tags are not authoritative installed-package evidence."
+            elif tag_track.get("compatible") is False:
+                state = "research_only"
+                priority = "low"
+                reason = (
+                    "The repository release belongs to a different package track than Eve's watched installed component; "
+                    "it is adjacent upstream research, not an update candidate."
+                )
+            elif older_than_installed:
+                state = "historical"
+                priority = "info"
+                reason = "The release feed version is older than Eve's installed package version and must not be offered as an update."
             elif blocked_match:
                 state = "blocked"
                 priority = "low"
@@ -2479,6 +3478,7 @@ def build_feature_reviews(
                     500,
                 ),
                 "release_feature_mode": release_mode,
+                "tag_track": tag_track,
                 "visible_in_current_feed": True,
                 "first_seen_at": str(prior.get("first_seen_at") or checked_at),
                 "last_seen_at": checked_at,
@@ -2500,6 +3500,7 @@ def build_feature_reviews(
                         "feature_bullets",
                         "required_gate",
                         "release_feature_mode",
+                        "tag_track",
                     )
                 }
             )
@@ -2709,7 +3710,15 @@ def build_effective_configuration_attestations(
         organ_id = str(organ.get("id"))
         state = str(organ.get("operational_status") or organ.get("status") or "unknown").lower()
         reported_state = str(organ.get("status") or state)
-        if organ_id == "beads_work_graph_substrate" and reported_state == "staged_live":
+        observation_environment_limited = organ.get("observation_environment_limited") is True
+        observation_blockers = [
+            str(value)
+            for value in organ.get("observation_blockers") or []
+            if str(value).strip()
+        ]
+        if observation_environment_limited:
+            effective_status = "inconclusive_environment"
+        elif organ_id == "beads_work_graph_substrate" and reported_state == "staged_live":
             effective_status = "staged_unbridged"
         elif reported_state == "lab_verified" or state == "lab_verified":
             effective_status = "lab_verified"
@@ -2719,6 +3728,8 @@ def build_effective_configuration_attestations(
             effective_status = "configured_unverified"
         elif state in {"disabled", "dormant", "not_configured", "research_candidate"}:
             effective_status = "dormant"
+        elif state == "working":
+            effective_status = "configured_unverified"
         else:
             effective_status = "degraded"
         add(
@@ -2731,6 +3742,9 @@ def build_effective_configuration_attestations(
             runtime={
                 "reported_status": reported_state,
                 "operational_status": str(organ.get("operational_status") or ""),
+                "observation_complete": organ.get("observation_complete"),
+                "observation_authoritative": organ.get("observation_authoritative"),
+                "observation_environment_limited": observation_environment_limited,
             },
             consequence={
                 "summary": compact_text(organ.get("summary"), 320),
@@ -2740,6 +3754,7 @@ def build_effective_configuration_attestations(
             authority_owner="Eve executive scheduler and the named organ contract",
             data_boundary=compact_text(organ.get("authority_boundary"), 420),
             rollback="Remove the organ from recurrence or return it to lab-only use without changing Eve identity or canonical memory.",
+            blockers=observation_blockers,
         )
 
     openclaw = subsystems.get("openclaw") if isinstance(subsystems.get("openclaw"), dict) else {}
@@ -2820,6 +3835,80 @@ def build_effective_configuration_attestations(
         blockers=[] if context_management_ok else [
             "profile validation, live gateway consumption, or one of the admitted context-management settings is missing"
         ],
+    )
+    model_context_capacity = (
+        runtime_surfaces.get("model_context_capacity")
+        if isinstance(runtime_surfaces.get("model_context_capacity"), dict)
+        else {}
+    )
+    configured_model_count = int(
+        model_context_capacity.get("configured_local_model_count") or 0
+    )
+    verified_model_count = int(model_context_capacity.get("verified_count") or 0)
+    model_context_attention = int(model_context_capacity.get("attention_count") or 0)
+    model_context_ok = bool(
+        configured_model_count > 0
+        and verified_model_count == configured_model_count
+        and model_context_capacity.get("ok")
+    )
+    if model_context_ok:
+        model_context_status = "effective"
+    elif model_context_attention:
+        model_context_status = "degraded"
+    elif configured_model_count:
+        model_context_status = "configured_unverified"
+    else:
+        model_context_status = "dormant"
+    model_context_blockers = []
+    for record in model_context_capacity.get("records") or []:
+        if not isinstance(record, dict) or record.get("status") in {"exact", "conservative"}:
+            continue
+        model_context_blockers.append(
+            f"{record.get('provider')}/{record.get('model')}: "
+            f"declared={int(record.get('declared_context_tokens') or 0)} "
+            f"effective={int(record.get('effective_context_tokens') or 0)} "
+            f"status={record.get('status') or 'unverified'}"
+        )
+    add(
+        "openclaw:model_context_capacity",
+        subsystem="openclaw",
+        feature_family="model_context_capacity",
+        configured_source=str(openclaw.get("config_path") or "OpenClaw Eve profile"),
+        configured_paths=[
+            "models.providers.*.baseUrl",
+            "models.providers.*.models[].contextWindow",
+            "models.providers.*.models[].maxTokens",
+        ],
+        consumer={
+            "kind": "openclaw_model_budget_and_compaction_planner",
+            "profile": str(openclaw.get("profile") or "eve-repair"),
+        },
+        runtime={
+            "configured_local_model_count": configured_model_count,
+            "endpoint_count": int(model_context_capacity.get("endpoint_count") or 0),
+            "verified_count": verified_model_count,
+            "exact_count": int(model_context_capacity.get("exact_count") or 0),
+            "attention_count": model_context_attention,
+            "records": model_context_capacity.get("records") or [],
+            "content_persisted": False,
+        },
+        consequence={
+            "verified": model_context_ok,
+            "intended_consequence": (
+                "OpenClaw never admits a prompt against more context than the selected live llama.cpp slot can hold"
+            ),
+        },
+        status=model_context_status,
+        authority_owner="OpenClaw provider configuration plus the selected local llama.cpp server",
+        data_boundary=(
+            "The attestation persists only provider/model identifiers and token/slot counts; it reads no prompt, response, "
+            "model artifact path, credential, or memory content."
+        ),
+        rollback=(
+            "Restore the prior provider declaration or llama.cpp launch shape, validate the profile, and require an exact "
+            "fresh /props plus /slots attestation before relying on the capacity again."
+        ),
+        blockers=model_context_blockers,
     )
     memory = openclaw.get("memory") if isinstance(openclaw.get("memory"), dict) else {}
     add(
@@ -3014,6 +4103,11 @@ def build_effective_configuration_attestations(
     )
 
     hermes = subsystems.get("hermes") if isinstance(subsystems.get("hermes"), dict) else {}
+    hermes_automation = (
+        hermes.get("automation_receipts")
+        if isinstance(hermes.get("automation_receipts"), dict)
+        else {}
+    )
     hermes_family_by_id = {
         str(item.get("id")): item
         for item in hermes.get("capability_families") or []
@@ -3104,6 +4198,39 @@ def build_effective_configuration_attestations(
         data_boundary="Upstream commits remain research/canary evidence until Eve's local repair, strict JSON, tests, and rollback all pass.",
         rollback="Discard the canary checkout; do not update the live Hermes environment in place.",
         blockers=["a newer Hermes source exists but has not passed the full Eve canary gate"] if source_update_pending else [],
+    )
+    automation_observed = hermes_automation.get("all_observed") is True
+    automation_configured = hermes_automation.get("any_configured") is True
+    automation_absent = bool(automation_observed and not automation_configured)
+    if automation_absent:
+        automation_status = "effective"
+        automation_blockers: List[str] = []
+    elif automation_configured:
+        automation_status = "degraded"
+        automation_blockers = [
+            "Hermes has cron or hook automation configured outside Eve's scheduler and event-ledger authority"
+        ]
+    else:
+        automation_status = "configured_unverified"
+        automation_blockers = ["Hermes cron and hook absence was not directly observed"]
+    add(
+        "hermes:automation_absence",
+        subsystem="hermes",
+        feature_family="cron_hooks",
+        configured_source=str(hermes.get("config_path") or "Hermes Eve learning profile"),
+        configured_paths=["cron", "hooks", "webhooks"],
+        consumer={"kind": "hermes_profile_scoped_cli_receipt"},
+        runtime=hermes_automation,
+        consequence={
+            "verified": automation_absent,
+            "direct_automation_absent": automation_absent,
+            "raw_content_retained": bool(hermes_automation.get("raw_content_retained")),
+        },
+        status=automation_status,
+        authority_owner="Eve executive scheduler and evidence ledger; Hermes remains proposal-only",
+        data_boundary="The receipt stores only empty/present status, return codes, and output hashes; no job, hook, webhook, prompt, or payload content is retained.",
+        rollback="Remove any Hermes cron or hook entry and rerun the profile-scoped absence receipt; Eve's scheduler remains unchanged.",
+        blockers=automation_blockers,
     )
 
     oss = eve.get("oss_substrates") if isinstance(eve.get("oss_substrates"), dict) else {}
@@ -3232,6 +4359,11 @@ def build_subsystem_feature_family_reviews(
 
     reviews: List[Dict[str, object]] = []
     openclaw = subsystems.get("openclaw") if isinstance(subsystems.get("openclaw"), dict) else {}
+    openclaw_plugins = {
+        str(item.get("id") or ""): item
+        for item in openclaw.get("plugins") or []
+        if isinstance(item, dict) and item.get("id")
+    }
     reviews.extend(
         item
         for item in openclaw.get("feature_family_reviews") or []
@@ -3239,6 +4371,11 @@ def build_subsystem_feature_family_reviews(
     )
 
     hermes = subsystems.get("hermes") if isinstance(subsystems.get("hermes"), dict) else {}
+    hermes_automation = (
+        hermes.get("automation_receipts")
+        if isinstance(hermes.get("automation_receipts"), dict)
+        else {}
+    )
     hermes_decisions = {
         "agent_runtime": "use_existing",
         "model_route": "canary",
@@ -3267,6 +4404,7 @@ def build_subsystem_feature_family_reviews(
         family_id = str(family.get("id"))
         state = str(family.get("status") or "unknown")
         decision = hermes_decisions.get(family_id, "defer")
+        family_evidence = [compact_text(value, 260) for value in (family.get("evidence") or [])[:12]]
         if family_id == "model_route" and state == "default_ready":
             decision = "use_existing"
         elif family_id == "config_and_prompt_hygiene" and state == "migration_available":
@@ -3285,6 +4423,28 @@ def build_subsystem_feature_family_reviews(
             "configured",
         }:
             decision = "configure"
+        if family_id == "cron_hooks" and hermes_automation.get("all_observed") is True:
+            cron_receipt = (
+                hermes_automation.get("cron")
+                if isinstance(hermes_automation.get("cron"), dict)
+                else {}
+            )
+            hooks_receipt = (
+                hermes_automation.get("hooks")
+                if isinstance(hermes_automation.get("hooks"), dict)
+                else {}
+            )
+            if hermes_automation.get("any_configured") is True:
+                state = "configured_live_receipt"
+                decision = "configure"
+            else:
+                state = "not_configured_live_receipt"
+                decision = "defer"
+            family_evidence = [
+                f"live_cron_status={cron_receipt.get('status') or 'unverified'}",
+                f"live_hooks_status={hooks_receipt.get('status') or 'unverified'}",
+                "receipt_content=hash_only",
+            ]
         reviews.append(
             {
                 "id": f"hermes:{family_id}",
@@ -3294,7 +4454,7 @@ def build_subsystem_feature_family_reviews(
                 "decision": decision,
                 "rationale": compact_text(family.get("eve_role"), 420),
                 "configuration_action": compact_text(family.get("recommended_next_test"), 500),
-                "evidence": [compact_text(value, 260) for value in (family.get("evidence") or [])[:12]],
+                "evidence": family_evidence,
                 "authority_boundary": "Hermes may learn and propose; it cannot write Eve state, own channels, or become another resident mind.",
             }
         )
@@ -3347,24 +4507,70 @@ def build_subsystem_feature_family_reviews(
         release_mode = str(component.get("release_feature_mode") or "installed_version")
         local_version = str(component.get("local_version") or "")
         errors = [str(value) for value in component.get("errors") or []]
+        refresh_observation = (
+            component.get("refresh_observation")
+            if isinstance(component.get("refresh_observation"), dict)
+            else classify_component_refresh_errors(errors)
+        )
+        refresh_status = str(refresh_observation.get("status") or "complete")
+        local_probe_known = component.get("local_probe_ok") is not None
+        local_probe_ok = component.get("local_probe_ok") is True
+        local_probe_detail = str(component.get("local_probe_detail") or "")
+        profile_owned_evidence = ""
+        if component_id == "openclaw-acpx" and "acpx" in openclaw_plugins:
+            acpx = openclaw_plugins["acpx"]
+            local_probe_known = True
+            local_probe_ok = bool(acpx.get("enabled") and str(acpx.get("status") or "") == "loaded")
+            local_version = str(acpx.get("version") or local_version)
+            profile_owned_evidence = "openclaw_profile_plugin_inventory"
+        local_probe_not_applicable = "no local command configured" in local_probe_detail.lower()
+        source_only_reference = bool(
+            not local_version
+            and not local_probe_ok
+            and local_probe_not_applicable
+            and str(component.get("mirror_status") or "") == "ready"
+        )
         if release_mode == "research_only":
             decision = "defer"
         elif release_mode == "lab_only":
             decision = "canary"
-        elif errors:
+        elif refresh_status == "actionable_error":
             decision = "configure"
+        elif (
+            local_probe_known
+            and not local_probe_ok
+            and not local_probe_not_applicable
+            and not source_only_reference
+        ):
+            decision = "configure"
+        elif local_probe_ok or local_version:
+            decision = "use_existing"
+        elif source_only_reference or refresh_status == "remote_refresh_inconclusive":
+            decision = "defer"
         elif not local_version:
             decision = "defer"
         else:
             decision = "use_existing"
+        if refresh_status == "remote_refresh_inconclusive":
+            if local_probe_ok or local_version:
+                current_state = "installed_refresh_inconclusive"
+            elif source_only_reference:
+                current_state = "source_reference_refresh_inconclusive"
+            else:
+                current_state = "availability_refresh_inconclusive"
+        else:
+            current_state = str(component.get("status") or local_version or "unknown")
         reviews.append(
             {
                 "id": f"eve:component:{component_id}",
                 "subsystem": "eve",
                 "family": f"component:{component_id}",
-                "current_state": str(component.get("status") or local_version or "unknown"),
+                "current_state": current_state,
                 "decision": decision,
-                "rationale": f"Tracked {component.get('kind') or 'component'} substrate; release mode={release_mode}.",
+                "rationale": (
+                    f"Tracked {component.get('kind') or 'component'} substrate; release mode={release_mode}; "
+                    f"refresh evidence={refresh_status}."
+                ),
                 "configuration_action": compact_text(
                     component.get("adoption")
                     or "Inspect its shipped feature/config surface and run a focused consequence canary before changing live use.",
@@ -3372,6 +4578,10 @@ def build_subsystem_feature_family_reviews(
                 ),
                 "evidence": [
                     f"local_version={local_version or 'unknown'}",
+                    f"local_probe_ok={component.get('local_probe_ok')}",
+                    f"effective_local_probe_ok={local_probe_ok}",
+                    *([f"profile_owned_evidence={profile_owned_evidence}"] if profile_owned_evidence else []),
+                    f"refresh_observation={refresh_status}",
                     f"latest_version={component.get('latest_version') or 'unknown'}",
                     *[compact_text(value, 240) for value in errors[:6]],
                 ],
@@ -4112,6 +5322,10 @@ def build_snapshot(
     refresh: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     generated_at = utc_now()
+    subsystems, observation_receipts = reconcile_inconclusive_subsystem_observations(
+        {"eve": eve, "openclaw": openclaw, "hermes": hermes},
+        previous,
+    )
     snapshot: Dict[str, object] = {
         "schema_id": SCHEMA_ID,
         "id": str(uuid.uuid4()),
@@ -4123,7 +5337,8 @@ def build_snapshot(
         "installs_or_updates_components": False,
         "adds_chat_lane": False,
         "refresh": refresh or {},
-        "subsystems": {"eve": eve, "openclaw": openclaw, "hermes": hermes},
+        "subsystems": subsystems,
+        "observation_receipts": observation_receipts,
         "release_feeds": release_feeds or [],
     }
     snapshot["feature_reviews"] = build_feature_reviews(
@@ -4179,6 +5394,16 @@ def build_snapshot(
         f"{int(effective_summary.get('attestation_count') or 0)} owned contract(s), with "
         f"{int(effective_summary.get('attention_count') or 0)} requiring runtime attention or a missing bridge."
     )
+    if observation_receipts:
+        preserved_count = sum(
+            1
+            for item in observation_receipts
+            if item.get("state_action") == "preserved_last_authoritative"
+        )
+        snapshot["summary"] += (
+            f" {len(observation_receipts)} subsystem observation(s) were inconclusive in this runner; "
+            f"the last authoritative state was preserved for {preserved_count}."
+        )
     snapshot["fingerprint"] = stable_json_hash(
         {
             "subsystems": {key: value.get("fingerprint") for key, value in subsystems.items() if isinstance(value, dict)},
@@ -4212,6 +5437,7 @@ def compact_history_record(snapshot: Dict[str, object]) -> Dict[str, object]:
         "summary": snapshot.get("summary"),
         "fingerprint": snapshot.get("fingerprint"),
         "refresh": snapshot.get("refresh") or {},
+        "observation_receipts": snapshot.get("observation_receipts") or [],
         "versions": {
             key: value.get("version")
             for key, value in subsystems.items()
@@ -4270,6 +5496,19 @@ def format_snapshot(snapshot: Dict[str, object], *, full: bool = False) -> str:
         f"summary: {snapshot.get('summary') or 'none recorded'}",
         f"material_change: {'yes' if changes.get('material_change') else 'no'}",
     ]
+    observation_receipts = [
+        item
+        for item in snapshot.get("observation_receipts") or []
+        if isinstance(item, dict)
+    ]
+    for item in observation_receipts:
+        lines.append(
+            "observation_inconclusive: "
+            f"{item.get('subsystem') or 'unknown'} | reason={item.get('reason') or 'unknown'} | "
+            f"action={item.get('state_action') or 'unknown'} | "
+            f"failed_probes={int(item.get('failed_probe_count') or 0)} | "
+            f"unverified_config_change={'yes' if item.get('config_changed_from_preserved_state') else 'no'}"
+        )
     for subsystem_id in ("eve", "openclaw", "hermes"):
         subsystem = subsystems.get(subsystem_id) if isinstance(subsystems.get(subsystem_id), dict) else {}
         version = subsystem.get("version") or subsystem.get("git_head") or "unknown"
@@ -4423,9 +5662,23 @@ def format_snapshot_markdown(snapshot: Dict[str, object]) -> str:
         "",
         str(snapshot.get("summary") or "No capability-intelligence summary is available."),
         "",
-        "## Subsystems",
-        "",
     ]
+    observation_receipts = [
+        item
+        for item in snapshot.get("observation_receipts") or []
+        if isinstance(item, dict)
+    ]
+    if observation_receipts:
+        lines.extend(["## Inconclusive Observations", ""])
+        for item in observation_receipts:
+            lines.append(
+                f"- **{item.get('subsystem') or 'unknown'}** — `{item.get('reason') or 'unknown'}`; "
+                f"state action `{item.get('state_action') or 'unknown'}`; failed probes "
+                f"`{int(item.get('failed_probe_count') or 0)}`; unverified config drift "
+                f"`{'yes' if item.get('config_changed_from_preserved_state') else 'no'}`."
+            )
+        lines.append("")
+    lines.extend(["## Subsystems", ""])
     for subsystem_id in ("eve", "openclaw", "hermes"):
         subsystem = subsystems.get(subsystem_id) if isinstance(subsystems.get(subsystem_id), dict) else {}
         version = subsystem.get("version") or subsystem.get("git_head") or "unknown"

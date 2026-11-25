@@ -14,6 +14,8 @@
     "CODE_OF_CONDUCT.md",
     "THIRD_PARTY_NOTICES.md",
     ".github/dependabot.yml",
+    ".github/workflows/codeql.yml",
+    ".github/workflows/dependency-sbom-audit.yml",
     ".github/workflows/public-release-audit.yml",
     "openclaw/config/mcporter.json",
     "pyproject.toml",
@@ -62,7 +64,12 @@
     "web/**"
   ],
   "force_include": [
+    "docs/architecture/EVE_ATTACHMENT_BOUNDARY_2026_08_23.md",
+    "docs/architecture/EVE_APP_REFRESH_CONTRACT_2026_08_23.md",
+    "docs/architecture/EVE_LOOPBACK_HTTP_SECURITY_2026_08_23.md",
+    "docs/architecture/EVE_STORE_CONCURRENCY_2026_08_23.md",
     "docs/evidence/DEPENDENCY_LICENSE_AUDIT_2026_08_23.md",
+    "docs/evidence/PERFORMANCE_OBSERVATION_CONTRACT_2026_08_23.md",
     "docs/evidence/PUBLIC_RELEASE_READINESS_AUDIT_2026_08_23.md"
   ],
   "exclude": [
@@ -100,15 +107,10 @@
     "bin/codex_coord.py",
     "bin/eve_core_ai_lab.py",
     "bin/eve_lora_train 2.py",
-    "bin/eve_lived_predictive_transfer.py",
     "bin/eve_mcp_2026_canary.py",
-    "bin/eve_predictive_dynamics_eval.py",
     "bin/eve_private_probe_runner.py",
     "bin/eve_self_repair_container_canary.py",
-    "eve_lived_feature_stream.py",
     "eve_model_inventory.py",
-    "eve_otel_genai.py",
-    "eve_predictive_dynamics.py",
     "eve_self_repair_container.py",
     "mac/EveAppIntents.swift",
     "mac/EveNativeIntelligence.swift",
@@ -116,10 +118,7 @@
     "tests/test_core_ai_lab.py",
     "tests/test_macos_native_capabilities.py",
     "tests/test_mcp_2026_compat.py",
-    "tests/test_lived_feature_stream.py",
     "tests/test_model_inventory.py",
-    "tests/test_otel_genai.py",
-    "tests/test_predictive_dynamics.py",
     "tests/test_private_probe_runner.py",
     "tests/test_self_repair_container.py",
     "web/eve_app/index 2.html",
@@ -226,6 +225,61 @@
   },
   "forbidden_declared_dependencies": [
     "arize-phoenix",
-    "mlx-embeddings"
-  ]
+    "mlx-embeddings",
+    "peft"
+  ],
+  "permissive_transitive_license_ids": [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "CNRI-Python",
+    "HPND-Markus-Kuhn",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "PSF-2.0",
+    "Python-2.0",
+    "Ruby",
+    "Zlib",
+    "ZPL-2.1"
+  ],
+  "permissive_transitive_license_refs": [
+    "LicenseRef-scancode-google-patent-license-golang",
+    "LicenseRef-scancode-protobuf",
+    "LicenseRef-scancode-public-domain"
+  ],
+  "transitive_license_overrides": {
+    "pkg:pypi/eve-local-runtime@0.1.0": {
+      "effective_license": "Apache-2.0",
+      "evidence_url": "https://raw.githubusercontent.com/adamdmcbride/eve/e33ce6d9512fc549a6fa65c444c08af5952da3ea/LICENSE",
+      "evidence_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    "pkg:pypi/aiohappyeyeballs@2.7.1": {
+      "effective_license": "PSF-2.0",
+      "evidence_url": "https://pypi.org/pypi/aiohappyeyeballs/2.7.1/json",
+      "evidence_sha256": "90a6fe95d5083b27fa3cb21b46a78cdf84befd72a03001ea3182747e6794b983"
+    },
+    "pkg:pypi/typing-extensions@4.16.0": {
+      "effective_license": "PSF-2.0",
+      "evidence_url": "https://pypi.org/pypi/typing-extensions/4.16.0/json",
+      "evidence_sha256": "2140da00d62dde967f52d0be0ae28444f1d6a3fe603f52c83c23988c32122d5a"
+    },
+    "pkg:githubactions/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1": {
+      "effective_license": "MIT",
+      "evidence_url": "https://raw.githubusercontent.com/actions/checkout/3d3c42e5aac5ba805825da76410c181273ba90b1/LICENSE",
+      "evidence_sha256": "3e855ffa704114a51628ef8f0bf3aeb41728adf9d9070e263bf58aa5640b0eb5"
+    },
+    "pkg:githubactions/actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97": {
+      "effective_license": "MIT",
+      "evidence_url": "https://raw.githubusercontent.com/actions/setup-python/5fda3b95a4ea91299a34e894583c3862153e4b97/LICENSE",
+      "evidence_sha256": "7d070f6b64d9bcc530fe99cc21eaaa4b3c364e0b2d367d7735671fa202a03b32"
+    },
+    "pkg:githubactions/actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294": {
+      "effective_license": "MIT",
+      "evidence_url": "https://raw.githubusercontent.com/actions/dependency-review-action/a1d282b36b6f3519aa1f3fc636f609c47dddb294/LICENSE",
+      "evidence_sha256": "399ebcd5cf53d2ba8f32e8d7c7aa77a64b959734f662c533f30b0e75d76012a1"
+    }
+  }
 }

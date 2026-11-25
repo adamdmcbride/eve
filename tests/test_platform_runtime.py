@@ -14,6 +14,12 @@ import eve_platform
 
 
 class EvePlatformTests(unittest.TestCase):
+    def setUp(self):
+        # Legacy service fixtures must not observe the host's real owned core.
+        observer = patch.object(eve, "observe_core_runner", return_value={"available": False})
+        observer.start()
+        self.addCleanup(observer.stop)
+
     def test_html_text_extraction_ignores_script_and_style_content(self):
         html = (
             "<html><head><title>Eve &amp; Guide</title>"
@@ -240,9 +246,11 @@ class EvePlatformTests(unittest.TestCase):
             self.assertIsNone(re.search(pattern, external_process))
 
     def test_runtime_dir_uses_windows_local_appdata(self):
+        # The test harness exports EVE_RUNTIME_DIR, which runtime_dir() honors
+        # before any platform rule; blank it so the Windows branch is exercised.
         with patch("sys.platform", "win32"), patch.dict(
             "os.environ",
-            {"LOCALAPPDATA": r"C:\Users\example\AppData\Local"},
+            {"LOCALAPPDATA": r"C:\Users\example\AppData\Local", "EVE_RUNTIME_DIR": ""},
             clear=False,
         ):
             path = eve_platform.runtime_dir()
@@ -788,7 +796,11 @@ class RuntimeFallbackTests(unittest.TestCase):
             sleep_seconds = 0
 
         state = {"daemon_started_at": "2026-04-20T22:38:54+00:00"}
-        with patch.object(eve, "load_config", return_value={"loop_sleep_seconds": 1}), patch.object(
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            eve, "RUNTIME_DIR", Path(temp_dir)
+        ), patch.object(eve, "write_daemon_activity"), patch.object(
+            eve, "load_config", return_value={"loop_sleep_seconds": 1}
+        ), patch.object(
             eve, "load_state", return_value=state
         ), patch.object(eve, "save_state") as save_state, patch.object(
             eve, "run_daemon_cycle", return_value=[]

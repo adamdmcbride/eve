@@ -25,6 +25,17 @@ eve_model_watchdog = load_script_module("eve_model_watchdog_test", "bin/eve_mode
 eve_system_observer = load_script_module("eve_system_observer_test", "bin/eve_system_observer.py")
 
 
+
+def _awareness_delegate_timeout() -> int:
+    """The awareness delegate timeout follows the live config; do not hard-code it."""
+    config = eve.load_config()
+    return int(config.get("self_awareness_timeout_seconds") or eve.DEFAULT_CONFIG["self_awareness_timeout_seconds"]) + 30 + int(config.get("human_context_timeout_seconds") or eve.DEFAULT_CONFIG["human_context_timeout_seconds"])
+
+
+def _awareness_battery_delegate_timeout() -> int:
+    config = eve.load_config()
+    return _awareness_delegate_timeout() + int(config.get("human_analog_self_awareness_timeout_seconds") or eve.DEFAULT_CONFIG["human_analog_self_awareness_timeout_seconds"]) + 15
+
 class FakeHTTPResponse:
     def __init__(self, payload):
         self.payload = payload
@@ -2562,6 +2573,11 @@ class MindTickTests(unittest.TestCase):
                 "openclaw_routines_enabled": False,
                 "episode_extraction_enabled": False,
                 "self_awareness_perturbation_enabled": False,
+                # These two phases read and write the durable capability store
+                # and fetch release feeds; leave them off so this cycle only
+                # exercises the mind tick.
+                "capability_intelligence_enabled": False,
+                "capability_adoption_enabled": False,
             }
         )
         now = "2026-04-21T03:05:00+00:00"
@@ -2610,7 +2626,7 @@ class MindTickTests(unittest.TestCase):
         ):
             completed = eve.run_daemon_cycle(config, state, force=False)
 
-        self.assertEqual(["mind_tick"], completed)
+        self.assertEqual(["mind_tick"], [item for item in completed if not str(item).startswith("sensory_")])
         run_mind_tick.assert_called_once_with(
             config,
             source="daemon",
@@ -2672,7 +2688,7 @@ class MindTickTests(unittest.TestCase):
         ):
             completed = eve.run_daemon_cycle(config, state, force=False)
 
-        self.assertEqual(["presence_cycle"], completed)
+        self.assertEqual(["presence_cycle"], [item for item in completed if not str(item).startswith("sensory_")])
         run_presence_cycle.assert_called_once_with(config, state, source="daemon", force=False)
         run_developmental_cycle.assert_not_called()
 
@@ -2760,7 +2776,7 @@ class MindTickTests(unittest.TestCase):
         ):
             completed = eve.run_daemon_cycle(config, state, force=False)
 
-        self.assertEqual(["ambient_thought"], completed)
+        self.assertEqual(["ambient_thought"], [item for item in completed if not str(item).startswith("sensory_")])
         generate_thread_micro_updates.assert_not_called()
         update_ambient_thought.assert_called_once()
         self.assertEqual(
@@ -2833,7 +2849,7 @@ class MindTickTests(unittest.TestCase):
         ), patch.object(eve, "append_entry"):
             completed = eve.run_daemon_cycle(config, state, force=False)
 
-        self.assertEqual(["ambient_thought"], completed)
+        self.assertEqual(["ambient_thought"], [item for item in completed if not str(item).startswith("sensory_")])
         generate_ambient.assert_called_once()
         self.assertEqual("eve-planner", update_ambient_thought.call_args.kwargs["model"])
         self.assertEqual("daemon_model", update_ambient_thought.call_args.kwargs["source"])
@@ -4189,7 +4205,7 @@ class MindTickTests(unittest.TestCase):
             cwd=str(runtime_dir),
             capture_output=True,
             text=True,
-            timeout=330,
+            timeout=_awareness_delegate_timeout(),
         )
         run_self_awareness_test.assert_not_called()
 
@@ -4225,7 +4241,7 @@ class MindTickTests(unittest.TestCase):
             cwd=str(runtime_dir),
             capture_output=True,
             text=True,
-            timeout=495,
+            timeout=_awareness_battery_delegate_timeout(),
         )
         run_self_awareness_battery.assert_not_called()
 

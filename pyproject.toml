@@ -35,7 +35,6 @@ oss-lab = [
   "langfuse>=4.14.4",
   "langgraph>=1.2.11",
   "openinference-semantic-conventions>=0.1.32",
-  "peft>=0.20.0",
 ]
 
 [tool.uv]

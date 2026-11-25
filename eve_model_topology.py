@@ -23,9 +23,11 @@ import eve_profile
 
 MODEL_LANE_TOPOLOGY_FIVE_ENDPOINT = "five_endpoint"
 MODEL_LANE_TOPOLOGY_THREE_SUBSTRATE = "three_substrate"
+MODEL_LANE_TOPOLOGY_SINGLE_SUBSTRATE = "single_substrate"
 MODEL_LANE_TOPOLOGY_MODES = {
     MODEL_LANE_TOPOLOGY_FIVE_ENDPOINT,
     MODEL_LANE_TOPOLOGY_THREE_SUBSTRATE,
+    MODEL_LANE_TOPOLOGY_SINGLE_SUBSTRATE,
 }
 
 # Logical order follows the reply council.  Physical profile order preserves
@@ -104,6 +106,8 @@ def normalize_topology_mode(value: object) -> str:
         "three": MODEL_LANE_TOPOLOGY_THREE_SUBSTRATE,
         "three_substrates": MODEL_LANE_TOPOLOGY_THREE_SUBSTRATE,
         "three_substrate": MODEL_LANE_TOPOLOGY_THREE_SUBSTRATE,
+        "single": MODEL_LANE_TOPOLOGY_SINGLE_SUBSTRATE,
+        "single_substrate": MODEL_LANE_TOPOLOGY_SINGLE_SUBSTRATE,
     }
     return aliases.get(normalized, MODEL_LANE_TOPOLOGY_FIVE_ENDPOINT)
 
@@ -120,6 +124,8 @@ def topology_profile_map(
     mode: Optional[str] = None,
 ) -> Dict[str, str]:
     selected = normalize_topology_mode(mode or configured_topology_mode(config))
+    if selected == MODEL_LANE_TOPOLOGY_SINGLE_SUBSTRATE:
+        return {lane: "deep" for lane in LOGICAL_LANE_ORDER}
     if selected == MODEL_LANE_TOPOLOGY_FIVE_ENDPOINT:
         return dict(IDENTITY_PROFILE_MAP)
     result = dict(THREE_SUBSTRATE_PROFILE_MAP)
@@ -309,9 +315,11 @@ def topology_snapshot(
         spec for spec in all_profile_specs(config, mode=selected) if not bool(spec["active"])
     ]
     errors: List[str] = []
-    expected_substrate_count = (
-        3 if selected == MODEL_LANE_TOPOLOGY_THREE_SUBSTRATE else 5
-    )
+    expected_substrate_count = {
+        MODEL_LANE_TOPOLOGY_SINGLE_SUBSTRATE: 1,
+        MODEL_LANE_TOPOLOGY_THREE_SUBSTRATE: 3,
+        MODEL_LANE_TOPOLOGY_FIVE_ENDPOINT: 5,
+    }[selected]
     if len(active) != expected_substrate_count:
         errors.append(
             f"{selected} requires {expected_substrate_count} active substrates, found {len(active)}"

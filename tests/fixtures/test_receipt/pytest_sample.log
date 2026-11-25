@@ -1,0 +1,9 @@
+.....F...E.....s........                                                 [100%]
+=================================== FAILURES ===================================
+____________________ CopilotKitTests.test_agui_adapter_canary ____________________
+AssertionError: expected COPILOTKIT_AGUI_PROTOCOL in eve_agui
+=========================== short test summary info ============================
+FAILED tests/test_copilotkit_probe.py::CopilotKitTests::test_agui_adapter_canary - AssertionError: expected COPILOTKIT_AGUI_PROTOCOL in eve_agui
+FAILED tests/test_copilotkit_probe.py::CopilotKitTests::test_probe_reports_protocol - KeyError: 'protocol'
+ERROR tests/test_http_server.py::HttpServerTests::test_bind - OSError: [Errno 48] Address already in use
+2 failed, 21 passed, 1 skipped, 1 xfailed, 1 error in 12.34s

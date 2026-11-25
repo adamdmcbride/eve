@@ -2517,6 +2517,95 @@ class ConversationalPredictionTests(unittest.TestCase):
         self.assertIsNone(record["outcome_ok"])
         join.assert_not_called()
 
+    def test_new_social_prediction_scores_visible_response_with_proper_loss(self):
+        prediction = eve.eve_social_prediction.build_prediction(
+            reply_text="What changed after the restart?",
+            inbound_text="Help me diagnose this.",
+            thread_id="social-thread-1",
+            source_message_id="social-user-1",
+            reply_message_id="social-reply-1",
+            made_at="2026-08-23T20:00:00+00:00",
+        )
+        prior = {
+            "social_prediction": prediction,
+            "reply_message_id": "social-reply-1",
+            "conscious_cycle_id": "social-cycle-1",
+        }
+        with (
+            patch.object(eve, "prediction_check_observation_status", return_value="none"),
+            patch.object(eve, "append_prediction_check_record", return_value=True),
+            patch.object(eve, "join_delayed_reply_consequence") as join,
+        ):
+            record = eve.record_conversational_prediction_check(
+                prior,
+                {
+                    "id": "social-user-2",
+                    "body": "The gateway recovered.",
+                    "thread_id": "social-thread-1",
+                    "timestamp": "2026-08-23T20:00:01+00:00",
+                },
+            )
+
+        self.assertTrue(record["fulfilled"])
+        self.assertEqual("answer", record["observed"])
+        self.assertTrue(record["social_outcome"]["scored"])
+        self.assertEqual(
+            record["social_outcome"]["error_magnitude"],
+            record["error_magnitude"],
+        )
+        self.assertFalse(record["consequence_observed"])
+        self.assertIsNone(record["outcome_ok"])
+        join.assert_not_called()
+
+    def test_anticipated_correction_is_prediction_hit_but_negative_consequence(self):
+        prediction = eve.eve_social_prediction.build_prediction(
+            reply_text="I completed the requested change.",
+            inbound_text="Fix the architecture.",
+            thread_id="social-thread-2",
+            source_message_id="social-user-3",
+            reply_message_id="social-reply-2",
+            made_at="2026-08-23T20:01:00+00:00",
+        )
+        prediction["distribution"] = {
+            "acceptance": 0.10,
+            "correction": 0.60,
+            "answer": 0.05,
+            "follow_up_question": 0.10,
+            "continuation": 0.10,
+            "topic_shift": 0.05,
+        }
+        prediction["predicted_class"] = "correction"
+        prediction["top_probability"] = 0.60
+        prior = {
+            "social_prediction": prediction,
+            "reply_message_id": "social-reply-2",
+            "conscious_cycle_id": "social-cycle-2",
+        }
+        with (
+            patch.object(eve, "prediction_check_observation_status", return_value="none"),
+            patch.object(eve, "append_prediction_check_record", return_value=True),
+            patch.object(
+                eve,
+                "join_delayed_reply_consequence",
+                return_value={"applied": True},
+            ) as join,
+        ):
+            record = eve.record_conversational_prediction_check(
+                prior,
+                {
+                    "id": "social-user-4",
+                    "body": "No, that is not what I asked.",
+                    "thread_id": "social-thread-2",
+                    "timestamp": "2026-08-23T20:01:01+00:00",
+                },
+            )
+
+        self.assertTrue(record["fulfilled"])
+        self.assertTrue(record["consequence_observed"])
+        self.assertFalse(record["outcome_ok"])
+        self.assertTrue(record["conscious_consequence_joined"])
+        join.assert_called_once()
+
     def test_scope_reframe_is_detected_as_lived_correction(self):
         correction = eve.classify_user_correction(
             "I mean real consciousness. Read the README and fix the architecture."
@@ -2561,6 +2650,11 @@ class ConversationalPredictionTests(unittest.TestCase):
         self.assertFalse(outcome["observed"])
         self.assertTrue(outcome["delivery_ok"])
         self.assertEqual("pending_user_evidence", replay["reply_consequence_status"])
+        self.assertEqual(
+            eve.eve_social_prediction.SCHEMA_VERSION,
+            replay["social_prediction"]["schema_version"],
+        )
+        self.assertEqual("r1", replay["social_prediction"]["reply_message_id"])
         self.assertEqual("respond_to_user", replay["conscious_action_id"])
         self.assertEqual(["fast"], [item["lane"] for item in replay["faculty_contributors"]])
         self.assertEqual(["direct_reply"], replay["faculty_contributors"][0]["roles"])
@@ -2793,6 +2887,73 @@ class ConversationalPredictionTests(unittest.TestCase):
         self.assertFalse(record["recorded"])
         self.assertFalse(record["conscious_consequence_joined"])
         join.assert_called_once()
+
+    def test_concurrent_second_observation_cannot_overwrite_first_consequence(self):
+        prior = {
+            "predicted_reaction": "continue",
+            "reply_message_id": "race-reply-1",
+            "conscious_cycle_id": "race-cycle-1",
+        }
+        with (
+            patch.object(
+                eve,
+                "prediction_check_observation_status",
+                side_effect=["none", "different_observation"],
+            ),
+            patch.object(eve, "append_prediction_check_record", return_value=False),
+            patch.object(eve, "join_delayed_reply_consequence") as join,
+        ):
+            record = eve.record_conversational_prediction_check(
+                prior,
+                {
+                    "id": "race-user-2",
+                    "body": "No, that is not what I asked.",
+                    "thread_id": "race-thread-1",
+                },
+            )
+
+        self.assertTrue(record["closed_by_prior_observation"])
+        join.assert_not_called()
+
+    def test_new_social_prediction_closes_once_and_persists_no_user_text(self):
+        first = {
+            "kind": "conversational",
+            "prediction_id": "social-prediction:unit-close-once",
+            "scored_reply_id": "social-reply-close-once",
+            "observed_message_id": "social-user-first",
+            "observed_text": "private first response",
+            "social_outcome": {"scored": True},
+        }
+        second = {
+            **first,
+            "observed_message_id": "social-user-second",
+            "observed_text": "private second response",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "prediction_checks.jsonl"
+            with (
+                patch.object(eve, "PREDICTION_CHECKS_PATH", path),
+                patch.object(eve, "mirror_store_file_to_runtime"),
+            ):
+                eve.write_jsonl_records(
+                    path,
+                    [
+                        {
+                            "kind": "conversational",
+                            "scored_reply_id": "legacy-reply",
+                            "observed_message_id": "legacy-user",
+                            "observed_text": "legacy private response",
+                        }
+                    ],
+                )
+                self.assertTrue(eve.append_prediction_check_record(first))
+                self.assertFalse(eve.append_prediction_check_record(second))
+                persisted = eve.read_jsonl_records(path)
+
+        self.assertEqual(2, len(persisted))
+        self.assertTrue(all("observed_text" not in item for item in persisted))
+        self.assertTrue(all(len(item["observed_text_sha256"]) == 64 for item in persisted))
+        self.assertEqual("social-user-first", persisted[-1]["observed_message_id"])
 
 
 if __name__ == "__main__":

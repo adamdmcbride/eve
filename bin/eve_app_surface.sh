@@ -44,6 +44,18 @@ listener_pid() {
   fi
 }
 
+is_valid_pid() {
+  local pid="$1"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ && "${pid}" != "1" ]]
+}
+
+is_eve_app_surface_process() {
+  local pid="$1"
+  local command
+  command="$(ps -p "${pid}" -o command= 2>/dev/null || true)"
+  [[ "${command}" == *eve_app_server.py* ]]
+}
+
 backend_ready() {
   curl -fsS --max-time 2 "${BACKEND}/v1/models" >/dev/null 2>&1
 }
@@ -51,7 +63,8 @@ backend_ready() {
 surface_ready() {
   local payload
   payload="$(curl -fsS --max-time 2 "http://${HOST}:${PORT}/health" 2>/dev/null || true)"
-  [[ "${payload}" == *'"surface": "eve-app"'* || "${payload}" == *'"surface":"eve-app"'* ]]
+  [[ "${payload}" == *'"surface": "eve-app"'* || "${payload}" == *'"surface":"eve-app"'* ]] &&
+    [[ "${payload}" == *'"backend_ok": true'* || "${payload}" == *'"backend_ok":true'* ]]
 }
 
 if surface_ready; then
@@ -61,8 +74,14 @@ fi
 
 if [[ -f "${PID_PATH}" ]]; then
   old_pid="$(cat "${PID_PATH}" 2>/dev/null || true)"
-  if [[ -n "${old_pid}" ]] && kill -0 "${old_pid}" 2>/dev/null; then
-    stop_process_tree "${old_pid}"
+  if is_valid_pid "${old_pid}" && kill -0 "${old_pid}" 2>/dev/null; then
+    if is_eve_app_surface_process "${old_pid}"; then
+      stop_process_tree "${old_pid}"
+    else
+      echo "Ignoring stale Eve app PID ${old_pid}; it belongs to another process." >&2
+    fi
+  elif [[ -n "${old_pid}" ]] && ! is_valid_pid "${old_pid}"; then
+    echo "Ignoring invalid Eve app PID file contents." >&2
   fi
   rm -f "${PID_PATH}"
 fi

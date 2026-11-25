@@ -45,6 +45,17 @@ The export policy excludes, among other things:
 - isolated experimental adapters that were still under separate review when
   the first public source snapshot was frozen.
 
+The source release gate now emits a deterministic schema 2 manifest containing
+sorted relative paths, byte counts, per-file SHA-256 digests, total bytes, and a
+canonical tree digest. Export is transactional: it copies into a sibling
+staging directory, re-audits that staged tree, requires exact manifest parity,
+and renames it into place only after both checks pass. The verifier rejects
+path traversal, duplicate or unsorted entries, summary tampering, changed or
+missing files, non-regular files, and unmanifested tree content. This is the
+mechanism intended to compare a reviewed source candidate, GitHub root, and
+extracted release archive; a manifest that was merely generated is not proof
+until verification succeeds against the independently obtained tree.
+
 The public `.gitignore` independently defaults secrets, environments, model
 files, local training data, continuity stores, OpenClaw state, and generated
 runtime material to local-only.
@@ -68,6 +79,23 @@ Python 3.12. The locked core/dev environment installed successfully, and an
 isolated runtime sync reported matching first-party source/runtime hashes while
 honestly marking optional learned artifacts unavailable.
 
+The source install now also creates one stable `eve` command inside the locked
+environment. Its Unix and Windows launchers locate `eve.py` relative to the
+environment, contain no checkout-specific absolute path, and are installed by
+same-directory atomic replacement. A relocation test moved a checkout into a
+path containing a space and verified exact argument forwarding. The launcher is
+an interim source-install contract only: no wheel, PyPI distribution, daemon,
+model, or external provider is implied.
+
+Bootstrap execution truth is now explicit. Schema-2 `install --json` isolates
+child output and emits one final result with a terminal status, completed-step
+count, exact failed command, rollback flag, and bounded 8 KiB diagnostic tail.
+The executor stops before all later commands on a failed or unstartable step.
+Human-readable mode reports the same partial-progress boundary without a Python
+traceback. This does not make install transactional: previously completed
+environment or runtime-sync steps remain in place and are truthfully reported
+as not rolled back.
+
 ## License and provenance result
 
 - Eve's original source is Apache-2.0.
@@ -84,6 +112,27 @@ GitHub currently generates an SPDX dependency-graph SBOM with 187 package
 records, and Dependabot reports zero open alerts. The complete transitive
 license review remains a gate for the first public tag. Weekly `uv` and GitHub
 Actions Dependabot updates support that review; they do not replace it.
+
+Every checkout in the public release and scheduled SBOM workflows now sets
+`persist-credentials: false`. Workflow permissions remain `contents: read`, all
+external actions remain full-SHA pinned, and no `pull_request_target` or
+`workflow_run` trigger executes checked-out contribution code. The workflow
+contract test enforces checkout-count parity with explicit non-persistence so a
+future job cannot inherit authenticated Git access by omission.
+
+The source candidate now also carries the advanced Python CodeQL workflow that
+was already present in the personal public repository. It uses interpreted
+`build-mode: none`; runs on push, ordinary pull request, weekly schedule, and
+manual dispatch; and does not install or execute repository code. Its analysis
+job grants `contents: read` plus the single `security-events: write` permission
+needed to upload CodeQL results. Immutable checkout/CodeQL pins, credential
+non-persistence, matching init/analyze revisions, trigger safety, and the absence
+of other write scopes are enforced by the workflow contract test.
+The release policy now lists CodeQL, the scheduled transitive-SBOM/license
+gate, Dependabot, and the main release audit as required files rather than only
+allowlisted files. The deterministic candidate audit therefore blocks an
+export if any of these controls is missing; this is source-policy evidence, not
+proof that a newly exported revision has already run on GitHub.
 
 ## Security evidence
 
@@ -150,7 +199,21 @@ uv run python bin/eve_dependency_license_audit.py --json
 python3 bin/eve_public_release_audit.py \
   --root . \
   --full
+
+python3 bin/eve_public_release_audit.py \
+  --root . \
+  --write-manifest /path/outside/eve-public-manifest.json \
+  --export /path/outside/eve-public-export \
+  --full
+
+python3 bin/eve_public_release_audit.py \
+  --root /path/outside/eve-public-export \
+  --verify-manifest /path/outside/eve-public-manifest.json \
+  --exact-tree \
+  --full
 ```
 
 Export remains fail-closed and refuses a non-empty destination or a candidate
-with a blocking finding.
+with a blocking finding. Manifest output is required to remain outside the
+audited source and exported tree so it cannot invalidate or self-reference the
+artifact it describes.

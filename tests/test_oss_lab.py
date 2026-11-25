@@ -161,6 +161,146 @@ class OssLabTests(unittest.TestCase):
         self.assertEqual("phoenix", report["server_identity"])
         self.assertTrue(report["currently_running"])
 
+    def test_phoenix_local_only_environment_strips_inherited_remote_and_model_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env, policy = oss_lab.phoenix_local_only_environment(
+                Path(tmp),
+                6006,
+                package_version_value="20.3.0",
+                base_env={
+                    "PATH": "/usr/bin",
+                    "PHOENIX_COLLECTOR_ENDPOINT": "https://collector.invalid",
+                    "PHOENIX_CLIENT_HEADERS": "Authorization=secret",
+                    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "https://otel.invalid",
+                    "OPENAI_API_KEY": "secret-openai-value",
+                    "HTTPS_PROXY": "https://proxy.invalid",
+                },
+            )
+
+        self.assertEqual("127.0.0.1", env["PHOENIX_HOST"])
+        self.assertEqual("false", env["PHOENIX_ALLOW_EXTERNAL_RESOURCES"])
+        self.assertEqual("true", env["PHOENIX_DISABLE_AGENT_ASSISTANT"])
+        self.assertEqual("false", env["PHOENIX_ENABLE_MCP_SERVER"])
+        self.assertEqual("false", env["PHOENIX_ENABLE_MCP_CODE_MODE"])
+        self.assertEqual("NONE", env["PHOENIX_ALLOWED_PROVIDERS"])
+        self.assertEqual("NONE", env["PHOENIX_ALLOWED_SANDBOX_PROVIDERS"])
+        self.assertNotIn("PHOENIX_COLLECTOR_ENDPOINT", env)
+        self.assertNotIn("PHOENIX_CLIENT_HEADERS", env)
+        self.assertNotIn("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", env)
+        self.assertNotIn("OPENAI_API_KEY", env)
+        self.assertNotIn("HTTPS_PROXY", env)
+        self.assertFalse(policy["remote_export_configured"])
+        self.assertFalse(policy["contains_inherited_sensitive_values"])
+        self.assertFalse(policy["launch_permitted"])
+        self.assertTrue(policy["wasm_required_for_no_download_launch"])
+        self.assertNotIn("secret-openai-value", json.dumps(policy, sort_keys=True))
+        self.assertNotIn("collector.invalid", json.dumps(policy, sort_keys=True))
+
+    def test_phoenix_local_only_environment_accepts_only_exact_wasm_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            wasm = workdir / "wasm" / "python-3.12.0.wasm"
+            wasm.parent.mkdir()
+            wasm.write_bytes(b"fixture")
+            with patch.object(
+                oss_lab,
+                "file_sha256",
+                return_value=oss_lab.PHOENIX_WASM_SHA256,
+            ):
+                env, policy = oss_lab.phoenix_local_only_environment(
+                    workdir,
+                    6006,
+                    package_version_value="20.3.0",
+                    base_env={"PATH": "/usr/bin"},
+                )
+
+        self.assertEqual(str(wasm.resolve()), env["PHOENIX_WASM_BINARY_PATH"])
+        self.assertTrue(policy["wasm_available"])
+        self.assertTrue(policy["wasm_sha256_verified"])
+        self.assertEqual("working_dir_cache", policy["wasm_source"])
+        self.assertTrue(policy["launch_permitted"])
+
+    def test_phoenix_legacy_launch_does_not_require_new_wasm_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env, policy = oss_lab.phoenix_local_only_environment(
+                Path(tmp),
+                6006,
+                package_version_value="14.6.0",
+                base_env={"PATH": "/usr/bin"},
+            )
+
+        self.assertNotIn("PHOENIX_WASM_BINARY_PATH", env)
+        self.assertFalse(policy["wasm_required_for_no_download_launch"])
+        self.assertTrue(policy["launch_permitted"])
+
+    def test_phoenix_guarded_command_blocks_non_loopback_dns_before_connect(self) -> None:
+        code = """
+import socket
+try:
+    socket.getaddrinfo('example.com', 443)
+except socket.gaierror:
+    print('blocked')
+""".strip()
+        command = oss_lab.phoenix_guarded_python_command(
+            oss_lab.sys.executable,
+            code,
+            [],
+            run_entrypoint=False,
+        )
+
+        result = oss_lab.run_command(command, timeout=5, env={"PATH": "/usr/bin:/bin"})
+
+        self.assertEqual("ok", result["status"])
+        self.assertEqual("blocked", result["stdout_tail"].strip())
+        self.assertIn(oss_lab.PHOENIX_EXTERNAL_SOCKET_BLOCKED_MARKER, result["stderr_tail"])
+
+    def test_phoenix_trace_probe_reports_only_aggregate_receipt(self) -> None:
+        command_result = {
+            "status": "ok",
+            "returncode": 0,
+            "stdout_tail": '{"flush_ok": true, "span_count": 1}\n',
+            "stderr_tail": "",
+        }
+        with patch.object(oss_lab, "run_command", return_value=command_result):
+            report = oss_lab.phoenix_local_trace_probe(
+                "/repo/.venv/bin/python",
+                "http://127.0.0.1:6006",
+                {"PATH": "/usr/bin"},
+            )
+
+        self.assertEqual("passed", report["status"])
+        self.assertTrue(report["flush_ok"])
+        self.assertEqual(1, report["span_count"])
+        self.assertFalse(report["contains_span_payload"])
+        self.assertFalse(report["contains_user_data"])
+        self.assertNotIn("eve.phoenix.local_preflight", json.dumps(report, sort_keys=True))
+
+    def test_phoenix_trace_probe_retries_one_transient_local_failure(self) -> None:
+        failed = {
+            "status": "error",
+            "returncode": 1,
+            "stdout_tail": "",
+            "stderr_tail": "transient local database not ready",
+        }
+        passed = {
+            "status": "ok",
+            "returncode": 0,
+            "stdout_tail": '{"flush_ok": true, "span_count": 1}\n',
+            "stderr_tail": "",
+        }
+        with patch.object(oss_lab, "run_command", side_effect=[failed, passed]):
+            report = oss_lab.phoenix_local_trace_probe(
+                "/repo/.venv/bin/python",
+                "http://127.0.0.1:6006",
+                {"PATH": "/usr/bin"},
+            )
+
+        self.assertEqual("passed", report["status"])
+        self.assertEqual(2, report["attempt_count"])
+        self.assertFalse(report["attempts"][0]["passed"])
+        self.assertTrue(report["attempts"][1]["passed"])
+        self.assertNotIn("database not ready", json.dumps(report, sort_keys=True))
+
     def test_importable_treats_missing_parent_package_as_absent(self) -> None:
         self.assertFalse(oss_lab.importable("definitely_missing_parent_for_eve.submodule"))
 
@@ -354,6 +494,10 @@ Would install 2 packages
         self.assertTrue(plan["boundary"]["no_training_started"])
         self.assertIn("do_train: false", recipe_text)
         self.assertIn("train: false", mlx_text)
+        self.assertIn("test: true", mlx_text)
+        self.assertIn("test_batches: 1", mlx_text)
+        self.assertIn('adapter_path: ""', mlx_text)
+        self.assertNotIn("report_to:", mlx_text)
         self.assertIn("OPENBLAS_NUM_THREADS=1", mlx_text)
         self.assertNotIn("private row text", recipe_text)
         self.assertNotIn("corrected answer", unsloth_text)

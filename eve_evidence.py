@@ -7,14 +7,11 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 import uuid
 
-import eve_store
+import eve_records
+from eve_records import normalize_text, normalize_text_list, utc_now
 
 
 DEFAULT_TTL_HOURS = 24
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def parse_iso_datetime(value: object) -> Optional[datetime]:
@@ -32,34 +29,6 @@ def parse_iso_datetime(value: object) -> Optional[datetime]:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
-
-
-def normalize_text(value: object, fallback: str = "", limit: int = 320) -> str:
-    text = " ".join(str(value or "").split()).strip()
-    if not text:
-        return fallback
-    if limit > 0 and len(text) > limit:
-        return text[: max(0, limit - 1)].rstrip() + "..."
-    return text
-
-
-def normalize_text_list(value: object, limit: int = 8, item_limit: int = 180) -> List[str]:
-    if not isinstance(value, list):
-        return []
-    items: List[str] = []
-    seen = set()
-    for raw in value:
-        text = normalize_text(raw, fallback="", limit=item_limit)
-        if not text:
-            continue
-        key = text.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        items.append(text)
-        if len(items) >= limit:
-            break
-    return items
 
 
 def normalize_confidence(value: object) -> float:
@@ -174,9 +143,7 @@ def create_evidence_record(
 
 
 def append_evidence_record(path: Path, record: Dict[str, object]) -> Dict[str, object]:
-    normalized = normalize_evidence_record(record)
-    eve_store.append_jsonl_record(path, normalized, ensure_ascii=True)
-    return normalized
+    return eve_records.append_normalized_record(path, record, normalize=normalize_evidence_record)
 
 
 def read_evidence_records(
@@ -188,21 +155,22 @@ def read_evidence_records(
     active_only: bool = False,
     min_freshness: int = 1,
 ) -> List[Dict[str, object]]:
-    if limit is not None and not source and not kind and not active_only:
-        raw_records = eve_store.read_jsonl_tail_records(path, limit)
-    else:
-        raw_records = eve_store.read_jsonl_records(path)
-    records = [normalize_evidence_record(item) for item in raw_records]
+    filters = {}
     if source:
-        records = [item for item in records if item.get("source") == source]
+        filters["source"] = source
     if kind:
-        records = [item for item in records if item.get("kind") == kind]
+        filters["kind"] = kind
+    predicate = None
     if active_only:
-        records = [item for item in records if evidence_is_active(item, min_freshness=min_freshness)]
-    records.sort(key=lambda item: item.get("observed_at") or item.get("created_at") or "", reverse=True)
-    if limit is not None:
-        records = records[:limit]
-    return records
+        predicate = lambda item: evidence_is_active(item, min_freshness=min_freshness)
+    return eve_records.read_normalized_records(
+        path,
+        normalize=normalize_evidence_record,
+        limit=limit,
+        filters=filters,
+        predicate=predicate,
+        sort_key=lambda item: item.get("observed_at") or item.get("created_at") or "",
+    )
 
 
 def supersede_records(

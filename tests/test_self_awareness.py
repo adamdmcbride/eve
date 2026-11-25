@@ -435,6 +435,22 @@ class SelfAwarenessTests(unittest.TestCase):
         ), patch.object(
             eve, "read_messages", return_value=self.sample_messages()
         ), patch.object(
+            eve, "read_lived_messages", return_value=self.sample_messages()
+        ), patch.object(
+            eve, "load_system_snapshot", return_value={}
+        ), patch.object(
+            eve, "load_global_workspace", return_value=eve.normalize_global_workspace({})
+        ), patch.object(
+            eve, "load_self_model_state", return_value=eve.normalize_self_model_state({})
+        ), patch.object(
+            eve, "load_world_model_state", return_value=eve.normalize_world_model_state({})
+        ), patch.object(
+            eve, "load_relationship_model_state", return_value=eve.normalize_relationship_model_state({})
+        ), patch.object(
+            eve, "load_other_minds_model_state", return_value=eve.normalize_other_minds_model_state({})
+        ), patch.object(
+            eve, "load_homeostasis", return_value=eve.default_homeostasis_state()
+        ), patch.object(
             eve, "load_prompt", side_effect=lambda name: f"prompt:{name}"
         ), patch.object(
             eve, "model_chat", side_effect=fake_model_chat
@@ -453,7 +469,10 @@ class SelfAwarenessTests(unittest.TestCase):
         self.assertEqual("fallback", record.get("failure_kind"))
         self.assertIn("Confidence brake", record["summary"])
         self.assertEqual([900, 900, 1100, 900], token_budgets)
-        self.assertEqual([30, 18, 50, 18], timeouts)
+        # micro cap 90 s, repair 18 s, full-context cap 150 s bounded by the remaining deadline, repair 18 s
+        self.assertEqual([90, 18], timeouts[:2])
+        self.assertTrue(60 <= timeouts[2] <= 150, timeouts)
+        self.assertEqual(18, timeouts[3])
         self.assertTrue(all(schema for schema in response_schemas))
         self.assertIn("identity", response_schemas[0]["properties"])
         self.assertTrue(record["used_fallback"])
@@ -497,6 +516,22 @@ class SelfAwarenessTests(unittest.TestCase):
             eve, "read_thread_summaries", return_value=self.sample_threads_for_micro_awareness()
         ), patch.object(
             eve, "read_messages", return_value=self.sample_messages()
+        ), patch.object(
+            eve, "read_lived_messages", return_value=self.sample_messages()
+        ), patch.object(
+            eve, "load_system_snapshot", return_value={}
+        ), patch.object(
+            eve, "load_global_workspace", return_value=eve.normalize_global_workspace({})
+        ), patch.object(
+            eve, "load_self_model_state", return_value=eve.normalize_self_model_state({})
+        ), patch.object(
+            eve, "load_world_model_state", return_value=eve.normalize_world_model_state({})
+        ), patch.object(
+            eve, "load_relationship_model_state", return_value=eve.normalize_relationship_model_state({})
+        ), patch.object(
+            eve, "load_other_minds_model_state", return_value=eve.normalize_other_minds_model_state({})
+        ), patch.object(
+            eve, "load_homeostasis", return_value=eve.default_homeostasis_state()
         ), patch.object(
             eve, "load_prompt", side_effect=lambda name: f"prompt:{name}"
         ), patch.object(

@@ -20,7 +20,13 @@ import re
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+import eve_metacognitive_belief
+import eve_autobiography
+import eve_common_ground
+import eve_interoception
+import eve_predictive_dynamics
 import eve_sensory
+import eve_context_learning
 
 
 SCHEMA_VERSION = "eve.conscious_state.v3"
@@ -34,7 +40,29 @@ MAX_JOINED_COMPLETIONS = 12
 MAX_APPLIED_CONSEQUENCE_IDS = 256
 MAX_GOAL_OUTCOME_OBSERVATIONS = 24
 GOAL_OUTCOME_ATTRIBUTION_VERSION = "eve.goal_outcome.v1"
+# Incumbency decay for goals re-nominated every cycle: lose one priority point
+# per GOAL_TENURE_DECAY_STEP cycles, capped. A verified success only pauses the
+# decay for GOAL_SUCCESS_GRACE_SECONDS; it must not exempt an evergreen goal
+# forever (outcome observations are capped and never age out).
+GOAL_TENURE_DECAY_STEP = 60
+GOAL_TENURE_DECAY_CAP = 16
+GOAL_SUCCESS_GRACE_SECONDS = 3600
 BROADCAST_ACTION_WEIGHT = 0.18
+GLOBAL_BROADCAST_SCHEMA = "eve.global_broadcast.v1"
+GLOBAL_BROADCAST_ACCESS_SCOPE = (
+    "reply",
+    "mind",
+    "autonomy",
+    "action",
+    "memory",
+    "learning",
+)
+GLOBAL_WORKSPACE_CAPACITY = 1
+GLOBAL_WORKSPACE_ALTERNATIVE_CAPACITY = 4
+WORKSPACE_PRECISION_NEUTRAL = 70
+WORKSPACE_PRECISION_WEIGHT = 0.15
+WORKSPACE_DIRECT_HUMAN_FLOOR = 94.0
+WORKSPACE_SAFETY_FLOOR = 98.0
 LESIONS = (
     "sensory_stream",
     "workspace",
@@ -42,12 +70,26 @@ LESIONS = (
     "metacognition",
     "world_model",
     "other_minds",
+    "social_prediction",
+    "social_feedback",
+    "common_ground",
+    "common_ground_feedback",
+    "autobiography",
+    "autobiographical_change",
     "memory",
     "homeostasis",
+    "allostasis",
+    "interoceptive_enaction",
     "goals",
     "plan_model",
     "action_model",
+    "contextual_action_learning",
+    "workspace_bottleneck",
+    "workspace_precision",
+    "broadcast_access",
+    "broadcast_action_coupling",
     "recurrence",
+    "embodiment",
 )
 
 
@@ -592,6 +634,54 @@ def _normalize_conflicts(value: object) -> List[Dict[str, object]]:
     return normalized
 
 
+def _normalize_module_query(value: object) -> Dict[str, object]:
+    """Admit only a provenance-bound internal query into recurrent attention.
+
+    An internal module query is not a user message.  Keeping the two channels
+    distinct prevents a background result from manufacturing a
+    ``respond_to_user`` intention while still allowing that result to change
+    what wins the next global broadcast.
+    """
+    payload = value if isinstance(value, dict) else {}
+    if _text(payload.get("schema_id"), 80) != "eve.recurrent_module_query.v1":
+        return {}
+    provided_sha = _text(payload.get("query_sha256"), 80)
+    canonical = copy.deepcopy(payload)
+    canonical.pop("query_sha256", None)
+    computed_sha = hashlib.sha256(
+        json.dumps(
+            canonical,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if not provided_sha or provided_sha != computed_sha:
+        return {}
+    query_id = _text(payload.get("id"), 100)
+    question = _text(payload.get("question"), 420)
+    source_result_sha256 = _text(payload.get("source_result_sha256"), 80)
+    target_module = _text(payload.get("target_module"), 100)
+    waiting = payload.get("query_kind") == "await_evidence" and not payload.get("target_action")
+    if not all((query_id, question, source_result_sha256)) or (not target_module and not waiting):
+        return {}
+    return {
+        "schema_id": "eve.recurrent_module_query.v1",
+        "id": query_id,
+        "query_kind": _text(payload.get("query_kind"), 80),
+        "question": question,
+        "source_module": _text(payload.get("source_module"), 100),
+        "target_module": target_module,
+        "target_action": _text(payload.get("target_action"), 100),
+        "source_result_sha256": source_result_sha256,
+        "source_cycle_id": _text(payload.get("source_cycle_id"), 100),
+        "created_at": _text(payload.get("created_at"), 80),
+        "evidence_ids": _items(payload.get("evidence_ids"), 20, 160),
+        "grounded": bool(payload.get("grounded")),
+        "query_sha256": provided_sha,
+    }
+
+
 def _open_world_inquiries(world_model: object) -> List[Dict[str, object]]:
     payload = world_model if isinstance(world_model, dict) else {}
     source = payload.get("open_questions") if isinstance(payload.get("open_questions"), list) else []
@@ -626,7 +716,7 @@ def _open_world_inquiries(world_model: object) -> List[Dict[str, object]]:
         selected_action = _text(raw.get("selected_action"), 80)
         if selected_action not in candidate_actions or selected_action in attempted_actions:
             selected_action = remaining_actions[0] if remaining_actions else ""
-        if not question or status not in {"open", "in_progress"}:
+        if not question or status not in {"open", "in_progress"} or (attempts and not remaining_actions):
             continue
         inquiry_id = _text(raw.get("id"), 100) or _stable_id(
             "inquiry",
@@ -654,6 +744,23 @@ def _open_world_inquiries(world_model: object) -> List[Dict[str, object]]:
                 "failed_actions": failed_actions,
                 "remaining_actions": remaining_actions,
                 "recovery_step": bool(attempts and selected_action),
+                # Preserve alternative explanations as conjectures across a
+                # failed probe, not as facts about the environment.
+                "prior_hypotheses": [
+                    {"explanation": _text(item.get("explanation"), 180),
+                     "predicted_observation": _text(item.get("predicted_observation"), 180),
+                     "test": item.get("test") if isinstance(item.get("test"), dict) else {},
+                     "epistemic_status": "unverified_hypothesis"}
+                    for attempt in attempts[-1:]
+                    for proposal in [attempt.get("reasoning_proposal")]
+                    if isinstance(proposal, dict)
+                    for alternatives in [proposal.get("alternatives")]
+                    if isinstance(alternatives, list)
+                    for item in alternatives[:2]
+                    if isinstance(item, dict)
+                ],
+                "observation_test": raw.get("observation_test") if isinstance(raw.get("observation_test"), dict) else {},
+                "prior_prediction_assessment": (attempts[-1].get("prediction_assessment") or {}) if attempts else {},
             }
         )
         if len(result) >= 8:
@@ -802,6 +909,11 @@ def _normalize_epistemic_frame(value: object) -> Dict[str, object]:
 def state_checkpoint_digest(state: Dict[str, object]) -> str:
     """Hash the persisted state while excluding the digest's own value."""
     canonical = copy.deepcopy(state if isinstance(state, dict) else {})
+    # Empty module-query state was added after existing v3 checkpoints were
+    # already persisted.  Omitting only the empty value preserves checkpoint
+    # compatibility; a real query remains covered by the digest.
+    if not canonical.get("module_query"):
+        canonical.pop("module_query", None)
     recurrent = canonical.get("recurrent") if isinstance(canonical.get("recurrent"), dict) else {}
     recurrent["checkpoint_digest"] = ""
     canonical["recurrent"] = recurrent
@@ -944,13 +1056,30 @@ def _interoceptive_feedback(
     range_error = _clamp(distance * 5)
     expected_mode = _text(expected.get("expected_regulation_mode"), 40)
     mode_error = 35 if expected_mode and expected_mode != current_mode else 0
-    magnitude = max(range_error, mode_error)
+    dynamics: Dict[str, object] = {}
+    forecast = expected.get("dynamics_forecast") if isinstance(expected.get("dynamics_forecast"), dict) else {}
+    forecast_used = bool(expected.get("dynamics_forecast_used", bool(forecast)))
+    if forecast:
+        # The auditable predictive-dynamics forecast scores a graded error against
+        # its own precision, so a confident wrong forecast is more surprising than
+        # a hedged one. The range check above stays as the coarse bound.
+        try:
+            dynamics = eve_predictive_dynamics.evaluate_observation(current_arousal, forecast)
+        except ValueError as exc:
+            dynamics = {"comparable": False, "reason": str(exc)[:160]}
+    # The graded dynamics error counts toward the felt magnitude only when the
+    # dynamics forecast set the expectation; otherwise it is recorded for audit.
+    dynamics_error = int(round(float(dynamics.get("weighted_error") or 0.0))) if (dynamics.get("comparable") and forecast_used) else 0
+    magnitude = max(range_error, mode_error, _clamp(dynamics_error))
     return {
         "expected_arousal_range": [low, high],
         "observed_arousal": current_arousal,
         "expected_regulation_mode": expected_mode,
         "observed_regulation_mode": current_mode,
         "error_magnitude": magnitude,
+        "range_error": range_error,
+        "mode_error": mode_error,
+        "dynamics": dynamics,
         "fulfilled": magnitude == 0,
         "source_cycle_id": _text(previous.get("cycle_id"), 80),
     }
@@ -994,10 +1123,27 @@ def default_state() -> Dict[str, object]:
             "sensory_frame": eve_sensory.build_frame([], now="1970-01-01T00:00:00+00:00"),
         },
         "broadcast": {
+            "schema_version": GLOBAL_BROADCAST_SCHEMA,
             "content": "Not enough integrated evidence yet.",
             "ignition_score": 0,
             "source_kinds": [],
             "access_scope": [],
+            "workspace_capacity": GLOBAL_WORKSPACE_CAPACITY,
+            "candidate_count": 0,
+            "selected_candidate_count": 0,
+            "selected_candidate_ids": [],
+            "alternatives_retained_count": 0,
+            "bottleneck_active": True,
+            "selection_status": "not_run",
+            "access_status": "not_broadcast",
+            "selection_digest": "",
+            "delivery_digest": "",
+            "precision_weighting_active": True,
+            "selected_confidence": 0,
+            "selected_precision_adjustment": 0.0,
+            "selected_priority_floor": 0.0,
+            "attenuated_candidate_count": 0,
+            "precision_protected_candidate_count": 0,
             "why_selected": "No competition has run yet.",
         },
         "self_model": {"summary": "Not enough evidence yet.", "uncertainties": [], "available": False},
@@ -1022,9 +1168,12 @@ def default_state() -> Dict[str, object]:
             "unresolved_count": 0,
             "learned_frame": _normalize_epistemic_frame({}),
             "learned_signal_count": 0,
+            "belief_control": {},
             "available": False,
         },
         "memory": {"retrieved": [], "continuity_anchors": [], "available": False},
+        "autobiography": eve_autobiography.normalize_state({}),
+        "module_query": {},
         "goals": {"stack": [], "selected_goal_id": "", "selected_goal": ""},
         "plan_model": {
             "schema_id": "eve.conscious_plan.v1",
@@ -1149,9 +1298,11 @@ def _collect_coalitions(
     relationship_model: Dict[str, object],
     plan_model: Dict[str, object],
     homeostasis: Dict[str, object],
+    autobiography: Dict[str, object],
     memory_items: Sequence[Dict[str, object]],
     sensory_frame: Dict[str, object],
     inbound: str,
+    module_query: Dict[str, object],
     previous_state: Dict[str, object],
     continuity_timing: Dict[str, object],
     interoceptive_feedback: Dict[str, object],
@@ -1177,6 +1328,31 @@ def _collect_coalitions(
             confidence=95,
         )
         if candidate:
+            candidate["direct_human"] = True
+            result.append(candidate)
+    if module_query and module_query.get("query_kind") != "await_evidence" and "recurrence" not in lesions:
+        candidate = _coalition(
+            "module_query",
+            module_query.get("question"),
+            "recurrent_module_query:" + _text(module_query.get("source_module"), 80),
+            salience=88,
+            urgency=58,
+            novelty=82,
+            goal_relevance=84,
+            self_relevance=65,
+            affective_weight=15,
+            epistemic_value=96,
+            continuity=82,
+            confidence=98 if module_query.get("grounded") else 72,
+        )
+        if candidate:
+            candidate["module_query_id"] = _text(module_query.get("id"), 100)
+            candidate["source_result_sha256"] = _text(
+                module_query.get("source_result_sha256"), 80
+            )
+            candidate["target_module"] = _text(module_query.get("target_module"), 100)
+            candidate["target_action"] = _text(module_query.get("target_action"), 100)
+            candidate["evidence_ids"] = _items(module_query.get("evidence_ids"), 20, 160)
             result.append(candidate)
     if "sensory_stream" not in lesions:
         for item in sensory_frame.get("working_set") or []:
@@ -1203,6 +1379,8 @@ def _collect_coalitions(
                 candidate["sensory_event_id"] = _text(item.get("id"), 120)
                 candidate["sensory_modality"] = modality
                 candidate["attention_score"] = score
+                candidate["direct_human"] = bool(item.get("direct_human"))
+                candidate["safety_critical"] = bool(item.get("safety_critical"))
                 result.append(candidate)
     if "workspace" not in lesions:
         _add_many(result, "prediction_error", workspace.get("prediction_errors"), "global_workspace", salience=88, urgency=78, novelty=90, epistemic_value=95, self_relevance=70)
@@ -1278,6 +1456,34 @@ def _collect_coalitions(
             )
             if candidate:
                 result.append(candidate)
+    selected_precedent = (
+        autobiography.get("selected_precedent")
+        if isinstance(autobiography.get("selected_precedent"), dict)
+        else {}
+    )
+    if autobiography.get("status") == "active" and selected_precedent.get("selected"):
+        candidate = _coalition(
+            "autobiographical_change",
+            selected_precedent.get("change_directive"),
+            "autobiographical_continuity:" + _text(selected_precedent.get("change_id"), 100),
+            salience=60,
+            urgency=55 if selected_precedent.get("requires_revision") else 30,
+            novelty=25,
+            goal_relevance=74,
+            self_relevance=94,
+            affective_weight=45,
+            epistemic_value=78,
+            continuity=100,
+            confidence=90 if selected_precedent.get("change_strength") == "verified" else 82,
+        )
+        if candidate:
+            candidate["autobiographical_change_id"] = _text(
+                selected_precedent.get("change_id"), 100
+            )
+            candidate["source_episode_id"] = _text(
+                selected_precedent.get("episode_id"), 100
+            )
+            result.append(candidate)
     if "memory" not in lesions:
         for index, note in enumerate(memory_items[:8]):
             if not isinstance(note, dict):
@@ -1427,31 +1633,217 @@ def _collect_coalitions(
     return sorted(deduped.values(), key=lambda item: (float(item.get("score") or 0), str(item.get("id"))), reverse=True)
 
 
+def _apply_workspace_precision_weighting(
+    coalitions: Sequence[Dict[str, object]],
+    lesions: Set[str],
+) -> List[Dict[str, object]]:
+    """Apply bounded reliability control before global broadcast selection.
+
+    Confidence used to be descriptive metadata only, which allowed a vivid but
+    weakly grounded candidate to dominate a more reliable signal.  The control
+    is deliberately modest: it can break close competitions, but it cannot
+    erase a genuinely urgent signal.  Direct human input, explicit safety
+    signals, and very urgent candidates are protected from negative weighting.
+
+    The ``workspace_precision`` lesion removes only the confidence adjustment.
+    Human/safety priority floors remain active in both arms so the lesion tests
+    reliability weighting rather than disabling existing priority policy.
+    """
+    active = "workspace_precision" not in lesions
+    weighted: List[Dict[str, object]] = []
+    for raw in coalitions:
+        if not isinstance(raw, dict):
+            continue
+        candidate = dict(raw)
+        components = (
+            candidate.get("components")
+            if isinstance(candidate.get("components"), dict)
+            else {}
+        )
+        confidence = _clamp(
+            components.get("confidence"),
+            default=WORKSPACE_PRECISION_NEUTRAL,
+        )
+        urgency = _clamp(components.get("urgency"), default=0)
+        direct_human = bool(candidate.get("direct_human")) or str(
+            candidate.get("kind") or ""
+        ) == "inbound"
+        safety_critical = bool(candidate.get("safety_critical"))
+        protected = direct_human or safety_critical or urgency >= 85
+        before = max(0.0, min(100.0, float(candidate.get("score") or 0.0)))
+        priority_floor = (
+            WORKSPACE_SAFETY_FLOOR
+            if safety_critical
+            else WORKSPACE_DIRECT_HUMAN_FLOOR
+            if direct_human
+            else 0.0
+        )
+        after_floor = max(before, priority_floor)
+        # Use precision as a noise gate, not a generic reward.  Confidence above
+        # the neutral prior does not inflate salience; only weakly supported
+        # candidates are attenuated.  This keeps established competitions
+        # stable while preventing low-reliability salience capture.
+        raw_adjustment = (
+            min(
+                0.0,
+                (confidence - WORKSPACE_PRECISION_NEUTRAL)
+                * WORKSPACE_PRECISION_WEIGHT,
+            )
+            if active
+            else 0.0
+        )
+        adjustment = 0.0 if protected and raw_adjustment < 0.0 else raw_adjustment
+        after = max(0.0, min(100.0, after_floor + adjustment))
+        candidate.update(
+            {
+                "score": round(after, 2),
+                "workspace_score_before_control": round(before, 2),
+                "workspace_priority_floor": round(priority_floor, 2),
+                "workspace_score_after_priority_floor": round(after_floor, 2),
+                "workspace_confidence_adjustment": round(adjustment, 2),
+                "workspace_precision_weighting_active": active,
+                "workspace_precision_protected": protected,
+                "direct_human": direct_human,
+                "safety_critical": safety_critical,
+            }
+        )
+        weighted.append(candidate)
+    return sorted(
+        weighted,
+        key=lambda item: (float(item.get("score") or 0), str(item.get("id"))),
+        reverse=True,
+    )
+
+
 def _select_broadcast(coalitions: Sequence[Dict[str, object]], lesions: Set[str]) -> Tuple[Dict[str, object], List[Dict[str, object]], Dict[str, object]]:
     if not coalitions:
         empty = default_state()["broadcast"]
+        empty["precision_weighting_active"] = "workspace_precision" not in lesions
         return {}, [], dict(empty)
-    winner = dict(coalitions[0])
-    alternatives: List[Dict[str, object]] = []
-    seen_kinds = {str(winner.get("kind"))}
-    for item in coalitions[1:]:
-        kind = str(item.get("kind"))
-        if kind in seen_kinds and len(alternatives) >= 2:
-            continue
-        alternatives.append(dict(item))
-        seen_kinds.add(kind)
-        if len(alternatives) >= 4:
-            break
-    access_scope = [] if "workspace" in lesions else ["reply", "mind", "autonomy", "action", "memory", "learning"]
-    source_kinds = [str(winner.get("kind"))]
-    source_kinds.extend(str(item.get("kind")) for item in alternatives[:2])
-    margin = float(winner.get("score") or 0) - (float(coalitions[1].get("score") or 0) if len(coalitions) > 1 else 0.0)
+    ranked = [dict(item) for item in coalitions if isinstance(item, dict)]
+    if not ranked:
+        empty = default_state()["broadcast"]
+        empty["precision_weighting_active"] = "workspace_precision" not in lesions
+        return {}, [], dict(empty)
+    bottleneck_active = "workspace_bottleneck" not in lesions
+    if bottleneck_active:
+        winner = dict(ranked[0])
+        selected = [winner]
+        alternatives: List[Dict[str, object]] = []
+        seen_kinds = {str(winner.get("kind"))}
+        for item in ranked[1:]:
+            kind = str(item.get("kind"))
+            if kind in seen_kinds and len(alternatives) >= 2:
+                continue
+            alternatives.append(dict(item))
+            seen_kinds.add(kind)
+            if len(alternatives) >= GLOBAL_WORKSPACE_ALTERNATIVE_CAPACITY:
+                break
+        margin = float(winner.get("score") or 0) - (
+            float(ranked[1].get("score") or 0) if len(ranked) > 1 else 0.0
+        )
+        why_selected = (
+            f"Won attention competition by {round(margin, 2)} points across "
+            f"{len(ranked)} candidate coalition(s)."
+        )
+    else:
+        selected = ranked[:12]
+        member_ids = [_text(item.get("id"), 100) for item in selected]
+        bundled_content = _text(
+            " | ".join(_text(item.get("content"), 120) for item in selected),
+            260,
+        )
+        winner = {
+            **dict(ranked[0]),
+            "id": "coalition-unfiltered-" + hashlib.sha256(
+                "|".join(member_ids).encode("utf-8")
+            ).hexdigest()[:20],
+            "kind": "unfiltered_workspace_bundle",
+            "source": "workspace_bottleneck_lesion",
+            "content": bundled_content,
+            "member_ids": member_ids,
+            "member_count": len(selected),
+        }
+        alternatives = []
+        margin = 0.0
+        why_selected = (
+            "Selective workspace bottleneck lesioned; multiple competing "
+            "coalitions entered one unfiltered bundle."
+        )
+    access_scope = (
+        []
+        if "workspace" in lesions or "broadcast_access" in lesions
+        else list(GLOBAL_BROADCAST_ACCESS_SCOPE)
+    )
+    source_kinds = list(
+        dict.fromkeys(str(item.get("kind")) for item in [*selected, *alternatives[:2]])
+    )
+    selected_ids = [_text(item.get("id"), 100) for item in selected]
+    selection_material = {
+        "schema_version": GLOBAL_BROADCAST_SCHEMA,
+        "bottleneck_active": bottleneck_active,
+        "candidate_count": len(ranked),
+        "selected_candidate_ids": selected_ids,
+        "content": _text(winner.get("content"), 260),
+    }
+    selection_digest = hashlib.sha256(
+        json.dumps(
+            selection_material,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    delivery_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "selection_digest": selection_digest,
+                "access_scope": access_scope,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     broadcast = {
+        "schema_version": GLOBAL_BROADCAST_SCHEMA,
         "content": _text(winner.get("content"), 260),
         "ignition_score": round(float(winner.get("score") or 0), 2),
-        "source_kinds": list(dict.fromkeys(source_kinds)),
+        "source_kinds": source_kinds,
         "access_scope": access_scope,
-        "why_selected": f"Won attention competition by {round(margin, 2)} points across {len(coalitions)} candidate coalition(s).",
+        "workspace_capacity": (
+            GLOBAL_WORKSPACE_CAPACITY if bottleneck_active else len(selected)
+        ),
+        "candidate_count": len(ranked),
+        "selected_candidate_count": len(selected),
+        "selected_candidate_ids": selected_ids,
+        "alternatives_retained_count": len(alternatives),
+        "bottleneck_active": bottleneck_active,
+        "selection_status": "selected" if bottleneck_active else "unfiltered_lesion",
+        "access_status": "broadcast" if access_scope else "access_lesioned",
+        "selection_digest": selection_digest,
+        "delivery_digest": delivery_digest,
+        "precision_weighting_active": "workspace_precision" not in lesions,
+        "selected_confidence": _clamp(
+            (winner.get("components") or {}).get("confidence")
+            if isinstance(winner.get("components"), dict)
+            else None,
+            default=WORKSPACE_PRECISION_NEUTRAL,
+        ),
+        "selected_precision_adjustment": round(
+            float(winner.get("workspace_confidence_adjustment") or 0.0), 2
+        ),
+        "selected_priority_floor": round(
+            float(winner.get("workspace_priority_floor") or 0.0), 2
+        ),
+        "attenuated_candidate_count": sum(
+            float(item.get("workspace_confidence_adjustment") or 0.0) < 0.0
+            for item in ranked
+        ),
+        "precision_protected_candidate_count": sum(
+            bool(item.get("workspace_precision_protected")) for item in ranked
+        ),
+        "why_selected": why_selected,
     }
     return winner, alternatives, broadcast
 
@@ -1649,6 +2041,10 @@ def _merge_goals(
     threads = autonomy_agenda.get("active_threads") if isinstance(autonomy_agenda.get("active_threads"), list) else []
     for thread in threads[:6]:
         if isinstance(thread, dict) and thread.get("title"):
+            if str(thread.get("status") or "active") == "watching":
+                # Evergreen threads demoted by the agenda (unchanged evidence run after
+                # run) are kept for reference but no longer compete as goals.
+                continue
             candidates.append((_text(thread.get("title"), 220), "autonomy_agenda", _clamp(thread.get("priority"), 1, 100, 65), _text(thread.get("evidence"), 220)))
     for conflict in epistemic_conflicts[:4]:
         if not isinstance(conflict, dict) or str(conflict.get("status") or "unresolved") == "resolved":
@@ -1665,13 +2061,54 @@ def _merge_goals(
                 )
             )
     merged: Dict[str, Dict[str, object]] = {}
+    substrate_goal_ids = {
+        _stable_id("goal", text)
+        for text, source, _priority, _evidence in candidates
+        if source != "global_workspace"
+    }
+    now_time = _parse_time(now)
     for text, source, priority, evidence in candidates:
         goal_id = _stable_id("goal", text)
-        record = _goal_record(text, source=source, priority=priority, now=now, previous=previous_goals.get(goal_id), evidence=evidence)
-        if record:
-            prior = merged.get(goal_id)
-            if prior is None or int(record["priority"]) > int(prior["priority"]):
-                merged[goal_id] = record
+        previous = previous_goals.get(goal_id)
+        if source == "global_workspace":
+            previous_origin = _text((previous or {}).get("origin_source"), 80)
+            if goal_id in substrate_goal_ids or previous_origin not in {"", "global_workspace"}:
+                # The broadcast is only a projection of a durable substrate
+                # (agenda, plan, inquiry, self) that already owns this goal.
+                # Re-nominating it at broadcast priority let the goal stack
+                # re-select itself above its own authority's priority.
+                continue
+        record = _goal_record(text, source=source, priority=priority, now=now, previous=previous, evidence=evidence)
+        if not record:
+            continue
+        persistence = int(record.get("persistence_cycles") or 1)
+        latest_success_at = _parse_time(
+            next(
+                (
+                    item.get("completed_at")
+                    for item in reversed(record.get("outcome_observations") or [])
+                    if isinstance(item, dict) and item.get("ok") is True
+                ),
+                None,
+            )
+        )
+        recently_advanced = (
+            latest_success_at is not None
+            and now_time is not None
+            and 0 <= (now_time - latest_success_at).total_seconds() <= GOAL_SUCCESS_GRACE_SECONDS
+        )
+        if persistence > 1 and not recently_advanced:
+            # Incumbency decays: a goal held for hours without a recent verified
+            # outcome must re-earn its slot against fresh competition.
+            record["priority"] = _clamp(
+                int(record["priority"]) - min(GOAL_TENURE_DECAY_CAP, persistence // GOAL_TENURE_DECAY_STEP),
+                1,
+                100,
+                50,
+            )
+        prior = merged.get(goal_id)
+        if prior is None or int(record["priority"]) > int(prior["priority"]):
+            merged[goal_id] = record
     for goal_id, previous in previous_goals.items():
         if goal_id in merged:
             continue
@@ -1714,7 +2151,8 @@ def _merge_goals(
             goal["priority"] = _clamp(int(goal.get("priority") or 50) - 25, 1, 100, 50)
             goal["conflict_status"] = "challenged"
             goal["conflict_ids"] = [_text(item.get("id"), 80) for item in conflict_matches[:3]]
-    return sorted(merged.values(), key=lambda item: (int(item.get("priority") or 0), int(item.get("persistence_cycles") or 0)), reverse=True)[:8]
+    # Equal priority prefers the fresher goal, so an incumbent cannot win ties forever.
+    return sorted(merged.values(), key=lambda item: (int(item.get("priority") or 0), -int(item.get("persistence_cycles") or 0)), reverse=True)[:8]
 
 
 def _action_affordances(
@@ -1727,6 +2165,7 @@ def _action_affordances(
     winner: Dict[str, object],
     broadcast: Dict[str, object],
     inbound: str,
+    module_query: Dict[str, object],
     regulation_mode: str,
     arousal: int,
     valence: float,
@@ -1735,8 +2174,27 @@ def _action_affordances(
     regulatory_prediction_error: int,
     action_models: Dict[str, object],
     lesions: Set[str],
+    now: Optional[str] = None,
+    homeostasis: Optional[Dict[str, object]] = None,
 ) -> List[Dict[str, object]]:
     raw: List[Tuple[str, str, str, Dict[str, object]]] = []
+    # Body needs afford body actions. The fly body is Eve's body; when its hunger or threat
+    # pressure is high, the matching body action competes for selection with everything else,
+    # with a utility that rises with the need so an urgent body wins over routine tasks.
+    body_levels: Dict[str, int] = {}
+    if "embodiment" not in lesions and isinstance(homeostasis, dict):
+        for item in homeostasis.get("pressures") if isinstance(homeostasis.get("pressures"), list) else []:
+            if isinstance(item, dict) and str(item.get("id") or "") in {"body_hunger", "body_threat"}:
+                body_levels[str(item.get("id"))] = _clamp(item.get("level"))
+    if body_levels:
+        threat = body_levels.get("body_threat", 0)
+        hunger = body_levels.get("body_hunger", 0)
+        if threat >= 45:
+            raw.append(("body_escape", "Turn the body away from the threat and run", "embodiment", {"need": "body_threat", "need_level": threat, "need_utility": min(98, 52 + int(threat * 0.5))}))
+        if hunger >= 55:
+            raw.append(("body_approach_food", "Move the body toward food and feed", "embodiment", {"need": "body_hunger", "need_level": hunger, "need_utility": min(96, 46 + int(hunger * 0.5))}))
+        if threat < 45 and hunger < 55:
+            raw.append(("body_explore", "Walk the body through the arena", "embodiment", {"need": "none", "need_level": max(threat, hunger), "need_utility": 48}))
     goal_by_id = {
         str(item.get("id")): item
         for item in goals
@@ -1756,6 +2214,25 @@ def _action_affordances(
 
     if inbound:
         raw.append(("respond_to_user", "Respond to the current user message", "current_turn", {}))
+    if module_query:
+        target_action = _text(module_query.get("target_action"), 80)
+        question = _text(module_query.get("question"), 220)
+        if target_action and question:
+            raw.append(
+                (
+                    target_action,
+                    "Continue recurrent inquiry: " + question,
+                    "recurrent_module_query:" + _text(module_query.get("source_module"), 80),
+                    {
+                        "module_query_id": _text(module_query.get("id"), 100),
+                        "module_query_kind": _text(module_query.get("query_kind"), 80),
+                        "source_result_sha256": _text(
+                            module_query.get("source_result_sha256"), 80
+                        ),
+                        "module_query_grounded": bool(module_query.get("grounded")),
+                    },
+                )
+            )
     if "world_model" not in lesions:
         for inquiry in _open_world_inquiries(world_model)[:4]:
             selected_action = _text(inquiry.get("selected_action"), 80)
@@ -1825,23 +2302,36 @@ def _action_affordances(
     if "workspace" not in lesions:
         raw.extend(("workspace_action", item, "global_workspace", {}) for item in _items(workspace.get("action_readiness"), 6))
     goal_text = " ".join(str(item.get("text") or "") for item in goals[:4])
-    seen: Set[str] = set()
+    seen: Set[Tuple[str, str]] = set()
+    concrete_descriptions: Set[str] = set()
     result: List[Dict[str, object]] = []
     for action_id, description, source, metadata in raw:
-        # Prefer an admitted agenda action id over the workspace's generic
-        # description when both refer to the same affordance.
-        key = description.lower()
+        # Keep distinct concrete actions even when their prose is identical:
+        # otherwise learning cannot choose the alternative. Still suppress a
+        # generic workspace duplicate of an already named action.
+        if action_id == "workspace_action" and description.lower() in concrete_descriptions:
+            continue
+        key = (action_id, description.lower())
         if key in seen:
             continue
         seen.add(key)
+        if action_id != "workspace_action":
+            concrete_descriptions.add(description.lower())
         lowered = f"{action_id} {description}".lower()
-        inquiry_action = bool(metadata.get("inquiry_id"))
+        inquiry_action = bool(metadata.get("inquiry_id") or metadata.get("module_query_id"))
         epistemic = 100 if inquiry_action else 65 if any(token in lowered for token in ("check", "inspect", "read", "review", "query", "test", "status", "observe")) else 25
         epistemic = min(100, epistemic + min(25, uncertainty_count * 4) + min(20, regulatory_prediction_error // 5))
         risk = 80 if any(token in lowered for token in ("delete", "send", "pay", "install", "deploy", "credential", "irreversible")) else 12
         if action_id == "respond_to_user":
             utility = 96
             relationship_cost = 0
+        elif source == "embodiment":
+            utility = _clamp(metadata.get("need_utility"), 1, 100, 60)
+            relationship_cost = 20 if inbound else 0
+            # A body action is an observation with a measured consequence, and an
+            # urgent need must be able to outrank routine inquiry: threat weighs
+            # more than hunger because it is time-critical.
+            epistemic = max(epistemic, 65)
         elif inquiry_action:
             utility = 82
             relationship_cost = 28 if inbound else 0
@@ -1857,14 +2347,16 @@ def _action_affordances(
         continuity = int(round(_overlap(description, goal_text) * 100))
         current_turn_priority = 35 if action_id == "respond_to_user" else (-35 if inbound else 0)
         learned = action_models.get(action_id) if isinstance(action_models.get(action_id), dict) else {}
-        observations = learned.get("observations") if isinstance(learned.get("observations"), list) else []
-        outcomes = [bool(item.get("ok")) for item in observations if isinstance(item, dict) and item.get("ok") is not None]
-        attempts = len(outcomes)
-        successes = sum(1 for item in outcomes if item)
-        # A symmetric Beta prior prevents a single result from dominating while
-        # still allowing repeated verified consequences to change selection.
-        learned_reliability = (successes + 2.0) / (attempts + 4.0)
-        learned_adjustment = round((learned_reliability - 0.5) * min(48.0, attempts * 12.0), 2)
+        action_context = eve_context_learning.build_context(
+            source=source, inbound=inbound, regulation_mode=regulation_mode, metadata=metadata,
+        )
+        contextual = eve_context_learning.estimate(
+            learned, action_context, now=_now(now),
+            enabled="contextual_action_learning" not in lesions,
+        )
+        attempts = contextual["attempts"]
+        learned_reliability = contextual["probability"]
+        learned_adjustment = contextual["adjustment"]
         broadcast_access = {
             str(item)
             for item in (broadcast.get("access_scope") or [])
@@ -1896,6 +2388,11 @@ def _action_affordances(
             broadcast_alignment * BROADCAST_ACTION_WEIGHT,
             2,
         )
+        broadcast_selection_digest = (
+            _text(broadcast.get("selection_digest"), 80)
+            if broadcast_adjustment > 0.0
+            else ""
+        )
         score = (
             utility * 0.42
             + epistemic * 0.22
@@ -1908,6 +2405,11 @@ def _action_affordances(
             + learned_adjustment
             + broadcast_adjustment
             + (18 if inquiry_action else 0)
+            + (
+                _clamp(metadata.get("need_level")) * (0.35 if metadata.get("need") == "body_threat" else 0.22)
+                if source == "embodiment"
+                else 0
+            )
         )
         affordance = {
                 "id": action_id,
@@ -1925,9 +2427,12 @@ def _action_affordances(
                 "learned_attempts": attempts,
                 "learned_reliability": round(learned_reliability, 3),
                 "learned_adjustment": learned_adjustment,
+                "action_context": action_context,
+                "contextual_learning": contextual,
                 "broadcast_alignment": broadcast_alignment,
                 "broadcast_adjustment": broadcast_adjustment,
                 "broadcast_basis": list(dict.fromkeys(broadcast_basis)),
+                "broadcast_selection_digest": broadcast_selection_digest,
             }
         affordance.update(copy.deepcopy(metadata))
         result.append(affordance)
@@ -2210,11 +2715,13 @@ def build_conscious_state(
     homeostasis: Optional[Dict[str, object]] = None,
     plan_model: Optional[Dict[str, object]] = None,
     autonomy_agenda: Optional[Dict[str, object]] = None,
+    autobiography: Optional[Dict[str, object]] = None,
     memory_items: Optional[Sequence[Dict[str, object]]] = None,
     sensory_frame: Optional[Dict[str, object]] = None,
     conflict_items: Optional[Sequence[object]] = None,
     epistemic_frame: Optional[Dict[str, object]] = None,
     inbound: object = "",
+    module_query: Optional[Dict[str, object]] = None,
     previous_state: Optional[Dict[str, object]] = None,
     latest_outcome: Optional[Dict[str, object]] = None,
     revision_rounds: int = 0,
@@ -2231,6 +2738,7 @@ def build_conscious_state(
     homeostasis = homeostasis or {}
     plan_model = plan_model or {}
     autonomy_agenda = autonomy_agenda or {}
+    autobiography = autobiography or {}
     previous_state = previous_state or {}
     memory_items = list(memory_items or [])
     normalized_sensory_frame = eve_sensory.public_frame(
@@ -2243,8 +2751,28 @@ def build_conscious_state(
         item for item in epistemic_conflicts if str(item.get("status") or "unresolved") != "resolved"
     ]
     inbound_text = _text(inbound, 600)
+    normalized_module_query = _normalize_module_query(module_query)
     runtime_epoch_text = _text(runtime_epoch, 120)
     lesion_set = {str(item) for item in lesions or [] if str(item) in LESIONS}
+    normalized_autobiography = eve_autobiography.normalize_state(autobiography)
+    if "autobiography" in lesion_set:
+        projected_autobiography = eve_autobiography.lesion_all(normalized_autobiography)
+    elif "autobiographical_change" in lesion_set:
+        projected_autobiography = eve_autobiography.lesion_change(normalized_autobiography)
+    else:
+        projected_autobiography = normalized_autobiography
+    active_memory_items = [
+        item
+        for item in memory_items
+        if not (
+            isinstance(item, dict)
+            and item.get("source") == "autobiographical_continuity"
+            and (
+                "autobiography" in lesion_set
+                or "autobiographical_change" in lesion_set
+            )
+        )
+    ]
     plan_available = "plan_model" not in lesion_set and bool(plan_model.get("available"))
     active_plans = (
         [copy.deepcopy(item) for item in (plan_model.get("active_plans") or [])[:8] if isinstance(item, dict)]
@@ -2283,6 +2811,17 @@ def build_conscious_state(
     )
     previous_checkpoint_status = checkpoint_integrity(previous_state)
     trusted_previous = previous_state if previous_checkpoint_status != "failed" else {}
+    previous_epistemic_state = (
+        trusted_previous.get("epistemic_state")
+        if isinstance(trusted_previous.get("epistemic_state"), dict)
+        else {}
+    )
+    belief_control = eve_metacognitive_belief.build_control(
+        active_epistemic_frame,
+        previous_control=previous_epistemic_state.get("belief_control"),
+        observed_at=timestamp,
+        lesioned=("metacognition" in lesion_set or "self_model" in lesion_set),
+    )
     causal_latest_outcome = _causally_matched_previous_outcome(
         trusted_previous,
         latest_outcome,
@@ -2315,9 +2854,11 @@ def build_conscious_state(
         relationship_model=relationship_model,
         plan_model=normalized_plan_model,
         homeostasis=homeostasis,
-        memory_items=memory_items,
+        autobiography=projected_autobiography,
+        memory_items=active_memory_items,
         sensory_frame=normalized_sensory_frame,
         inbound=inbound_text,
+        module_query=normalized_module_query,
         previous_state=trusted_previous,
         continuity_timing=timing,
         interoceptive_feedback=interoceptive_feedback,
@@ -2326,6 +2867,7 @@ def build_conscious_state(
         previous_checkpoint_integrity=previous_checkpoint_status,
         lesions=lesion_set,
     )
+    coalitions = _apply_workspace_precision_weighting(coalitions, lesion_set)
     winner, alternatives, broadcast = _select_broadcast(coalitions, lesion_set)
     goals = _merge_goals(
         workspace=workspace,
@@ -2350,7 +2892,40 @@ def build_conscious_state(
     other_minds_available = "other_minds" not in lesion_set and bool(
         relationship_model or other_minds_model
     )
-    memory_available = "memory" not in lesion_set and bool(memory_items)
+    social_prediction_model = (
+        other_minds_model.get("social_prediction")
+        if isinstance(other_minds_model.get("social_prediction"), dict)
+        else {}
+    )
+    social_prediction_available = bool(
+        other_minds_available
+        and "social_prediction" not in lesion_set
+        and social_prediction_model
+    )
+    social_feedback_available = bool(
+        social_prediction_available and "social_feedback" not in lesion_set
+    )
+    common_ground_model = eve_common_ground.normalize_model(
+        other_minds_model.get("common_ground")
+    )
+    common_ground_available = bool(
+        other_minds_available
+        and "common_ground" not in lesion_set
+        and int(common_ground_model.get("trajectory_count") or 0) > 0
+    )
+    common_ground_feedback_available = bool(
+        common_ground_available
+        and "common_ground_feedback" not in lesion_set
+        and int(common_ground_model.get("feedback_evidence_count") or 0) > 0
+    )
+    projected_common_ground = (
+        {}
+        if not common_ground_available
+        else eve_common_ground.lesion_feedback(common_ground_model)
+        if "common_ground_feedback" in lesion_set
+        else copy.deepcopy(common_ground_model)
+    )
+    memory_available = "memory" not in lesion_set and bool(active_memory_items)
     previous_learning = (
         trusted_previous.get("learning")
         if "recurrence" not in lesion_set and isinstance(trusted_previous.get("learning"), dict)
@@ -2446,6 +3021,7 @@ def build_conscious_state(
         winner=winner,
         broadcast=broadcast,
         inbound=inbound_text,
+        module_query=normalized_module_query,
         regulation_mode=regulation_mode,
         arousal=arousal,
         valence=valence,
@@ -2454,9 +3030,23 @@ def build_conscious_state(
         regulatory_prediction_error=regulatory_prediction_error,
         action_models=action_models,
         lesions=lesion_set,
+        now=timestamp,
+        homeostasis=homeostasis,
     )
     if "action_model" in lesion_set:
         affordances = []
+    allostatic_state = eve_interoception.build_allostatic_state(
+        homeostasis=homeostasis,
+        previous_state=trusted_previous,
+        affordances=affordances,
+        action_models=action_models,
+        lesions=lesion_set,
+    )
+    affordances = eve_interoception.apply_allostatic_adjustments(
+        affordances,
+        allostatic_state,
+        inbound=bool(inbound_text),
+    )
     selected_intention = affordances[0] if affordances else {}
     broadcast_action_coupling_active = any(
         float(item.get("broadcast_adjustment") or 0.0) > 0.0
@@ -2475,6 +3065,101 @@ def build_conscious_state(
         self_available=metacognition_available,
         process_models=process_models,
     )
+    belief_control_state = (
+        belief_control.get("control")
+        if isinstance(belief_control.get("control"), dict)
+        else {}
+    )
+    if belief_control.get("available") and (
+        belief_control_state.get("requires_revision")
+        or belief_control_state.get("requires_observation")
+    ):
+        process_prediction["needs_revision"] = True
+        lanes = {
+            str(item) for item in process_prediction.get("lanes") or [] if str(item)
+        }
+        lanes.add("observer")
+        process_prediction["lanes"] = [lane for lane in LANES if lane in lanes]
+        required_lanes = {
+            str(item)
+            for item in process_prediction.get("required_lanes") or []
+            if str(item)
+        }
+        required_lanes.add("observer")
+        process_prediction["required_lanes"] = [
+            lane for lane in LANES if lane in required_lanes
+        ]
+        process_prediction["reasons"] = _items(
+            [
+                "Metacognitive belief control requires evidence-sensitive revision.",
+                *(process_prediction.get("reasons") or []),
+            ],
+            5,
+            220,
+        )
+    active_common_ground_repair = (
+        projected_common_ground.get("active_repair")
+        if isinstance(projected_common_ground.get("active_repair"), dict)
+        else {}
+    )
+    if common_ground_available and active_common_ground_repair.get("required"):
+        process_prediction["needs_revision"] = True
+        process_prediction["needs_memory"] = True
+        lanes = {
+            str(item) for item in process_prediction.get("lanes") or [] if str(item)
+        }
+        lanes.update({"observer", "relationship"})
+        process_prediction["lanes"] = [lane for lane in LANES if lane in lanes]
+        required_lanes = {
+            str(item)
+            for item in process_prediction.get("required_lanes") or []
+            if str(item)
+        }
+        required_lanes.update({"observer", "relationship"})
+        process_prediction["required_lanes"] = [
+            lane for lane in LANES if lane in required_lanes
+        ]
+        process_prediction["reasons"] = _items(
+            [
+                "A source-attributed common-ground correction requires an explicit repair.",
+                *(process_prediction.get("reasons") or []),
+            ],
+            5,
+            220,
+        )
+    autobiographical_precedent = (
+        projected_autobiography.get("selected_precedent")
+        if isinstance(projected_autobiography.get("selected_precedent"), dict)
+        else {}
+    )
+    if autobiographical_precedent.get("selected"):
+        process_prediction["needs_memory"] = True
+        lanes = {
+            str(item) for item in process_prediction.get("lanes") or [] if str(item)
+        }
+        lanes.add("observer")
+        required_lanes = {
+            str(item)
+            for item in process_prediction.get("required_lanes") or []
+            if str(item)
+        }
+        required_lanes.add("observer")
+        if autobiographical_precedent.get("requires_revision"):
+            process_prediction["needs_revision"] = True
+            lanes.add("relationship")
+            required_lanes.add("relationship")
+        process_prediction["lanes"] = [lane for lane in LANES if lane in lanes]
+        process_prediction["required_lanes"] = [
+            lane for lane in LANES if lane in required_lanes
+        ]
+        process_prediction["reasons"] = _items(
+            [
+                "A source-grounded prior self-change is relevant to the current turn.",
+                *(process_prediction.get("reasons") or []),
+            ],
+            5,
+            220,
+        )
     attention_margin = float(winner.get("score") or 0) - (float(alternatives[0].get("score") or 0) if alternatives else 0.0)
     attention_confidence = _clamp(50 + attention_margin * 2, 0, 100, 0) if winner else 0
     previous_metacognition = (
@@ -2505,6 +3190,17 @@ def build_conscious_state(
             - (4 if learned_calibration_interrupt else 0)
         )
     )
+    if metacognition_available and belief_control.get("available"):
+        metacognitive_confidence = min(
+            metacognitive_confidence,
+            _clamp(
+                float(belief_control_state.get("confidence_ceiling") or 1.0)
+                * 100,
+                0,
+                100,
+                50,
+            ),
+        )
     process_prediction["confidence"] = metacognitive_confidence
     continuity_strength = _continuity_strength(
         trusted_previous,
@@ -2542,34 +3238,17 @@ def build_conscious_state(
 
     selected_action_description = _text(selected_intention.get("description"), 220)
     selected_action_id = _text(selected_intention.get("id"), 80)
-    selected_action_learning = (
-        action_models.get(selected_action_id)
-        if selected_action_id and isinstance(action_models.get(selected_action_id), dict)
-        else {}
-    )
-    selected_action_observations = (
-        selected_action_learning.get("observations")
-        if isinstance(selected_action_learning.get("observations"), list)
-        else []
-    )
-    selected_action_outcomes = [
-        bool(item.get("ok"))
-        for item in selected_action_observations
-        if isinstance(item, dict) and item.get("ok") is not None
-    ][-MAX_CONTEXT_OBSERVATIONS:]
-    action_success_probability = (
-        (sum(1 for item in selected_action_outcomes if item) + 2.0)
-        / (len(selected_action_outcomes) + 4.0)
-        if selected_action_id
-        else 0.0
-    )
+    # Forecast and choice consume the same pre-action contextual estimate.
+    action_success_probability = float(selected_intention.get("learned_reliability", 0.5)) if selected_action_id else 0.0
     outcome_prediction = {
         "action_id": _text(selected_intention.get("id"), 80),
         "goal_id": _text(selected_intention.get("goal_id"), 80),
         "goal_text": _text(selected_intention.get("goal_text"), 220),
         "expected_ok": bool(selected_intention) and action_success_probability >= 0.5,
         "expected_success_probability": round(action_success_probability, 3),
-        "learned_samples": len(selected_action_outcomes),
+        "learned_samples": int(selected_intention.get("learned_attempts") or 0),
+        "action_context": copy.deepcopy(selected_intention.get("action_context") or {}),
+        "learning_policy": eve_context_learning.POLICY,
         "expected_signal": (
             f"A verified consequence should follow: {selected_action_description}"
             if selected_action_description
@@ -2577,7 +3256,56 @@ def build_conscious_state(
         ),
         "confidence": metacognitive_confidence,
     }
-    if arousal >= 50 and selected_intention:
+    baseline_allostatic_forecast = (
+        allostatic_state.get("baseline_forecast")
+        if isinstance(allostatic_state.get("baseline_forecast"), dict)
+        else {}
+    )
+    selected_allostatic_forecast = next(
+        (
+            item
+            for item in allostatic_state.get("candidate_forecasts") or []
+            if isinstance(item, dict)
+            and item.get("grounded_effect")
+            and _text(item.get("action_id"), 80) == selected_action_id
+        ),
+        {},
+    )
+    forecast_trajectories = (
+        selected_allostatic_forecast.get("trajectories")
+        if isinstance(selected_allostatic_forecast.get("trajectories"), list)
+        and allostatic_state.get("available")
+        else baseline_allostatic_forecast.get("trajectories")
+        if isinstance(baseline_allostatic_forecast.get("trajectories"), list)
+        and baseline_allostatic_forecast.get("available")
+        else []
+    )
+    next_intervals: List[List[float]] = []
+    for trajectory in forecast_trajectories:
+        if not isinstance(trajectory, dict):
+            continue
+        point = next(
+            (
+                item
+                for item in trajectory.get("points") or []
+                if isinstance(item, dict) and int(item.get("horizon_cycles") or 0) == 1
+            ),
+            {},
+        )
+        interval = point.get("interval") if isinstance(point.get("interval"), list) else []
+        if len(interval) == 2:
+            next_intervals.append([float(interval[0]), float(interval[1])])
+    if next_intervals:
+        expected_low = int(round(max(item[0] for item in next_intervals)))
+        expected_high = int(round(max(item[1] for item in next_intervals)))
+        midpoint = (expected_low + expected_high) / 2.0
+        if midpoint < arousal - 2:
+            expected_direction = "falling"
+        elif midpoint > arousal + 2:
+            expected_direction = "rising"
+        else:
+            expected_direction = "stable"
+    elif arousal >= 50 and selected_intention:
         expected_low = max(0, arousal - (20 if regulation_mode == "stabilize" else 15))
         expected_high = min(100, arousal + 5)
         expected_direction = "falling_or_stable"
@@ -2585,17 +3313,76 @@ def build_conscious_state(
         expected_low = max(0, arousal - 10)
         expected_high = min(100, arousal + 10)
         expected_direction = "stable"
+    # Arousal history carried across cycles feeds the auditable predictive-dynamics
+    # module: it picks the dynamics hypothesis with the best prospective backtest
+    # and forecasts the next arousal with an explicit precision. When no grounded
+    # allostatic trajectory exists, that forecast replaces the fixed +/-10 band.
+    previous_interoception = (
+        trusted_previous.get("interoception") if isinstance(trusted_previous.get("interoception"), dict) else {}
+    )
+    arousal_history = [
+        _clamp(item)
+        for item in (previous_interoception.get("arousal_history") or [])
+        if isinstance(item, (int, float))
+    ][-31:]
+    if homeostasis_available:
+        arousal_history.append(int(arousal))
+    dynamics_forecast: Dict[str, object] = {}
+    dynamics_basis = ""
+    dynamics_forecast_used = False
+    if homeostasis_available and len(arousal_history) >= 3:
+        # Always forecast when history allows, so the auditable dynamics prediction
+        # can be compared against the allostatic trajectory cycle by cycle; it
+        # only sets the expected range when no grounded trajectory exists.
+        try:
+            dynamics_forecast = eve_predictive_dynamics.forecast_numeric(arousal_history, limit=100)
+        except ValueError:
+            dynamics_forecast = {}
+        if dynamics_forecast and not next_intervals:
+            dynamics_forecast_used = True
+            selected_expert = next(
+                (item for item in dynamics_forecast.get("experts") or [] if item.get("name") == dynamics_forecast.get("selected_expert")),
+                {},
+            )
+            band = max(5.0, float(selected_expert.get("mean_absolute_error_percent") or 0.0))
+            prediction = float(dynamics_forecast.get("prediction") or arousal)
+            expected_low = _clamp(int(round(prediction - band)))
+            expected_high = _clamp(int(round(prediction + band)))
+            if prediction < arousal - 2:
+                expected_direction = "falling"
+            elif prediction > arousal + 2:
+                expected_direction = "rising"
+            else:
+                expected_direction = "stable"
+            dynamics_basis = "predictive_dynamics_forecast"
     interoceptive_prediction = {
         "expected_regulation_mode": regulation_mode,
         "expected_arousal_range": [expected_low, expected_high],
         "expected_direction": expected_direction,
         "basis_action_id": selected_action_id,
+        "basis": (
+            "grounded_action_effect_forecast"
+            if selected_allostatic_forecast
+            else "measured_pressure_trajectory"
+            if baseline_allostatic_forecast.get("available")
+            else dynamics_basis or "bounded_one_step_fallback"
+        ),
+        "dynamics_forecast": copy.deepcopy(dynamics_forecast),
+        "dynamics_forecast_used": dynamics_forecast_used,
+        "multi_horizon": copy.deepcopy(
+            selected_allostatic_forecast
+            if selected_allostatic_forecast
+            else baseline_allostatic_forecast
+            if baseline_allostatic_forecast.get("available")
+            else {}
+        ),
         "confidence": metacognitive_confidence if homeostasis_available else 0,
         "available": homeostasis_available,
     }
-    continuity_anchors = [] if "memory" in lesion_set else _items([item.get("text") or item.get("content") or item.get("title") for item in memory_items if isinstance(item, dict)], 5)
+    continuity_anchors = [] if "memory" in lesion_set else _items([item.get("text") or item.get("content") or item.get("title") for item in active_memory_items if isinstance(item, dict)], 5)
     provenance = [
         "current_turn" if inbound_text else "",
+        "recurrent_module_query" if normalized_module_query else "",
         (
             "sensory_frame"
             if "sensory_stream" not in lesion_set
@@ -2607,6 +3394,22 @@ def build_conscious_state(
         "world_model" if world_available else "",
         "relationship_model" if other_minds_available and relationship_model else "",
         "other_minds_model" if other_minds_available and other_minds_model else "",
+        "temporal_common_ground" if common_ground_available else "",
+        (
+            "common_ground_feedback"
+            if common_ground_feedback_available
+            else ""
+        ),
+        (
+            "autobiographical_continuity"
+            if projected_autobiography.get("status") == "active"
+            else ""
+        ),
+        (
+            "autobiographical_change_directive"
+            if autobiographical_precedent.get("selected")
+            else ""
+        ),
         "homeostasis" if homeostasis_available else "",
         "memory_retrieval" if memory_available else "",
         "autonomy_agenda" if autonomy_agenda else "",
@@ -2614,12 +3417,42 @@ def build_conscious_state(
         "previous_conscious_cycle" if trusted_previous.get("cycle_id") and "recurrence" not in lesion_set else "",
         "epistemic_conflict_memory" if epistemic_conflicts else "",
         (
-            "learned_epistemic_preflight:"
+        "learned_epistemic_preflight:"
             + _text(active_epistemic_frame.get("model_id"), 100)
             if learned_epistemic_labels
             else ""
         ),
+        (
+            "metacognitive_belief_control"
+            if belief_control.get("available")
+            else ""
+        ),
         "homeostatic_prediction_feedback" if interoceptive_feedback else "",
+        (
+            "allostatic_pressure_forecast"
+            if allostatic_state.get("available")
+            else ""
+        ),
+        (
+            "interoceptive_enactive_sampling_proposal"
+            if allostatic_state.get("sampling_proposal")
+            else ""
+        ),
+        (
+            "limited_capacity_workspace"
+            if broadcast.get("bottleneck_active")
+            else ""
+        ),
+        (
+            "workspace_precision_weighting"
+            if broadcast.get("precision_weighting_active")
+            else ""
+        ),
+        (
+            "global_broadcast_access"
+            if broadcast.get("access_scope")
+            else ""
+        ),
         "broadcast_to_action" if broadcast_action_coupling_active else "",
     ]
     cycle_index = 1 if "recurrence" in lesion_set else max(0, int(previous_state.get("cycle_index") or 0)) + 1
@@ -2694,6 +3527,35 @@ def build_conscious_state(
             "summary": "Other-minds model lesioned." if not other_minds_available else _text(other_minds_model.get("summary"), 260),
             "relationship_state": "" if not other_minds_available else _text(relationship_model.get("relationship_state"), 260),
             "next_relational_move": "" if not other_minds_available else _text(relationship_model.get("next_relational_move"), 220),
+            "social_prediction": (
+                {}
+                if not social_prediction_available
+                else {
+                    **copy.deepcopy(social_prediction_model),
+                    **(
+                        {}
+                        if social_feedback_available
+                        else {
+                            "evidence_count": 0,
+                            "scored_count": 0,
+                            "response_prior": {},
+                            "observed_counts": {},
+                            "mean_normalized_brier": None,
+                            "top1_accuracy": None,
+                            "last_observed_class": "",
+                            "last_prediction_id": "",
+                            "distribution_shift": None,
+                            "recent_evidence_ids": [],
+                            "feedback_lesioned": True,
+                        }
+                    ),
+                }
+            ),
+            "social_prediction_available": social_prediction_available,
+            "social_feedback_available": social_feedback_available,
+            "common_ground": projected_common_ground,
+            "common_ground_available": common_ground_available,
+            "common_ground_feedback_available": common_ground_feedback_available,
             "available": other_minds_available,
         },
         "interoception": {
@@ -2702,7 +3564,13 @@ def build_conscious_state(
             "relief_signals": relief,
             "valence": valence,
             "arousal": arousal,
+            "arousal_history": list(arousal_history),
+            "pressure_records": copy.deepcopy(homeostatic["pressure_records"]),
             "prediction_error": interoceptive_feedback,
+            "allostasis": copy.deepcopy(allostatic_state),
+            "sampling_proposal": copy.deepcopy(
+                allostatic_state.get("sampling_proposal") or {}
+            ),
             "available": homeostasis_available,
         },
         "epistemic_state": {
@@ -2710,13 +3578,20 @@ def build_conscious_state(
             "unresolved_count": sum(1 for item in epistemic_conflicts if item.get("status") != "resolved"),
             "learned_frame": active_epistemic_frame,
             "learned_signal_count": len(learned_epistemic_labels),
-            "available": bool(epistemic_conflicts or learned_epistemic_labels),
+            "belief_control": belief_control,
+            "available": bool(
+                epistemic_conflicts
+                or learned_epistemic_labels
+                or belief_control.get("available")
+            ),
         },
         "memory": {
-            "retrieved": [] if "memory" in lesion_set else [copy.deepcopy(item) for item in memory_items[:8]],
+            "retrieved": [] if "memory" in lesion_set else [copy.deepcopy(item) for item in active_memory_items[:8]],
             "continuity_anchors": continuity_anchors,
             "available": memory_available,
         },
+        "autobiography": copy.deepcopy(projected_autobiography),
+        "module_query": copy.deepcopy(normalized_module_query),
         "goals": {
             "stack": goals,
             "selected_goal_id": _text(selected_goal.get("id"), 80),
@@ -2757,6 +3632,21 @@ def build_conscious_state(
                             if isinstance(item, dict)
                         ]
                         + _items(active_epistemic_frame.get("guidance"), 6, 220)
+                        + _items(
+                            [
+                                (belief_control.get("dominant_belief") or {}).get(
+                                    "proposition"
+                                ),
+                                (
+                                    "Metacognitive control: "
+                                    + _text(belief_control_state.get("decision"), 80)
+                                    if belief_control_state.get("decision") not in {None, "", "none"}
+                                    else ""
+                                ),
+                            ],
+                            2,
+                            220,
+                        )
                         + (["Re-observe regulatory state after prediction error."] if regulatory_prediction_error else [])
                     )
                 )[:8]
@@ -3026,17 +3916,84 @@ def complete_cycle(
         action_model = action_models.get(actual_action_id) if isinstance(action_models.get(actual_action_id), dict) else {}
         action_observations = action_model.get("observations") if isinstance(action_model.get("observations"), list) else []
         action_observations = [item for item in action_observations if isinstance(item, dict)][-(MAX_CONTEXT_OBSERVATIONS - 1):]
-        action_observations.append(
-            {
-                "completed_at": completed_at,
-                "ok": bool(observed_ok),
-                "summary": _text(outcome.get("summary"), 160),
-                "source_cycle_id": _text(updated.get("cycle_id"), 80),
-                "action_id": actual_action_id,
-                "evidence_id": _text(outcome.get("evidence_id"), 160),
-                "evidence_kind": "cycle_action_consequence",
-            }
+        action_observation = {
+            "completed_at": completed_at,
+            "ok": bool(observed_ok),
+            "summary": _text(outcome.get("summary"), 160),
+            "source_cycle_id": _text(updated.get("cycle_id"), 80),
+            "action_id": actual_action_id,
+            "evidence_id": _text(outcome.get("evidence_id"), 160),
+            "evidence_kind": "cycle_action_consequence",
+            "execution_id": _text(actual_process.get("execution_id") or outcome.get("execution_id"), 100),
+            "verification_ok": outcome.get("procedural_verification_ok", outcome.get("verification_ok")),
+            "action_context": (
+                eve_context_learning.capture_credit(state, actual_action_id).get("action_context", {})
+                if not any(item.get("action_id") == actual_action_id for item in recovery_attempts) else {}
+            ),
+        }
+        before_records = (
+            (updated.get("interoception") or {}).get("pressure_records")
+            if isinstance(updated.get("interoception"), dict)
+            else []
         )
+        homeostasis_before: Dict[str, float] = {}
+        for record in before_records or []:
+            if not isinstance(record, dict):
+                continue
+            pressure_id = _text(record.get("id"), 60).lower().replace(" ", "_")
+            try:
+                level = float(record.get("level"))
+            except (TypeError, ValueError):
+                continue
+            if pressure_id and 0.0 <= level <= 100.0:
+                homeostasis_before[pressure_id] = level
+        raw_after = outcome.get("homeostasis_after")
+        homeostasis_after: Dict[str, float] = {}
+        if isinstance(raw_after, dict):
+            for raw_pressure_id, raw_level in raw_after.items():
+                pressure_id = _text(raw_pressure_id, 60).lower().replace(" ", "_")
+                try:
+                    level = float(raw_level)
+                except (TypeError, ValueError):
+                    continue
+                if pressure_id and 0.0 <= level <= 100.0:
+                    homeostasis_after[pressure_id] = level
+        execution_id = _text(actual_process.get("execution_id"), 100)
+        evidence_id = _text(outcome.get("evidence_id"), 160)
+        try:
+            elapsed_cycles = int(outcome.get("elapsed_cycles"))
+            execution_cost = float(outcome.get("execution_cost"))
+        except (TypeError, ValueError):
+            elapsed_cycles = 0
+            execution_cost = -1.0
+        shared_pressure_ids = set(homeostasis_before) & set(homeostasis_after)
+        homeostatic_consequence_qualified = bool(
+            outcome.get("verification_ok") is True
+            and execution_id
+            and evidence_id
+            and shared_pressure_ids
+            and 1 <= elapsed_cycles <= 12
+            and 0.0 <= execution_cost <= 100.0
+        )
+        if homeostatic_consequence_qualified:
+            action_observation.update(
+                {
+                    "evidence_kind": eve_interoception.EFFECT_EVIDENCE_KIND,
+                    "execution_id": execution_id,
+                    "verification_ok": True,
+                    "elapsed_cycles": elapsed_cycles,
+                    "execution_cost": execution_cost,
+                    "homeostasis_before": {
+                        pressure_id: homeostasis_before[pressure_id]
+                        for pressure_id in sorted(shared_pressure_ids)
+                    },
+                    "homeostasis_after": {
+                        pressure_id: homeostasis_after[pressure_id]
+                        for pressure_id in sorted(shared_pressure_ids)
+                    },
+                }
+            )
+        action_observations.append(action_observation)
         action_models[actual_action_id] = {
             "action_id": actual_action_id,
             "observations": action_observations,
@@ -3084,6 +4041,13 @@ def complete_cycle(
                     attempt.get("recovery_from_execution_id"), 80
                 ),
                 "evidence_kind": "bounded_action_attempt",
+                "verification_ok": attempt.get("verification_ok"),
+                # Recovery occurred in a changed environment, not necessarily
+                # the original preflight. Do not invent its antecedent state.
+                "action_context": (
+                    eve_context_learning.capture_credit(state, attempt_action_id).get("action_context", {})
+                    if attempt.get("stage") != "recovery" else {}
+                ),
             }
         )
         action_models[attempt_action_id] = {
@@ -3240,6 +4204,7 @@ def apply_delayed_action_consequence(
     observed_message_id: str = "",
     prediction_error: Optional[int] = None,
     faculty_contributors: Optional[Sequence[Dict[str, object]]] = None,
+    source_credit: Optional[Dict[str, object]] = None,
     now: Optional[str] = None,
 ) -> Tuple[Dict[str, object], bool]:
     """Join a later lived consequence without replacing the current experience.
@@ -3323,6 +4288,7 @@ def apply_delayed_action_consequence(
             "observed_message_id": observed_id,
             "evidence_kind": "lived_user_consequence",
             "faculty_contributors": copy.deepcopy(contributors),
+            "action_context": eve_context_learning.bound_context(source_credit, cycle_id, action),
         }
     )
     action_models[action] = {
@@ -4124,11 +5090,22 @@ def causal_signature(state: Dict[str, object]) -> Dict[str, object]:
     epistemic_state = state.get("epistemic_state") if isinstance(state.get("epistemic_state"), dict) else {}
     recurrent = state.get("recurrent") if isinstance(state.get("recurrent"), dict) else {}
     memory = state.get("memory") if isinstance(state.get("memory"), dict) else {}
+    autobiography = state.get("autobiography") if isinstance(state.get("autobiography"), dict) else {}
     interoception = state.get("interoception") if isinstance(state.get("interoception"), dict) else {}
     action_model = state.get("action_model") if isinstance(state.get("action_model"), dict) else {}
     self_model = state.get("self_model") if isinstance(state.get("self_model"), dict) else {}
     world_model = state.get("world_model") if isinstance(state.get("world_model"), dict) else {}
     other_minds = state.get("other_minds") if isinstance(state.get("other_minds"), dict) else {}
+    social_prediction = (
+        other_minds.get("social_prediction")
+        if isinstance(other_minds.get("social_prediction"), dict)
+        else {}
+    )
+    common_ground = (
+        other_minds.get("common_ground")
+        if isinstance(other_minds.get("common_ground"), dict)
+        else {}
+    )
     goals = state.get("goals") if isinstance(state.get("goals"), dict) else {}
     plan_model = state.get("plan_model") if isinstance(state.get("plan_model"), dict) else {}
     sensory_frame = (
@@ -4146,11 +5123,17 @@ def causal_signature(state: Dict[str, object]) -> Dict[str, object]:
     }
     return {
         "access_breadth": len(kinds) + len(broadcast.get("access_scope") or []),
+        "workspace_bottleneck": int(bool(broadcast.get("bottleneck_active"))),
+        "broadcast_access_breadth": len(broadcast.get("access_scope") or []),
         "sensory_coupling": (
             len(sensory_frame.get("working_set") or [])
             + sum(1 for kind in kinds if kind.startswith("sensory_"))
         ),
         "broadcast_ignition": float(broadcast.get("ignition_score") or 0.0),
+        "workspace_precision_control": (
+            int(bool(broadcast.get("precision_weighting_active")))
+            + int(broadcast.get("attenuated_candidate_count") or 0)
+        ),
         "self_model_coupling": (
             int(bool(self_model.get("available")))
             + len(self_model.get("uncertainties") or [])
@@ -4173,8 +5156,48 @@ def causal_signature(state: Dict[str, object]) -> Dict[str, object]:
             + int(bool(_text(other_minds.get("next_relational_move"), 20)))
             + sum(1 for item in perception.get("salient_inputs") or [] if isinstance(item, dict) and str(item.get("kind") or "").startswith("relationship"))
         ),
+        "social_prediction_coupling": (
+            int(bool(other_minds.get("social_prediction_available")))
+            + int(bool(social_prediction.get("schema_version")))
+            + len(social_prediction.get("response_prior") or {})
+        ),
+        "social_feedback_coupling": (
+            int(social_prediction.get("scored_count") or 0)
+            + int(social_prediction.get("evidence_count") or 0)
+            + int(social_prediction.get("mean_normalized_brier") is not None)
+            + int(bool(social_prediction.get("last_observed_class")))
+        ),
+        "common_ground_coupling": (
+            int(bool(other_minds.get("common_ground_available")))
+            + int(common_ground.get("trajectory_count") or 0)
+            + len(common_ground.get("questions_under_discussion") or [])
+        ),
+        "common_ground_feedback_coupling": (
+            int(common_ground.get("feedback_evidence_count") or 0)
+            + len(common_ground.get("shared_commitments") or [])
+            + int(bool((common_ground.get("active_repair") or {}).get("required")))
+        ),
         "continuity_strength": int(recurrent.get("continuity_strength") or 0),
+        "embodiment_action_coupling": (
+            sum(1 for item in (action_model.get("affordances") or []) if isinstance(item, dict) and str(item.get("source") or "") == "embodiment")
+            + (1 if str((action_model.get("selected_intention") or {}).get("source") or "") == "embodiment" else 0)
+        ),
         "memory_anchors": len(memory.get("continuity_anchors") or []),
+        "autobiographical_continuity_coupling": (
+            int(autobiography.get("event_count") or 0)
+            + int(autobiography.get("trajectory_count") or 0)
+            + int(autobiography.get("prior_state_retrieval_count") or 0)
+        ),
+        "autobiographical_change_control": (
+            int(autobiography.get("change_count") or 0)
+            + int(bool((autobiography.get("selected_precedent") or {}).get("selected")))
+            + sum(
+                1
+                for item in memory.get("retrieved") or []
+                if isinstance(item, dict)
+                and item.get("source") == "autobiographical_continuity"
+            )
+        ),
         "homeostatic_action_modulation": round(
             sum(
                 abs(float(item.get("affective_adjustment") or 0.0))
@@ -4182,6 +5205,29 @@ def causal_signature(state: Dict[str, object]) -> Dict[str, object]:
                 for item in affordances
             ),
             3,
+        ),
+        "allostatic_forecast_control": (
+            round(
+                float(
+                    (
+                        (interoception.get("allostasis") or {}).get("baseline_forecast")
+                        if isinstance(interoception.get("allostasis"), dict)
+                        else {}
+                    ).get("decision_bound_crossing_risk")
+                    or 0.0
+                ),
+                3,
+            )
+            + int(
+                bool(
+                    (interoception.get("allostasis") or {}).get("available")
+                    if isinstance(interoception.get("allostasis"), dict)
+                    else False
+                )
+            )
+        ),
+        "interoceptive_enactive_sampling": int(
+            bool(interoception.get("sampling_proposal"))
         ),
         "broadcast_action_coupling": round(
             sum(float(item.get("broadcast_adjustment") or 0.0) for item in affordances),
@@ -4201,6 +5247,7 @@ def causal_signature(state: Dict[str, object]) -> Dict[str, object]:
         ),
         "action_control": int(bool(action_model.get("actionable"))) + len(affordances),
         "action_value": float((action_model.get("selected_intention") or {}).get("value") or 0.0),
+        "contextual_action_control": sum(abs(float(item.get("learned_adjustment") or 0.0)) for item in affordances),
         "selected_action": _text((action_model.get("selected_intention") or {}).get("id"), 80),
     }
 
@@ -4222,12 +5269,26 @@ def run_causal_ablation_suite(build_inputs: Dict[str, object]) -> Dict[str, obje
         "metacognition": "metacognitive_calibration",
         "world_model": "world_model_coupling",
         "other_minds": "other_minds_coupling",
+        "social_prediction": "social_prediction_coupling",
+        "social_feedback": "social_feedback_coupling",
+        "common_ground": "common_ground_coupling",
+        "common_ground_feedback": "common_ground_feedback_coupling",
+        "autobiography": "autobiographical_continuity_coupling",
+        "autobiographical_change": "autobiographical_change_control",
         "memory": "memory_anchors",
         "homeostasis": "homeostatic_action_modulation",
+        "allostasis": "allostatic_forecast_control",
+        "interoceptive_enaction": "interoceptive_enactive_sampling",
         "goals": "goal_control",
         "plan_model": "plan_control",
         "action_model": "action_control",
+        "contextual_action_learning": "contextual_action_control",
+        "workspace_bottleneck": "workspace_bottleneck",
+        "workspace_precision": "workspace_precision_control",
+        "broadcast_access": "broadcast_access_breadth",
+        "broadcast_action_coupling": "broadcast_action_coupling",
         "recurrence": "continuity_strength",
+        "embodiment": "embodiment_action_coupling",
     }
     results: Dict[str, object] = {}
     for lesion, metric in expectations.items():
@@ -4364,6 +5425,7 @@ def run_broadcast_action_counterfactual_suite() -> Dict[str, object]:
             winner=focus["winner"],
             broadcast=focus["broadcast"],
             inbound=common_context["inbound"],
+            module_query={},
             regulation_mode=common_context["regulation_mode"],
             arousal=common_context["arousal"],
             valence=common_context["valence"],
@@ -4487,6 +5549,333 @@ def run_broadcast_action_counterfactual_suite() -> Dict[str, object]:
     }
 
 
+def default_state_dependent_query_cases() -> List[Dict[str, object]]:
+    """Return balanced evaluator-owned query chains for a GWT-4 intervention."""
+    modules = ["module_alder_101", "module_birch_202", "module_cedar_303"]
+    links = [
+        (modules[0], modules[1]),
+        (modules[1], modules[2]),
+        (modules[2], modules[0]),
+        (modules[0], modules[2]),
+        (modules[1], modules[0]),
+        (modules[2], modules[1]),
+    ]
+    return [
+        {
+            "id": f"gwt4-query-{index}",
+            "modules": list(modules),
+            "locator_module": locator,
+            "target_module": target,
+        }
+        for index, (locator, target) in enumerate(links, start=1)
+    ]
+
+
+def _normalize_state_dependent_query_cases(
+    cases: Optional[Sequence[Dict[str, object]]],
+) -> List[Dict[str, object]]:
+    source = list(cases) if cases is not None else default_state_dependent_query_cases()
+    if len(source) < 6:
+        raise ValueError("state-dependent query succession requires at least six cases")
+    normalized: List[Dict[str, object]] = []
+    seen_ids: Set[str] = set()
+    for raw in source:
+        if not isinstance(raw, dict):
+            raise ValueError("each state-dependent query case must be a mapping")
+        case_id = _text(raw.get("id"), 80)
+        modules = _items(raw.get("modules"), 6, 80)
+        locator = _text(raw.get("locator_module"), 80)
+        target = _text(raw.get("target_module"), 80)
+        if not case_id or case_id in seen_ids:
+            raise ValueError("state-dependent query case ids must be unique")
+        if len(modules) < 3 or locator not in modules or target not in modules:
+            raise ValueError("each query case needs at least three modules including locator and target")
+        if locator == target:
+            raise ValueError("the target module must differ from the locator module")
+        if any(len(_tokens(module)) < 2 for module in modules):
+            raise ValueError("module ids must contain distinguishable lexical tokens")
+        seen_ids.add(case_id)
+        normalized.append(
+            {
+                "id": case_id,
+                "modules": modules,
+                "locator_module": locator,
+                "target_module": target,
+            }
+        )
+    return normalized
+
+
+def run_state_dependent_query_succession_suite(
+    cases: Optional[Sequence[Dict[str, object]]] = None,
+) -> Dict[str, object]:
+    """Test whether a verified module result controls the next module query.
+
+    Each matched chain first queries a locator module.  Its verified result is
+    inserted as the next cycle's winning workspace item.  The intact kernel
+    can use that globally broadcast state to query the named target.  The
+    lesion receives the same previous cycle, workspace item, action menu,
+    learned reliability, and time, but the broadcast-to-action edge is
+    removed.  That lesion is a stronger baseline than random choice because
+    the first successful query makes repeating the locator locally attractive.
+
+    The evaluator supplies the typed module result.  This therefore tests a
+    necessary software edge for GWT-4, not resident autonomous module querying
+    and not phenomenal consciousness.
+    """
+    normalized = _normalize_state_dependent_query_cases(cases)
+    results: List[Dict[str, object]] = []
+    for index, case in enumerate(normalized, start=1):
+        case_id = str(case["id"])
+        modules = [str(item) for item in case["modules"]]
+        locator = str(case["locator_module"])
+        target = str(case["target_module"])
+        agenda = {
+            "active_threads": [
+                {
+                    "title": module,
+                    "preferred_action": f"query_{module}",
+                    "priority": 70,
+                }
+                for module in modules
+            ],
+            "next_experiments": [],
+        }
+        common = {
+            "self_model": {},
+            "world_model": {
+                "environment_summary": "Matched evaluator-owned query environment.",
+                "live_unknowns": [],
+            },
+            "relationship_model": {},
+            "other_minds_model": {},
+            "homeostasis": {},
+            "plan_model": {},
+            "autonomy_agenda": agenda,
+            "memory_items": [],
+            "sensory_frame": {},
+            "conflict_items": [],
+            "epistemic_frame": {},
+            "inbound": "",
+            "runtime_epoch": "gwt4-query-evaluator",
+        }
+        base_minute = index * 3
+        opened_at = f"2026-08-23T20:{base_minute:02d}:00+00:00"
+        completed_at = f"2026-08-23T20:{base_minute:02d}:01+00:00"
+        next_at = f"2026-08-23T20:{base_minute:02d}:02+00:00"
+        first_workspace = {
+            "active_goals": [
+                "Resolve the evaluator query chain using verified module results"
+            ],
+            "prediction_errors": [
+                f"First query required: {locator} for {case_id}"
+            ],
+            "surprise_signals": [],
+            "action_readiness": [],
+        }
+        first = build_conscious_state(
+            source=f"gwt4_query_first:{case_id}",
+            workspace=first_workspace,
+            previous_state={},
+            lesions=[],
+            now=opened_at,
+            **common,
+        )
+        first_action = _text(
+            ((first.get("action_model") or {}).get("selected_intention") or {}).get("id"),
+            80,
+        )
+        locator_action = f"query_{locator}"
+        target_action = f"query_{target}"
+        prediction = (
+            (first.get("predictions") or {}).get("process")
+            if isinstance(first.get("predictions"), dict)
+            else {}
+        ) or {}
+        actual_lanes = list(
+            dict.fromkeys(
+                [
+                    *list(prediction.get("forecast_lanes") or []),
+                    *list(prediction.get("required_lanes") or []),
+                ]
+            )
+        )
+        execution_id = f"gwt4-execution-{index}"
+        evidence_id = f"gwt4-result-{index}"
+        completed = complete_cycle(
+            first,
+            actual_process={
+                "lanes": actual_lanes,
+                "tools_used": [locator_action],
+                "revision_used": bool(prediction.get("forecast_needs_revision")),
+                "action_id": locator_action,
+                "execution_id": execution_id,
+            },
+            outcome={
+                "ok": True,
+                "observed": True,
+                "action": locator_action,
+                "summary": "The typed locator result named the next module.",
+                "evidence_id": evidence_id,
+            },
+            now=completed_at,
+        )
+        cycle_outcome = (
+            completed.get("cycle_outcome")
+            if isinstance(completed.get("cycle_outcome"), dict)
+            else {}
+        )
+        causal_result_valid = bool(
+            first_action == locator_action
+            and cycle_outcome.get("outcome_observed") is True
+            and _text(cycle_outcome.get("actual_action_id"), 80) == locator_action
+            and _text(cycle_outcome.get("goal_outcome_evidence_id"), 160)
+            == evidence_id
+        )
+        second_workspace = {
+            "active_goals": list(first_workspace["active_goals"]),
+            # Keep content minimal so the requested next module, rather than
+            # the locator's name or evaluator prose, controls lexical access.
+            "prediction_errors": [target] if causal_result_valid else [],
+            "surprise_signals": [],
+            "action_readiness": [],
+        }
+        matched_inputs = {
+            "source": f"gwt4_query_second:{case_id}",
+            "workspace": second_workspace,
+            "previous_state": completed,
+            "latest_outcome": cycle_outcome,
+            "now": next_at,
+            **common,
+        }
+        input_digest = hashlib.sha256(
+            json.dumps(
+                matched_inputs,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        intact = build_conscious_state(lesions=[], **matched_inputs)
+        lesioned = build_conscious_state(
+            lesions=["broadcast_action_coupling"],
+            **matched_inputs,
+        )
+        intact_action = _text(
+            ((intact.get("action_model") or {}).get("selected_intention") or {}).get("id"),
+            80,
+        )
+        lesioned_action = _text(
+            ((lesioned.get("action_model") or {}).get("selected_intention") or {}).get("id"),
+            80,
+        )
+        intact_target = next(
+            (
+                item
+                for item in (intact.get("action_model") or {}).get("affordances") or []
+                if isinstance(item, dict) and item.get("id") == target_action
+            ),
+            {},
+        )
+        lesioned_target = next(
+            (
+                item
+                for item in (lesioned.get("action_model") or {}).get("affordances") or []
+                if isinstance(item, dict) and item.get("id") == target_action
+            ),
+            {},
+        )
+        query_result_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "source_cycle_id": first.get("cycle_id"),
+                    "action_id": locator_action,
+                    "execution_id": execution_id,
+                    "evidence_id": evidence_id,
+                    "next_module_id": target,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        results.append(
+            {
+                "case_id": case_id,
+                "matched_input_sha256": input_digest,
+                "query_result_sha256": query_result_digest,
+                "causal_result_valid": causal_result_valid,
+                "first_action_correct": first_action == locator_action,
+                "intact_selected_target": intact_action == target_action,
+                "lesion_selected_target": lesioned_action == target_action,
+                "intact_selected_action": intact_action,
+                "lesion_selected_action": lesioned_action,
+                "intact_target_broadcast_alignment": int(
+                    intact_target.get("broadcast_alignment") or 0
+                ),
+                "lesion_target_broadcast_alignment": int(
+                    lesioned_target.get("broadcast_alignment") or 0
+                ),
+                "intact_chain_completed": bool(
+                    causal_result_valid
+                    and first_action == locator_action
+                    and intact_action == target_action
+                ),
+                "lesion_chain_completed": bool(
+                    causal_result_valid
+                    and first_action == locator_action
+                    and lesioned_action == target_action
+                ),
+            }
+        )
+    intact_count = sum(1 for item in results if item["intact_chain_completed"])
+    lesion_count = sum(1 for item in results if item["lesion_chain_completed"])
+    case_count = len(results)
+    intact_rate = round(100.0 * intact_count / case_count, 6)
+    lesion_rate = round(100.0 * lesion_count / case_count, 6)
+    effect = round(intact_rate - lesion_rate, 6)
+    checks = {
+        "causal_first_query_receipts": all(
+            bool(item["causal_result_valid"] and item["first_action_correct"])
+            for item in results
+        ),
+        "matched_second_cycle_inputs": all(
+            bool(item["matched_input_sha256"]) for item in results
+        ),
+        "intact_query_succession": intact_count == case_count,
+        "lesion_removes_query_succession": lesion_count < intact_count,
+        "broadcast_edge_removed": all(
+            int(item["intact_target_broadcast_alignment"])
+            > int(item["lesion_target_broadcast_alignment"])
+            for item in results
+        ),
+        "minimum_directional_effect": effect >= 50.0,
+    }
+    return {
+        "schema_version": "eve.gwt4_state_dependent_query_succession.v1",
+        "tested_at": _now(),
+        "design": (
+            "matched sequential module-query intervention against a successful-"
+            "locator reliability baseline with broadcast-to-action coupling lesioned"
+        ),
+        "indicator_id": "GWT-4",
+        "case_count": case_count,
+        "intact_chain_completion_percent": intact_rate,
+        "lesion_chain_completion_percent": lesion_rate,
+        "directional_effect_percent": effect,
+        "cases": results,
+        "checks": checks,
+        "passed": all(checks.values()),
+        "consciousness_proven": False,
+        "resident_autonomous_querying_established": False,
+        "boundary": (
+            "Synthetic evidence for a necessary state-dependent query-selection "
+            "edge only. The evaluator supplied typed module results; minimal "
+            "implementation and phenomenal consciousness remain unestablished."
+        ),
+    }
+
+
 def run_longitudinal_counterfactual_suite(build_inputs: Dict[str, object]) -> Dict[str, object]:
     """Compare recurrent learning with a matched non-recurrent control.
 
@@ -4595,12 +5984,16 @@ def run_longitudinal_counterfactual_suite(build_inputs: Dict[str, object]) -> Di
             completed = complete_cycle(
                 state,
                 actual_process={
+                    "action_id": action_id,
+                    "execution_id": f"synthetic-longitudinal-{index}",
                     "lanes": list(((state.get("predictions") or {}).get("process") or {}).get("lanes") or []),
                     "tools_used": [action_id] if action_id else [],
                     "revision_used": bool(((state.get("predictions") or {}).get("process") or {}).get("needs_revision")),
                 },
                 outcome={
                     "ok": ok,
+                    "observed": True,
+                    "evidence_id": f"synthetic-longitudinal-{index}",
                     "summary": "Alternate source verified the anomaly." if ok else "Repeated probe failed verification again.",
                 },
                 now=f"2026-07-12T22:0{index}:30+00:00",
@@ -4783,13 +6176,62 @@ def run_durable_continuity_suite(build_inputs: Dict[str, object]) -> Dict[str, o
     matched_no_conflict_inputs["conflict_items"] = []
     matched_no_conflict = build_conscious_state(**matched_no_conflict_inputs)
 
-    surprised_homeostasis = copy.deepcopy(build_inputs.get("homeostasis") or {})
-    surprised_homeostasis["regulation_mode"] = "stabilize"
-    pressure_records = surprised_homeostasis.get("pressures") if isinstance(surprised_homeostasis.get("pressures"), list) else []
-    if pressure_records and isinstance(pressure_records[0], dict):
-        pressure_records[0]["level"] = 95
-        pressure_records[0]["trend"] = "rising"
-    surprised_homeostasis["pressures"] = pressure_records
+    expected_interoception = (
+        (short_resume.get("predictions") or {}).get("interoception") or {}
+    )
+    expected_range = expected_interoception.get("expected_arousal_range")
+    if not isinstance(expected_range, list) or len(expected_range) != 2:
+        expected_range = [40, 60]
+    expected_low = _clamp(expected_range[0])
+    expected_high = _clamp(expected_range[1])
+    if expected_low > expected_high:
+        expected_low, expected_high = expected_high, expected_low
+    expected_mode = (
+        _text(expected_interoception.get("expected_regulation_mode"), 40)
+        or _text((build_inputs.get("homeostasis") or {}).get("regulation_mode"), 40)
+        or "steady"
+    )
+    matched_level = int(round((expected_low + expected_high) / 2.0))
+    lower_distance = expected_low
+    upper_distance = 100 - expected_high
+    surprise_level = 0 if lower_distance >= upper_distance else 100
+    surprise_mode = expected_mode
+    if max(lower_distance, upper_distance) <= 0:
+        surprise_mode = "stabilize" if expected_mode != "stabilize" else "orient"
+
+    def regulatory_probe_homeostasis(*, level: int, mode: str) -> Dict[str, object]:
+        probe = copy.deepcopy(build_inputs.get("homeostasis") or {})
+        pressure_records = (
+            probe.get("pressures")
+            if isinstance(probe.get("pressures"), list)
+            else []
+        )
+        normalized_records = [
+            copy.deepcopy(item) for item in pressure_records if isinstance(item, dict)
+        ]
+        if not normalized_records:
+            normalized_records = [
+                {
+                    "id": "evaluator_regulatory_probe",
+                    "label": "evaluator regulatory probe",
+                    "reason": "Matched durable-continuity intervention.",
+                }
+            ]
+        for record in normalized_records:
+            record["level"] = level
+            record["trend"] = "steady"
+        probe["pressures"] = normalized_records
+        probe["regulation_mode"] = mode
+        return probe
+
+    surprised_homeostasis = regulatory_probe_homeostasis(
+        level=surprise_level,
+        mode=surprise_mode,
+    )
+    matched_homeostasis = regulatory_probe_homeostasis(
+        level=matched_level,
+        mode=expected_mode,
+    )
     surprise_inputs = copy.deepcopy(short_resume_inputs)
     surprise_inputs.update(
         {
@@ -4803,6 +6245,7 @@ def run_durable_continuity_suite(build_inputs: Dict[str, object]) -> Dict[str, o
     matched_intero_inputs.update(
         {
             "source": "durability_regulatory_match",
+            "homeostasis": matched_homeostasis,
             "now": "2026-07-12T18:03:30+00:00",
         }
     )
@@ -5037,6 +6480,11 @@ def run_durable_continuity_suite(build_inputs: Dict[str, object]) -> Dict[str, o
     conflicted_goals = (conflicted.get("goals") or {}).get("stack") or []
     surprised_error = int(((surprised.get("interoception") or {}).get("prediction_error") or {}).get("error_magnitude") or 0)
     matched_error = int(((matched_intero.get("interoception") or {}).get("prediction_error") or {}).get("error_magnitude") or 0)
+    surprised_salient_kinds = [
+        _text(item.get("kind"), 80)
+        for item in (surprised.get("perception") or {}).get("salient_inputs") or []
+        if isinstance(item, dict) and item.get("kind")
+    ]
     joined_recurrent = joined.get("recurrent") if isinstance(joined.get("recurrent"), dict) else {}
     joined_learning = joined.get("learning") if isinstance(joined.get("learning"), dict) else {}
     concurrent_open_recurrent = (
@@ -5105,6 +6553,14 @@ def run_durable_continuity_suite(build_inputs: Dict[str, object]) -> Dict[str, o
             ),
             "surprised_error": surprised_error,
             "matched_error": matched_error,
+            "expected_arousal_range": [expected_low, expected_high],
+            "matched_observed_arousal": matched_level,
+            "surprised_observed_arousal": surprise_level,
+            "expected_regulation_mode": expected_mode,
+            "surprised_regulation_mode": surprise_mode,
+            "matched_counterfactual": True,
+            "salient_kinds": surprised_salient_kinds,
+            "inquiry_preserved": "inquiry" in surprised_salient_kinds,
             "winner_kind": ((surprised.get("perception") or {}).get("winning_coalition") or {}).get("kind"),
         },
         "overlap_branch_join": {

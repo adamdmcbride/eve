@@ -1,0 +1,14 @@
+{
+  "schema_id": "eve_daemon_activity.v1",
+  "cycle_id": "fixture-cycle-active",
+  "owner_id": "fixture-owner",
+  "run_mode": "recurrent",
+  "pid": 12345,
+  "status": "active",
+  "cycle_started_at": "2026-09-17T05:20:00+00:00",
+  "last_heartbeat_at": "2026-09-17T05:20:15+00:00",
+  "heartbeat_count": 2,
+  "heartbeat_interval_seconds": 15,
+  "max_active_cycle_seconds": 900,
+  "completed_jobs": []
+}

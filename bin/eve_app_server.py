@@ -4,31 +4,63 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import mimetypes
 import os
 import signal
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+
+RUNTIME_ROOT = Path(__file__).resolve().parents[1]
+if str(RUNTIME_ROOT) not in sys.path:
+    sys.path.insert(0, str(RUNTIME_ROOT))
+
+import eve_http_body
+import eve_http_headers
+import eve_http_json
+import eve_http_path
+import eve_http_query
+import eve_http_security
+import eve_http_server
+from eve_spotlight_projection import build_spotlight_projection
 
 
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_CHAT_MESSAGES = 32
 MAX_MESSAGE_CHARS = 16_000
+MAX_PERSONAL_MESSAGE_ID_CHARS = 160
+MAX_PERSONAL_MESSAGE_BODY_CHARS = 8_000
+MAX_CLIENT_REQUEST_ID_CHARS = 160
 STREAM_CHUNK_BYTES = 64 * 1024
+MAX_PROXY_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_PROXY_ERROR_BYTES = 64 * 1024
+MAX_PRESENCE_RESPONSE_BYTES = 2 * 1024 * 1024
 PRESENCE_CACHE_SECONDS = 8.0
+BACKEND_HEALTH_POSITIVE_CACHE_SECONDS = 12.0
+BACKEND_HEALTH_NEGATIVE_CACHE_SECONDS = 1.0
+MAX_PROJECTION_STATE_BYTES = 256 * 1024
 SENSORY_APP_ORIGINS = {
     "http://127.0.0.1:3000",
     "http://localhost:3000",
 }
+
+
+class UpstreamResponseError(ValueError):
+    """The local backend response cannot safely cross the Eve.app boundary."""
+
+
+class UpstreamResponseTooLarge(UpstreamResponseError):
+    """The local backend response exceeded its admitted byte budget."""
 
 
 def _compact_text(value: object, limit: int = 320) -> str:
@@ -90,6 +122,30 @@ def normalize_chat_messages(messages: object) -> list[dict[str, str]]:
     if normalized[-1]["role"] != "user":
         raise ValueError("the final message must be from the user")
     return normalized
+
+
+def read_bounded_response(response: Any, *, max_bytes: int, label: str) -> bytes:
+    """Read one non-stream upstream response without trusting its size header."""
+
+    raw_length = response.headers.get("Content-Length") if response.headers else None
+    declared_length: int | None = None
+    if raw_length not in (None, ""):
+        try:
+            declared_length = int(raw_length)
+        except (TypeError, ValueError) as exc:
+            raise UpstreamResponseError(f"{label} returned an invalid Content-Length") from exc
+        if declared_length < 0 or declared_length > max_bytes:
+            raise UpstreamResponseTooLarge(
+                f"{label} exceeded the {max_bytes}-byte response limit"
+            )
+    data = response.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise UpstreamResponseTooLarge(
+            f"{label} exceeded the {max_bytes}-byte response limit"
+        )
+    if declared_length is not None and len(data) != declared_length:
+        raise UpstreamResponseError(f"{label} ended before its declared Content-Length")
+    return data
 
 
 def build_presence_snapshot(monitor: dict[str, Any]) -> dict[str, Any]:
@@ -191,6 +247,53 @@ def build_presence_snapshot(monitor: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _read_projection_json(path: Path) -> dict[str, Any]:
+    try:
+        if path.stat().st_size > MAX_PROJECTION_STATE_BYTES:
+            return {}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _read_projection_action_tail(path: Path, *, limit: int = 24) -> list[dict[str, Any]]:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            start = max(0, size - MAX_PROJECTION_STATE_BYTES)
+            handle.seek(start)
+            data = handle.read(MAX_PROJECTION_STATE_BYTES)
+    except OSError:
+        return []
+    if start:
+        first_newline = data.find(b"\n")
+        data = data[first_newline + 1 :] if first_newline >= 0 else b""
+    records: list[dict[str, Any]] = []
+    for raw_line in data.splitlines()[-max(1, limit) :]:
+        try:
+            item = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(item, dict):
+            records.append(item)
+    return records
+
+
+def build_spotlight_monitor_from_runtime_state(state_dir: Path) -> dict[str, Any]:
+    """Read only the bounded canonical state needed for the derived index."""
+
+    return {
+        "workspace": _read_projection_json(state_dir / "global_workspace.json"),
+        "homeostasis": _read_projection_json(state_dir / "homeostasis.json"),
+        "autonomy": {"agenda": _read_projection_json(state_dir / "autonomy_agenda.json")},
+        "operations": {
+            "actions": _read_projection_action_tail(state_dir / "action_executions.jsonl")
+        },
+    }
+
+
 def detach_from_launcher() -> None:
     """Keep the loopback UI alive after its short-lived launcher exits."""
     if hasattr(signal, "SIGHUP"):
@@ -203,40 +306,107 @@ def detach_from_launcher() -> None:
         pass
 
 
-class EveAppHTTPServer(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
+class EveAppHTTPServer(eve_http_server.EveBoundedThreadingHTTPServer):
+    internal_error_surface = "eve-app"
     static_root: Path
     backend_base: str
-    presence_cache: dict[str, Any] | None = None
-    presence_cache_at: float = 0.0
+    config_path: Path = RUNTIME_ROOT / ".eve" / "config.json"
+    runtime_state_dir: Path = RUNTIME_ROOT / ".eve"
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.presence_cache: dict[str, Any] | None = None
+        self.presence_cache_at = 0.0
+        self._backend_health_cache: bool | None = None
+        self._backend_health_cache_at = 0.0
+        self._backend_health_lock = threading.Lock()
+
+    def record_backend_health(self, available: bool, *, now: float | None = None) -> None:
+        observed_at = time.monotonic() if now is None else float(now)
+        with self._backend_health_lock:
+            self._backend_health_cache = bool(available)
+            self._backend_health_cache_at = observed_at
+
+    def cached_backend_health(self, *, now: float | None = None) -> bool | None:
+        observed_at = time.monotonic() if now is None else float(now)
+        with self._backend_health_lock:
+            available = self._backend_health_cache
+            observed_health_at = self._backend_health_cache_at
+        if available is None:
+            return None
+        ttl = (
+            BACKEND_HEALTH_POSITIVE_CACHE_SECONDS
+            if available
+            else BACKEND_HEALTH_NEGATIVE_CACHE_SECONDS
+        )
+        age = max(0.0, observed_at - observed_health_at)
+        return available if age <= ttl else None
 
 
-class EveAppHandler(BaseHTTPRequestHandler):
+class EveAppHandler(eve_http_server.EveBoundedHTTPRequestHandler):
     server: EveAppHTTPServer
+    server_version = "EveApp/1.0"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, format_string: str, *args: object) -> None:
-        # Never log request bodies, query values, or conversation text.
-        path = urllib.parse.urlsplit(self.path).path
+        # Never log request lines, query values, bodies, or conversation text.
+        # JSON string encoding escapes terminal controls without inventing a
+        # second logging dependency for this small local surface.
+        def field(value: object, limit: int = 512) -> str:
+            raw = str(value or "")
+            if len(raw) > limit:
+                raw = raw[:limit] + "..."
+            return json.dumps(raw, ensure_ascii=True)
+
+        raw_target = str(getattr(self, "path", ""))
+        raw_path = raw_target.split("?", 1)[0].split("#", 1)[0]
+        try:
+            path = eve_http_path.require_request_path(raw_path)
+        except ValueError:
+            path = "<invalid>"
+        status = str(args[1]) if len(args) >= 2 and str(args[1]).isdigit() else "-"
+        client_host = self.client_address[0] if self.client_address else ""
         sys.stderr.write(
-            f"eve-app {self.client_address[0]} {self.command} {path} "
-            + (format_string % args)
-            + "\n"
+            "eve-app request"
+            f" client={field(client_host, 128)}"
+            f" method={field(getattr(self, 'command', ''), 24)}"
+            f" path={field(path)}"
+            f" status={field(status, 8)}\n"
         )
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
-        parsed = urllib.parse.urlsplit(self.path)
-        if parsed.path == "/health":
+        target = self._admit_target(self.path)
+        if target is None:
+            return
+        if not self._admit_query(target.query):
+            return
+        path = target.path
+        try:
+            message_id = eve_http_path.match_route_segment(
+                path,
+                prefix="/api/messages/",
+                label="Message id",
+            )
+            thread_id = eve_http_path.match_route_segment(
+                path,
+                prefix="/api/thread/",
+                label="Thread id",
+            )
+        except ValueError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/health":
+            backend_ok = self._backend_available()
             self._send_json(
                 {
-                    "ok": True,
+                    "ok": backend_ok,
                     "surface": "eve-app",
-                    "backend_ok": self._backend_available(),
-                }
+                    "backend_ok": backend_ok,
+                },
+                status=HTTPStatus.OK if backend_ok else HTTPStatus.SERVICE_UNAVAILABLE,
             )
             return
-        if parsed.path == "/api/status":
+        if path == "/api/status":
             backend_ok = self._backend_available()
             self._send_json(
                 {
@@ -248,19 +418,23 @@ class EveAppHandler(BaseHTTPRequestHandler):
                 status=HTTPStatus.OK if backend_ok else HTTPStatus.SERVICE_UNAVAILABLE,
             )
             return
-        if parsed.path == "/api/presence":
+        if path == "/api/presence":
             self._handle_presence()
             return
-        if parsed.path == "/v1/models":
-            self._proxy("GET", parsed.path)
+        if path == "/api/eve-chat/spotlight-projection":
+            self._handle_spotlight_projection()
             return
-        if parsed.path == "/api/eve-chat/followups":
-            suffix = parsed.path
-            if parsed.query:
-                suffix += f"?{parsed.query}"
+        if path == "/v1/models":
+            self._proxy("GET", path)
+            return
+        if path == "/api/eve-chat/followups":
+            suffix = path
+            if target.query:
+                suffix += f"?{target.query}"
             self._proxy("GET", suffix)
             return
         live_read_routes = {
+            "/api/eve-app/snapshot",
             "/api/messages",
             "/api/thoughts",
             "/api/activity",
@@ -269,66 +443,112 @@ class EveAppHandler(BaseHTTPRequestHandler):
             "/api/reply-progress",
             "/api/sensory/status",
         }
-        message_parts = parsed.path.strip("/").split("/")
-        is_message_read = (
-            len(message_parts) == 3
-            and message_parts[0] == "api"
-            and message_parts[1] == "messages"
-            and bool(message_parts[2])
-        )
-        if parsed.path in live_read_routes or parsed.path.startswith("/api/thread/") or is_message_read:
-            suffix = parsed.path
-            if parsed.query:
-                suffix += f"?{parsed.query}"
+        dynamic_path = None
+        if message_id is not None:
+            dynamic_path = eve_http_path.build_route_path(
+                prefix="/api/messages/",
+                segment=message_id,
+                label="Message id",
+            )
+        elif thread_id is not None:
+            dynamic_path = eve_http_path.build_route_path(
+                prefix="/api/thread/",
+                segment=thread_id,
+                label="Thread id",
+            )
+        if path in live_read_routes or dynamic_path is not None:
+            suffix = dynamic_path or path
+            if target.query:
+                suffix += f"?{target.query}"
             self._proxy("GET", suffix)
             return
-        if parsed.path.startswith("/api/") or parsed.path.startswith("/v1/"):
+        if path.startswith("/api/") or path.startswith("/v1/"):
             self._send_json({"ok": False, "error": "Not found"}, status=HTTPStatus.NOT_FOUND)
             return
-        self._serve_static(parsed.path)
+        self._serve_static(path)
 
     def do_HEAD(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
-        parsed = urllib.parse.urlsplit(self.path)
-        if parsed.path.startswith("/api/") or parsed.path.startswith("/v1/") or parsed.path == "/health":
+        target = self._admit_target(self.path, head_only=True)
+        if target is None:
+            return
+        if target.path.startswith("/api/") or target.path.startswith("/v1/") or target.path == "/health":
             self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
             self.send_header("Content-Length", "0")
+            self.send_eve_private_response_headers()
             self.end_headers()
             return
-        self._serve_static(parsed.path, head_only=True)
+        self._serve_static(target.path, head_only=True)
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
-        parsed = urllib.parse.urlsplit(self.path)
-        if parsed.path == "/api/chat":
+        target = self._admit_target(self.path, close_on_rejection=True)
+        if target is None:
+            return
+        if not self._admit_query(target.query, close_on_rejection=True):
+            return
+        path = target.path
+        try:
+            message_id = eve_http_path.match_route_segment(
+                path,
+                prefix="/api/messages/",
+                suffix="/mark",
+                label="Message id",
+            )
+            followup_id = eve_http_path.match_route_segment(
+                path,
+                prefix="/api/eve-chat/followups/",
+                suffix="/seen",
+                label="Follow-up id",
+            )
+        except ValueError as exc:
+            self.close_connection = True
+            self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if not self._enforce_json_mutation_request():
+            return
+        if path == "/api/chat":
             self._handle_chat()
             return
-        if parsed.path == "/api/message/reply":
+        if path == "/api/message/reply":
             self._handle_personal_reply()
             return
-        if parsed.path.startswith("/api/messages/") and parsed.path.endswith("/mark"):
-            parts = parsed.path.strip("/").split("/")
-            if len(parts) == 4 and parts[0] == "api" and parts[1] == "messages" and parts[3] == "mark":
-                try:
-                    self._discard_request_body()
-                except ValueError as exc:
-                    self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                    return
-                self._proxy(
-                    "POST",
-                    parsed.path,
-                    body=b'{"status":"read"}',
-                    headers={"Content-Type": "application/json", "Accept": "application/json"},
-                )
-                return
-        if parsed.path.startswith("/api/eve-chat/followups/") and parsed.path.endswith("/seen"):
+        if message_id is not None:
             try:
                 self._discard_request_body()
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
-            self._proxy("POST", parsed.path, body=b"{}")
+            self._proxy(
+                "POST",
+                eve_http_path.build_route_path(
+                    prefix="/api/messages/",
+                    segment=message_id,
+                    suffix="/mark",
+                    label="Message id",
+                ),
+                body=b'{"status":"read"}',
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+            )
             return
-        if parsed.path in {"/api/sensory/session", "/api/sensory/events"}:
-            origin = str(self.headers.get("Origin") or "").strip()
+        if followup_id is not None:
+            try:
+                self._discard_request_body()
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._proxy(
+                "POST",
+                eve_http_path.build_route_path(
+                    prefix="/api/eve-chat/followups/",
+                    segment=followup_id,
+                    suffix="/seen",
+                    label="Follow-up id",
+                ),
+                body=b"{}",
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+            )
+            return
+        if path in {"/api/sensory/session", "/api/sensory/events"}:
+            origin = str(getattr(self, "_validated_mutation_origin", ""))
             if origin not in SENSORY_APP_ORIGINS:
                 try:
                     self._discard_request_body()
@@ -346,7 +566,7 @@ class EveAppHandler(BaseHTTPRequestHandler):
                 return
             self._proxy(
                 "POST",
-                parsed.path,
+                path,
                 body=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
                 headers={
                     "Content-Type": "application/json",
@@ -355,7 +575,96 @@ class EveAppHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        self.close_connection = True
         self._send_json({"ok": False, "error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+
+    def _admit_target(
+        self,
+        target: str,
+        *,
+        close_on_rejection: bool = False,
+        head_only: bool = False,
+    ) -> eve_http_path.HTTPRequestTarget | None:
+        try:
+            parsed = eve_http_path.parse_request_target(target)
+        except ValueError as exc:
+            if close_on_rejection:
+                self.close_connection = True
+            if head_only:
+                self.send_response(HTTPStatus.BAD_REQUEST)
+                self.send_header("Content-Length", "0")
+                self.send_eve_private_response_headers()
+                self.end_headers()
+            else:
+                self._send_json(
+                    {"ok": False, "error": str(exc)},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+            return None
+        return parsed
+
+    def _admit_query(self, query_string: str, *, close_on_rejection: bool = False) -> bool:
+        try:
+            eve_http_query.BoundedQuery.parse(query_string)
+        except ValueError as exc:
+            if close_on_rejection:
+                self.close_connection = True
+            self._send_json(
+                {"ok": False, "error": str(exc)},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return False
+        return True
+
+    def _record_internal_error(self, error: BaseException, *, operation: str) -> str:
+        return eve_http_server.record_http_internal_error(
+            error,
+            surface="eve-app",
+            operation=operation,
+        )
+
+    def _enforce_json_mutation_request(self) -> bool:
+        try:
+            origin = eve_http_headers.optional_ascii_header(
+                self.headers,
+                "Origin",
+                maximum_characters=512,
+            )
+            sec_fetch_site = eve_http_headers.optional_ascii_header(
+                self.headers,
+                "Sec-Fetch-Site",
+                maximum_characters=32,
+            )
+            content_type = eve_http_headers.optional_ascii_header(
+                self.headers,
+                "Content-Type",
+                maximum_characters=256,
+            )
+        except eve_http_headers.RequestHeaderError as exc:
+            self.close_connection = True
+            self._send_json(
+                {"ok": False, "error": str(exc)},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return False
+        decision = eve_http_security.evaluate_json_mutation_request(
+            origin=origin,
+            sec_fetch_site=sec_fetch_site,
+            content_type=content_type,
+            server_port=int(self.server.server_address[1]),
+            extra_origins=SENSORY_APP_ORIGINS,
+        )
+        if decision.allowed:
+            self._validated_mutation_origin = origin
+            return True
+        # The body is untrusted and may be arbitrarily large. Close rather than
+        # draining it into the next keep-alive request boundary.
+        self.close_connection = True
+        self._send_json(
+            {"ok": False, "error": decision.message},
+            status=decision.status,
+        )
+        return False
 
     def _handle_chat(self) -> None:
         try:
@@ -364,23 +673,28 @@ class EveAppHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
 
-        chat_id = str(payload.get("chat_id") or "").strip()
         try:
-            messages = normalize_chat_messages(payload.get("messages"))
-        except ValueError as exc:
-            self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-            return
-        if not chat_id or len(chat_id) > 160:
-            self._send_json(
-                {"ok": False, "error": "chat_id is required"},
-                status=HTTPStatus.BAD_REQUEST,
+            chat_id = eve_http_headers.require_ascii_field_value(
+                payload.get("chat_id"),
+                label="chat_id",
+                maximum_characters=160,
+                allow_empty=False,
             )
+            messages = normalize_chat_messages(payload.get("messages"))
+            user_message_id = eve_http_headers.require_ascii_field_value(
+                payload.get("user_message_id"),
+                label="user_message_id",
+                maximum_characters=160,
+            )
+            stream = eve_http_json.boolean_field(payload, "stream", default=True)
+        except (ValueError, eve_http_headers.RequestHeaderError) as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
 
         upstream_payload = {
             "model": "eve",
             "messages": messages,
-            "stream": bool(payload.get("stream", True)),
+            "stream": stream,
         }
         body = json.dumps(upstream_payload, ensure_ascii=False).encode("utf-8")
         headers = {
@@ -388,10 +702,9 @@ class EveAppHandler(BaseHTTPRequestHandler):
             "Accept": "text/event-stream, application/json",
             "X-OpenWebUI-Chat-Id": chat_id,
         }
-        user_message_id = str(payload.get("user_message_id") or "").strip()
         if user_message_id:
-            headers["X-OpenWebUI-User-Message-Id"] = user_message_id[:160]
-        self._proxy("POST", "/v1/chat/completions", body=body, headers=headers, stream=True)
+            headers["X-OpenWebUI-User-Message-Id"] = user_message_id
+        self._proxy("POST", "/v1/chat/completions", body=body, headers=headers, stream=stream)
 
     def _handle_personal_reply(self) -> None:
         try:
@@ -399,18 +712,36 @@ class EveAppHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
-        message_id = str(payload.get("message_id") or "").strip()
-        body_text = str(payload.get("body") or "").strip()
-        if not message_id or not body_text:
+        try:
+            message_id = eve_http_json.text_field(
+                payload,
+                "message_id",
+                maximum_characters=MAX_PERSONAL_MESSAGE_ID_CHARS,
+                required=True,
+            )
+            body_text = eve_http_json.text_field(
+                payload,
+                "body",
+                label="Message body",
+                maximum_characters=MAX_PERSONAL_MESSAGE_BODY_CHARS,
+                required=True,
+                multiline=True,
+            )
+            client_request_id = eve_http_json.text_field(
+                payload,
+                "client_request_id",
+                maximum_characters=MAX_CLIENT_REQUEST_ID_CHARS,
+            )
+        except ValueError as exc:
             self._send_json(
-                {"ok": False, "error": "message_id and body are required"},
+                {"ok": False, "error": str(exc)},
                 status=HTTPStatus.BAD_REQUEST,
             )
             return
         upstream_payload = {
-            "message_id": message_id[:160],
-            "body": body_text[:8000],
-            "client_request_id": str(payload.get("client_request_id") or "")[:160],
+            "message_id": message_id,
+            "body": body_text,
+            "client_request_id": client_request_id,
         }
         self._proxy(
             "POST",
@@ -421,33 +752,39 @@ class EveAppHandler(BaseHTTPRequestHandler):
         )
 
     def _read_json_body(self) -> dict[str, Any]:
-        raw_length = self.headers.get("Content-Length", "0")
         try:
-            length = int(raw_length)
-        except ValueError as exc:
-            raise ValueError("Invalid Content-Length") from exc
-        if length <= 0 or length > MAX_REQUEST_BYTES:
-            raise ValueError("Request body is empty or too large")
+            raw = eve_http_body.read_bounded_request_body(
+                self.rfile,
+                self.headers,
+                maximum_bytes=MAX_REQUEST_BYTES,
+            )
+        except eve_http_body.RequestBodyFramingError:
+            self.close_connection = True
+            raise
         try:
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
             raise ValueError("Request body must be valid JSON") from exc
         if not isinstance(payload, dict):
             raise ValueError("Request body must be a JSON object")
         return payload
 
     def _discard_request_body(self) -> None:
-        raw_length = self.headers.get("Content-Length", "0")
         try:
-            length = int(raw_length)
-        except ValueError as exc:
-            raise ValueError("Invalid Content-Length") from exc
-        if length < 0 or length > MAX_REQUEST_BYTES:
-            raise ValueError("Request body is too large")
-        if length:
-            self.rfile.read(length)
+            eve_http_body.read_bounded_request_body(
+                self.rfile,
+                self.headers,
+                maximum_bytes=MAX_REQUEST_BYTES,
+                allow_empty=True,
+            )
+        except eve_http_body.RequestBodyFramingError:
+            self.close_connection = True
+            raise
 
     def _backend_available(self) -> bool:
+        cached = self.server.cached_backend_health()
+        if cached is not None:
+            return cached
         request = urllib.request.Request(
             f"{self.server.backend_base}/v1/models",
             headers={"Accept": "application/json"},
@@ -455,9 +792,11 @@ class EveAppHandler(BaseHTTPRequestHandler):
         )
         try:
             with urllib.request.urlopen(request, timeout=1.5) as response:
-                return 200 <= response.status < 300
+                available = 200 <= response.status < 300
         except (urllib.error.URLError, TimeoutError, OSError):
-            return False
+            available = False
+        self.server.record_backend_health(available)
+        return available
 
     def _handle_presence(self) -> None:
         now = time.monotonic()
@@ -473,8 +812,23 @@ class EveAppHandler(BaseHTTPRequestHandler):
         )
         try:
             with urllib.request.urlopen(request, timeout=6) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+                payload = json.loads(
+                    read_bounded_response(
+                        response,
+                        max_bytes=MAX_PRESENCE_RESPONSE_BYTES,
+                        label="Eve's compact monitor",
+                    ).decode("utf-8")
+                )
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            UpstreamResponseError,
+            http.client.HTTPException,
+        ):
+            self.server.record_backend_health(False)
             self._send_json(
                 {"ok": False, "error": "Eve's current presence is temporarily unavailable."},
                 status=HTTPStatus.BAD_GATEWAY,
@@ -483,6 +837,7 @@ class EveAppHandler(BaseHTTPRequestHandler):
 
         monitor = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(monitor, dict):
+            self.server.record_backend_health(False)
             self._send_json(
                 {"ok": False, "error": "Eve's current presence could not be read."},
                 status=HTTPStatus.BAD_GATEWAY,
@@ -490,9 +845,34 @@ class EveAppHandler(BaseHTTPRequestHandler):
             return
 
         presence = build_presence_snapshot(monitor)
+        self.server.record_backend_health(True)
         self.server.presence_cache = presence
         self.server.presence_cache_at = now
         self._send_json({"ok": True, "data": presence})
+
+    def _handle_spotlight_projection(self) -> None:
+        try:
+            config = json.loads(self.server.config_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            config = {}
+        approval_source = str(config.get("spotlight_projection_approval_source") or "").strip()
+        if config.get("spotlight_projection_enabled") is not True or not approval_source:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "The derived Spotlight projection is not approved in Eve's runtime config.",
+                },
+                status=HTTPStatus.FORBIDDEN,
+            )
+            return
+
+        monitor = build_spotlight_monitor_from_runtime_state(self.server.runtime_state_dir)
+        projection = build_spotlight_projection(
+            monitor,
+            approved=True,
+            approval_source=approval_source,
+        )
+        self._send_json(projection)
 
     def _proxy(
         self,
@@ -512,7 +892,33 @@ class EveAppHandler(BaseHTTPRequestHandler):
                 timeout=timeout if timeout is not None else (180 if stream else 15),
             )
         except urllib.error.HTTPError as exc:
-            error_body = exc.read()
+            self.server.record_backend_health(exc.code < 500)
+            try:
+                error_body = read_bounded_response(
+                    exc,
+                    max_bytes=MAX_PROXY_ERROR_BYTES,
+                    label="Eve's local runtime error",
+                )
+            except UpstreamResponseTooLarge:
+                error_body = b'{"ok":false,"error":"Eve backend returned an oversized error"}'
+            except (UpstreamResponseError, OSError, http.client.HTTPException):
+                error_body = b'{"ok":false,"error":"Eve backend returned an unreadable error"}'
+            finally:
+                exc.close()
+            if exc.code >= 500:
+                error_id = self._record_internal_error(
+                    exc,
+                    operation="backend_http",
+                )
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "Eve's local runtime could not complete the request.",
+                        "error_id": error_id,
+                    },
+                    status=HTTPStatus.BAD_GATEWAY,
+                )
+                return
             self._send_bytes(
                 error_body or b'{"ok":false,"error":"Eve backend rejected the request"}',
                 status=exc.code,
@@ -520,20 +926,28 @@ class EveAppHandler(BaseHTTPRequestHandler):
             )
             return
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            reason = getattr(exc, "reason", exc)
+            self.server.record_backend_health(False)
+            error_id = self._record_internal_error(
+                exc,
+                operation="backend_transport",
+            )
             self._send_json(
-                {"ok": False, "error": f"Eve's local runtime is unavailable: {reason}"},
+                {
+                    "ok": False,
+                    "error": "Eve's local runtime is temporarily unavailable.",
+                    "error_id": error_id,
+                },
                 status=HTTPStatus.BAD_GATEWAY,
             )
             return
 
         with response:
             content_type = response.headers.get("Content-Type", "application/octet-stream")
-            self.send_response(response.status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
             if stream:
+                self.server.record_backend_health(True)
+                self.send_response(response.status)
+                self.send_header("Content-Type", content_type)
+                self.send_eve_private_response_headers()
                 self.send_header("Connection", "close")
                 self.end_headers()
                 try:
@@ -549,7 +963,41 @@ class EveAppHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 return
 
-            response_body = response.read()
+            try:
+                response_body = read_bounded_response(
+                    response,
+                    max_bytes=MAX_PROXY_RESPONSE_BYTES,
+                    label="Eve's local runtime",
+                )
+            except UpstreamResponseTooLarge:
+                self.server.record_backend_health(True)
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "Eve's local runtime returned more data than this app route admits.",
+                    },
+                    status=HTTPStatus.BAD_GATEWAY,
+                )
+                return
+            except (UpstreamResponseError, OSError, http.client.HTTPException) as exc:
+                self.server.record_backend_health(False)
+                error_id = self._record_internal_error(
+                    exc,
+                    operation="backend_response",
+                )
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "Eve's local runtime returned an incomplete response.",
+                        "error_id": error_id,
+                    },
+                    status=HTTPStatus.BAD_GATEWAY,
+                )
+                return
+            self.server.record_backend_health(True)
+            self.send_response(response.status)
+            self.send_header("Content-Type", content_type)
+            self.send_eve_private_response_headers()
             self.send_header("Content-Length", str(len(response_body)))
             self.end_headers()
             self.wfile.write(response_body)
@@ -580,20 +1028,9 @@ class EveAppHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type or "application/octet-stream")
         self.send_header("Content-Length", str(len(data)))
-        # The app is installed and upgraded in place; stale WebKit assets would
-        # leave the user looking at an older Eve after a successful rebuild.
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Permissions-Policy", "camera=(self), geolocation=(), microphone=(self)")
-        self.send_header(
-            "Content-Security-Policy",
-            "default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; "
-            "style-src 'self'; script-src 'self'; media-src 'self' blob:; frame-src 'none'; "
-            "frame-ancestors 'none'; form-action 'self'; base-uri 'none'",
-        )
+        # Stale WebKit assets would leave the user looking at an older Eve
+        # after a successful rebuild, so the shared policy remains no-store.
+        self.send_eve_document_security_headers(allow_sensory=True)
         self.end_headers()
         if not head_only:
             self.wfile.write(data)
@@ -609,10 +1046,7 @@ class EveAppHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_eve_private_response_headers()
         self.end_headers()
         try:
             self.wfile.write(data)

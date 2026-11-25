@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from unittest import mock
@@ -612,9 +613,12 @@ class SensoryAttentionTests(unittest.TestCase):
                 ],
             ),
             mock.patch.object(eve.eve_db, "read_events", return_value=[]),
+            tempfile.TemporaryDirectory() as lab,
         ):
+            # Keep the fly body hermetic: an empty lab dir reads as unavailable, so the
+            # assertion below does not depend on whether the live lab is running.
             observations = eve.collect_runtime_sensory_events(
-                eve.DEFAULT_CONFIG,
+                {**eve.DEFAULT_CONFIG, "fly_lab_path": lab},
                 prefer_runtime=False,
                 now=now,
             )
@@ -626,7 +630,11 @@ class SensoryAttentionTests(unittest.TestCase):
 
     def test_runtime_collector_does_not_replay_an_old_human_turn_as_perception(self):
         now = datetime(2026, 8, 23, 13, 0, tzinfo=timezone.utc)
+        # The collector also reads the fly body's live status file under fly_lab_path
+        # (default ~/Documents/eve-fly). Point it at an empty temp dir so the body reads
+        # as unavailable instead of whatever the live lab is doing right now.
         with (
+            tempfile.TemporaryDirectory() as lab,
             mock.patch.object(
                 eve,
                 "read_lived_messages",
@@ -646,7 +654,7 @@ class SensoryAttentionTests(unittest.TestCase):
             mock.patch.object(eve.eve_db, "read_events", return_value=[]),
         ):
             observations = eve.collect_runtime_sensory_events(
-                {"sensory_attention_window_seconds": 180},
+                {"sensory_attention_window_seconds": 180, "fly_lab_path": lab},
                 prefer_runtime=False,
                 now=now,
             )

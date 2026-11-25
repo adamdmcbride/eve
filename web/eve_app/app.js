@@ -53,6 +53,10 @@
   let statusChecked = false;
   let recognition = null;
   let recognitionDraft = "";
+  let nativeSpeechAvailable = false;
+  let nativeSpeechListening = false;
+  let nativeSpeechStartRequested = false;
+  let nativeIndexRefreshRequested = false;
   let lastRenderedConversationId = "";
   let liveRefreshHasNewContent = false;
   let liveRefreshInFlight = false;
@@ -1537,10 +1541,69 @@
     window.speechSynthesis.speak(utterance);
   }
 
+  function nativeMessageHandler(name) {
+    return window.webkit?.messageHandlers?.[name] || null;
+  }
+
+  function postNativeMessage(name, payload) {
+    const handler = nativeMessageHandler(name);
+    if (!handler || typeof handler.postMessage !== "function") return false;
+    handler.postMessage(payload);
+    return true;
+  }
+
+  function finishVoiceInput(detail = "") {
+    nativeSpeechListening = false;
+    nativeSpeechStartRequested = false;
+    elements.mic.classList.remove("listening");
+    setStatus(
+      backendReady ? "ready" : "offline",
+      backendReady ? presenceStatusLabel() : "Reconnecting",
+      detail || currentStatusDetail()
+    );
+    elements.prompt.focus();
+  }
+
+  function startBrowserRecognition() {
+    if (!recognition) {
+      finishVoiceInput("Voice input is unavailable on this Mac");
+      return;
+    }
+    try {
+      recognition.start();
+    } catch (_) {
+      finishVoiceInput("Voice input could not start");
+    }
+  }
+
+  function startVoiceInput() {
+    recognitionDraft = elements.prompt.value.trim();
+    nativeSpeechStartRequested = true;
+    if (
+      nativeSpeechAvailable &&
+      postNativeMessage("eveNativeSpeech", { action: "start", locale: "en-US" })
+    ) {
+      elements.mic.classList.add("listening");
+      setStatus("busy", "Listening", "Preparing local speech recognition");
+      return;
+    }
+    startBrowserRecognition();
+  }
+
+  function stopVoiceInput() {
+    nativeSpeechStartRequested = false;
+    if (nativeSpeechListening || (nativeSpeechAvailable && elements.mic.classList.contains("listening"))) {
+      postNativeMessage("eveNativeSpeech", { action: "stop", locale: "en-US" });
+      finishVoiceInput();
+      return;
+    }
+    if (recognition && elements.mic.classList.contains("listening")) recognition.stop();
+  }
+
   function configureRecognition() {
     const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!Recognition) {
-      elements.mic.hidden = true;
+      elements.mic.hidden = !nativeMessageHandler("eveNativeSpeech");
       return;
     }
     recognition = new Recognition();
@@ -1549,6 +1612,7 @@
     recognition.lang = "en-US";
     recognition.onstart = () => {
       recognitionDraft = elements.prompt.value.trim();
+      nativeSpeechStartRequested = false;
       elements.mic.classList.add("listening");
       setStatus("busy", "Listening", "");
     };
@@ -1561,22 +1625,117 @@
       updateComposer();
     };
     recognition.onend = () => {
-      elements.mic.classList.remove("listening");
-      setStatus(
-        backendReady ? "ready" : "offline",
-        backendReady ? presenceStatusLabel() : "Reconnecting",
-        currentStatusDetail()
-      );
-      elements.prompt.focus();
+      finishVoiceInput();
     };
     recognition.onerror = () => {
-      elements.mic.classList.remove("listening");
-      setStatus(
-        backendReady ? "ready" : "offline",
-        backendReady ? presenceStatusLabel() : "Reconnecting",
-        "Voice input stopped"
-      );
+      finishVoiceInput("Voice input stopped");
     };
+  }
+
+  function configureNativeBridges() {
+    window.EveNativeSpeech = {
+      receive(event) {
+        const type = String(event?.type || "");
+        if (type === "availability") {
+          nativeSpeechAvailable = event?.available === true;
+          elements.mic.hidden = !nativeSpeechAvailable && !recognition;
+          return;
+        }
+        if (type === "state") {
+          const state = String(event?.state || "");
+          if (state === "preparing" || state === "listening") {
+            nativeSpeechListening = true;
+            elements.mic.classList.add("listening");
+            setStatus("busy", state === "listening" ? "Listening" : "Getting ready", "Local speech stays on this Mac");
+          } else if (state === "idle") {
+            finishVoiceInput();
+          }
+          return;
+        }
+        if (type === "transcript") {
+          const transcript = String(event?.text || "").trim();
+          elements.prompt.value = [recognitionDraft, transcript].filter(Boolean).join(" ");
+          updateComposer();
+          scheduleDraftSave();
+          return;
+        }
+        if (type === "fallback") {
+          const shouldFallback = nativeSpeechStartRequested;
+          nativeSpeechListening = false;
+          nativeSpeechStartRequested = false;
+          elements.mic.classList.remove("listening");
+          if (shouldFallback) startBrowserRecognition();
+          return;
+        }
+        if (type === "error") {
+          finishVoiceInput(String(event?.error || "Voice input stopped"));
+        }
+      },
+      status() {
+        return postNativeMessage("eveNativeSpeech", { action: "status", locale: "en-US" });
+      },
+      start() {
+        startVoiceInput();
+      },
+      stop() {
+        stopVoiceInput();
+      },
+      cancel() {
+        postNativeMessage("eveNativeSpeech", { action: "cancel", locale: "en-US" });
+        finishVoiceInput();
+      },
+    };
+
+    window.EveNativeIntelligence = {
+      receive(event) {
+        window.dispatchEvent(new CustomEvent("eve-native-intelligence", { detail: event }));
+      },
+      status() {
+        return postNativeMessage("eveNativeIntelligence", { action: "status" });
+      },
+      run(task, input) {
+        const allowed = new Set(["classify", "extract", "observe", "summarize"]);
+        const taskName = String(task || "");
+        const text = String(input || "");
+        if (!allowed.has(taskName) || !text.trim()) return false;
+        return postNativeMessage("eveNativeIntelligence", {
+          action: "run",
+          task: taskName,
+          input: text.slice(0, 12000),
+        });
+      },
+      cancel() {
+        return postNativeMessage("eveNativeIntelligence", { action: "cancel" });
+      },
+    };
+
+    window.EveNativeIndex = {
+      receive(event) {
+        window.dispatchEvent(new CustomEvent("eve-native-index", { detail: event }));
+        if (
+          event?.type === "availability" &&
+          event?.available === true &&
+          !nativeIndexRefreshRequested
+        ) {
+          nativeIndexRefreshRequested = true;
+          postNativeMessage("eveNativeIndex", { action: "refresh" });
+        }
+      },
+      status() {
+        return postNativeMessage("eveNativeIndex", { action: "status" });
+      },
+      refresh() {
+        nativeIndexRefreshRequested = true;
+        return postNativeMessage("eveNativeIndex", { action: "refresh" });
+      },
+      clear() {
+        return postNativeMessage("eveNativeIndex", { action: "clear" });
+      },
+    };
+
+    window.EveNativeSpeech.status();
+    window.EveNativeIntelligence.status();
+    window.EveNativeIndex.status();
   }
 
   function sensoryStatus(text, error = false) {
@@ -2088,6 +2247,21 @@
     }
   }
 
+  function validatedLiveSnapshot(payload) {
+    if (!payload || payload.schema !== "eve_app_snapshot.v1") {
+      throw new Error("Eve returned an incompatible live snapshot");
+    }
+    for (const key of ["personal_messages", "thoughts", "activity", "reflections"]) {
+      if (!Array.isArray(payload[key])) {
+        throw new Error(`Eve's live snapshot is missing ${key}`);
+      }
+    }
+    if (!payload.followups || !Array.isArray(payload.followups.items)) {
+      throw new Error("Eve's live snapshot is missing follow-ups");
+    }
+    return payload;
+  }
+
   function eventTimestamp(item) {
     const value = item?.timestamp || item?.created_at || item?.updated_at;
     const parsed = Date.parse(value || "");
@@ -2281,36 +2455,30 @@
   }
 
   async function refreshLiveStream() {
-    if (liveRefreshInFlight) return;
+    if (liveRefreshInFlight) return true;
     liveRefreshInFlight = true;
     const live = ensureLiveConversation();
     try {
-      // Eve's local backend shares resources with her model lanes. Keep one
-      // light refresh in flight and avoid a five-request burst every poll.
-      const personalMessages = await fetchLiveData(
-        "/api/messages?limit=30&sender=eve&recipient=user&personal=1"
+      // One bounded snapshot replaces six independent ledger requests and the
+      // separate follow-up poll. Presence remains a small derived app contract.
+      const snapshot = validatedLiveSnapshot(
+        await fetchLiveData("/api/eve-app/snapshot")
       );
-      const thoughts = await fetchLiveData("/api/thoughts?limit=24");
-      const activity = await fetchLiveData("/api/activity?limit=50");
-      const reflections = await fetchLiveData("/api/reflections?limit=5");
+      const personalMessages = snapshot.personal_messages;
+      const thoughts = snapshot.thoughts;
+      const activity = snapshot.activity;
+      const reflections = snapshot.reflections;
+      const personalStatus = snapshot.personal_status || null;
+      const followupItems = snapshot.followups.items;
+      const connectionRecovered = !backendReady;
+      backendReady = true;
+      statusChecked = true;
       const presence = await fetchLiveData("/api/presence").catch(() => null);
-      const personalStatus = await fetchLiveData("/api/personal-conversation/status");
       const previousPresence = JSON.stringify(livePresence);
+      const previousPersonalStatus = JSON.stringify(live.personalStatus || null);
       if (presence && typeof presence === "object") livePresence = presence;
       const presenceChanged = previousPresence !== JSON.stringify(livePresence);
       syncVisualState();
-      if (
-        presenceChanged &&
-        statusChecked &&
-        !isSending &&
-        !elements.mic.classList.contains("listening")
-      ) {
-        setStatus(
-          backendReady ? "ready" : "offline",
-          backendReady ? presenceStatusLabel() : "Reconnecting",
-          currentStatusDetail()
-        );
-      }
       const now = Date.now();
       const threeDaysAgo = now - 3 * 24 * 60 * 60 * 1000;
       const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000;
@@ -2411,11 +2579,20 @@
       live.messages = nextMessages;
       live.pendingReadMessageIds = unreadIds;
       live.personalStatus = personalStatus || null;
+      const personalStatusChanged = previousPersonalStatus !== JSON.stringify(live.personalStatus);
+      const followupsChanged = await consumeFollowups(followupItems);
       if (changed) {
         live.updatedAt = Date.now();
       }
-      if (changed || unreadChanged) {
+      if (changed || unreadChanged || personalStatusChanged) {
         saveStore();
+      }
+      if (
+        (connectionRecovered || presenceChanged || personalStatusChanged) &&
+        !isSending &&
+        !elements.mic.classList.contains("listening")
+      ) {
+        setStatus("ready", presenceStatusLabel(), currentStatusDetail());
       }
       const newestProactive = newSourceItems
         .filter((message) => message.proactive && message.unread)
@@ -2424,15 +2601,24 @@
       if (newestProactive && settings.speakReplies) speakReply(newestProactive.content);
       if (
         store.activeId === LIVE_CONVERSATION_ID &&
-        (changed || presenceChanged || !elements.transcript.children.length)
+        (
+          changed ||
+          presenceChanged ||
+          personalStatusChanged ||
+          followupsChanged ||
+          !elements.transcript.children.length
+        )
       ) {
         liveRefreshHasNewContent = newSourceItems.length > 0;
         render({ newLiveContent: liveRefreshHasNewContent });
         liveRefreshHasNewContent = false;
+      } else if (followupsChanged) {
+        render();
       }
       if (store.activeId === LIVE_CONVERSATION_ID) markVisiblePersonalMessagesRead();
       settleLiveLaunchAtLatest();
       liveFailureCount = 0;
+      if (connectionRecovered) void recoverInterruptedReplies();
       return true;
     } catch (error) {
       liveFailureCount += 1;
@@ -2447,12 +2633,44 @@
   function scheduleBackgroundRefresh(delay = 0) {
     if (livePollTimer) window.clearTimeout(livePollTimer);
     livePollTimer = window.setTimeout(async () => {
-      await refreshLiveStream();
-      await pollFollowups();
+      const refreshed = await refreshLiveStream();
+      if (!refreshed) {
+        await refreshStatus();
+        await pollFollowups();
+      }
       const normalDelay = document.hidden ? 60000 : 10000;
       const backoff = Math.min(120000, normalDelay * Math.max(1, 2 ** liveFailureCount));
       scheduleBackgroundRefresh(backoff);
     }, Math.max(0, delay));
+  }
+
+  async function consumeFollowups(items) {
+    let changed = false;
+    for (const item of items) {
+      const followupId = String(item.id || "");
+      const chatId = String(item.openwebui_chat_id || "");
+      const conversation = store.conversations.find((entry) => entry.id === chatId);
+      if (!followupId || !conversation) continue;
+      if (!conversation.messages.some((message) => message.sourceId === followupId)) {
+        conversation.messages.push({
+          id: id("eve-followup"),
+          role: "assistant",
+          content: String(item.delivery_text || item.failure_reason || "I finished the follow-up."),
+          createdAt: Date.now(),
+          sourceId: followupId,
+          error: String(item.status || "") === "failed",
+        });
+        conversation.updatedAt = Date.now();
+        changed = true;
+      }
+      await fetch(`/api/eve-chat/followups/${encodeURIComponent(followupId)}/seen`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      }).catch(() => {});
+    }
+    if (changed) saveStore();
+    return changed;
   }
 
   async function pollFollowups() {
@@ -2463,37 +2681,9 @@
       );
       if (!response.ok) return;
       const payload = await response.json();
-      const items = payload?.data?.items || [];
-      let changed = false;
-      for (const item of items) {
-        const followupId = String(item.id || "");
-        const chatId = String(item.openwebui_chat_id || "");
-        const conversation = store.conversations.find((entry) => entry.id === chatId);
-        if (!followupId || !conversation) continue;
-        if (!conversation.messages.some((message) => message.sourceId === followupId)) {
-          conversation.messages.push({
-            id: id("eve-followup"),
-            role: "assistant",
-            content: String(item.delivery_text || item.failure_reason || "I finished the follow-up."),
-            createdAt: Date.now(),
-            sourceId: followupId,
-            error: String(item.status || "") === "failed",
-          });
-          conversation.updatedAt = Date.now();
-          changed = true;
-        }
-        await fetch(`/api/eve-chat/followups/${encodeURIComponent(followupId)}/seen`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: "{}",
-        }).catch(() => {});
-      }
-      if (changed) {
-        saveStore();
-        render();
-      }
+      if (await consumeFollowups(payload?.data?.items || [])) render();
     } catch (_) {
-      // Follow-ups are optional; normal chat remains usable if polling is unavailable.
+      // Failure fallback only; the normal live snapshot carries follow-ups.
     }
   }
 
@@ -2533,9 +2723,8 @@
     if (!settings.speakReplies && "speechSynthesis" in window) window.speechSynthesis.cancel();
   });
   elements.mic.addEventListener("click", () => {
-    if (!recognition) return;
-    if (elements.mic.classList.contains("listening")) recognition.stop();
-    else recognition.start();
+    if (elements.mic.classList.contains("listening")) stopVoiceInput();
+    else startVoiceInput();
   });
   elements.sensesToggle.addEventListener("click", () => toggleSensoryPanel());
   elements.sensesClose.addEventListener("click", () => toggleSensoryPanel(false));
@@ -2567,7 +2756,6 @@
     }
   });
   window.addEventListener("online", () => {
-    refreshStatus();
     scheduleBackgroundRefresh(0);
   });
   window.addEventListener("offline", () => {
@@ -2601,11 +2789,9 @@
   ensureConversation();
   honorLaunchView();
   configureRecognition();
+  configureNativeBridges();
   setSensoryControlsActive(false);
   render();
-  refreshStatus();
-  void recoverInterruptedReplies();
   scheduleBackgroundRefresh(0);
-  setInterval(refreshStatus, 30000);
   setInterval(setDaypart, 300000);
 })();

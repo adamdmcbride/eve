@@ -1,0 +1,29 @@
+...F.sE...
+======================================================================
+ERROR: test_transport_retries (tests.test_llama_transport.LlamaTransportTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/example/Eve/tests/test_llama_transport.py", line 40, in test_transport_retries
+    raise RuntimeError("boom")
+RuntimeError: boom
+
+======================================================================
+FAIL: test_budget_default (tests.test_cognition_budget.CognitionBudgetTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/example/Eve/tests/test_cognition_budget.py", line 12, in test_budget_default
+    self.assertEqual(1, 2)
+AssertionError: 1 != 2
+
+======================================================================
+FAIL: test_subtest_case (tests.test_mind_tick.MindTickTests) [lane=fast]
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/example/Eve/tests/test_mind_tick.py", line 99, in test_subtest_case
+    self.assertTrue(False)
+AssertionError: False is not true
+
+----------------------------------------------------------------------
+Ran 10 tests in 1.234s
+
+FAILED (failures=2, errors=1, skipped=1)

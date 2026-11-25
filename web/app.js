@@ -409,7 +409,7 @@ function bubbleTemplate(message) {
 }
 
 async function loadThread(threadId, subject = null) {
-  const thread = await api(`/api/thread/${threadId}`);
+  const thread = await api(`/api/thread/${encodeURIComponent(threadId)}`);
   const latestMessage = thread[thread.length - 1];
   const summary = state.threads.find((item) => item.thread_id === threadId);
 
@@ -561,11 +561,11 @@ nodes.threadSearchInput.addEventListener("input", () => {
 
 nodes.archiveThreadBtn.addEventListener("click", async () => {
   if (!state.selectedThreadId) return;
-  const thread = await api(`/api/thread/${state.selectedThreadId}`);
+  const thread = await api(`/api/thread/${encodeURIComponent(state.selectedThreadId)}`);
   const userMessages = thread.filter((message) => message.recipient === "user" && message.status !== "archived");
   await Promise.all(
     userMessages.map((message) =>
-      api(`/api/messages/${message.id}/mark`, {
+      api(`/api/messages/${encodeURIComponent(message.id)}/mark`, {
         method: "POST",
         body: JSON.stringify({ status: "archived" }),
       })

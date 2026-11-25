@@ -20,6 +20,48 @@ def load_memory_embedding_helper():
 
 
 class MemoryEmbeddingHelperTests(unittest.TestCase):
+    def test_optional_evidence_metadata_survives_mixed_legacy_rows(self) -> None:
+        helper = load_memory_embedding_helper()
+        notes = [{"id": "legacy", "text": "old schema"}, {"id": "current", "text": "new schema",
+                 "observed_at": "2026-10-01T00:00:00Z", "supersedes": ["previous"], "status": "active"}]
+        rows, lance = helper.build_rows(notes, [[1.0], [1.0]])
+        self.assertEqual(set(lance[0]), set(lance[1]))
+        self.assertEqual(["previous"], helper.base_match_from_item(lance[1])["supersedes"])
+        self.assertEqual("active", helper.base_match_from_item(rows[1])["status"])
+        self.assertEqual("invalid_metadata", helper.base_match_from_item({"evidence_metadata": "broken"})["status"])
+
+    def test_embedding_count_dimensions_and_finiteness_are_hard_gates(self) -> None:
+        helper = load_memory_embedding_helper()
+        notes = [{"id": "one"}, {"id": "two"}]
+        for vectors in ([[1.0]], [[1.0], [1.0, 2.0]], [[], []],
+                        [[float("nan")], [1.0]], [[float("inf")], [1.0]], [[True], [1.0]]):
+            with self.subTest(vectors=vectors), self.assertRaises(ValueError):
+                helper.build_rows(notes, vectors)
+        rows, lance = helper.build_rows(notes, [[1.0, 0.0], [0.0, 1.0]])
+        self.assertEqual(2, len(rows))
+        self.assertEqual(["one", "two"], [row["id"] for row in lance])
+
+    def test_invalid_json_embedding_keeps_previous_index(self) -> None:
+        helper = load_memory_embedding_helper()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "index.json"
+            output.write_text("previous index")
+            with self.assertRaises(ValueError):
+                helper.build_json_index(output, {}, [{"embedding": [float("nan")]}],
+                                        model_name="candidate", query_mode="vector")
+            self.assertEqual("previous index", output.read_text())
+            self.assertEqual(["index.json"], [p.name for p in output.parent.iterdir()])
+
+    def test_json_index_replaces_only_after_complete_serialization(self) -> None:
+        helper = load_memory_embedding_helper()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "index.json"
+            output.write_text("previous index")
+            result = helper.build_json_index(output, {"notes_hash": "synthetic"},
+                       [{"id": "one", "embedding": [1.0, 0.0]}], model_name="candidate", query_mode="vector")
+            self.assertEqual(result, json.loads(output.read_text()))
+            self.assertEqual(["index.json"], [p.name for p in output.parent.iterdir()])
+
     def test_lancedb_build_uses_supported_unified_fts_index_api(self) -> None:
         helper = load_memory_embedding_helper()
         create_index_calls: list[tuple[tuple, dict]] = []

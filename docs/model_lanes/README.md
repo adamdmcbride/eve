@@ -1,14 +1,14 @@
 # Eve Model Lane Living Specs
 
 Status: canonical
-Last reviewed: 2026-08-23
+Last reviewed: 2026-10-17
 Current authority: yes
 Supersedes: none
 Superseded by: none
 
 Date: 2026-04-24
 
-This directory is the living source of truth for what each of Eve's five logical model-lane faculties is supposed to do. The current runtime maps them to three resident substrates, but logical function and physical model topology are separate decisions. Use these files before changing prompts, adding bakeoff probes, evaluating candidates, or promoting a model.
+This directory is the living source of truth for what each of Eve's five logical model-lane faculties is supposed to do. The current user-authorized resource-saving runtime maps all five to one Qwen3.8 resident substrate, but logical function and physical model topology are separate decisions. Use these files before changing prompts, adding bakeoff probes, evaluating candidates, or promoting a model.
 
 The central resource and history ledger remains [../FIVE_LANE_MODEL_EVAL_AND_RESOURCE_BUDGET.md](../ARCHITECTURE.md#logical-modes-and-physical-substrates). These lane files explain the intent deeply enough that tests can be written against them and refined over time.
 
@@ -37,15 +37,15 @@ The user-facing reply path now uses a reply council admission layer before full 
 
 Non-lane support substrates are documented separately in [../SPECIALIST_SUBSTRATES.md](../ARCHITECTURE.md#organ-boundaries). Memory retrieval, coding/self-repair, and frontier/API lab work may support the five lanes, but they should not become a sixth always-on chat lane.
 
-Provider boundary: Eve's live local provider is `llama.cpp` with five named logical contracts on three resident substrates. This is a physical deployment choice, not a doctrine that any number of weight sets is intrinsically conscious. Hosted/non-local providers such as OpenAI, Anthropic, Bedrock, Gemini, OpenRouter, Groq, Together, or similar require the user's explicit permission before use and must name the provider, model, purpose, and data boundary. Lack of hosted login means that capability is unavailable; it does not justify silently leaving the local `llama.cpp` stack.
+Provider boundary: Eve's live local provider is `llama.cpp` with five named logical contracts on one shared Qwen3.8 substrate under the October 17 resource override. This is a physical deployment choice, not a doctrine that any number of weight sets is intrinsically conscious. Hosted/non-local providers such as OpenAI, Anthropic, Bedrock, Gemini, OpenRouter, Groq, Together, or similar require the user's explicit permission before use and must name the provider, model, purpose, and data boundary. Lack of hosted login means that capability is unavailable; it does not justify silently leaving the local `llama.cpp` stack.
 
 | Lane | Living spec | Current model | Suite |
 | --- | --- | --- | --- |
-| `fast` | [fast.md](fast.md) | Gemma 3 4B Q4 | `fast` |
+| `fast` | [fast.md](fast.md) | shared Qwen3.8-27B UD-Q4_K_XL | `fast` |
 | `deep` | [deep.md](deep.md) | Qwen3.8-27B UD-Q4_K_XL | `deep` |
-| `observer` | [observer.md](observer.md) | Qwen3.5-9B UD-Q4_K_XL | `observer` |
-| `planner` | [planner.md](planner.md) | shared Qwen3.5-9B UD-Q4_K_XL | `planner` |
-| `relationship` | [relationship.md](relationship.md) | Gemma 3 4B Q4 | `relationship` |
+| `observer` | [observer.md](observer.md) | shared Qwen3.8-27B UD-Q4_K_XL | `observer` |
+| `planner` | [planner.md](planner.md) | shared Qwen3.8-27B UD-Q4_K_XL | `planner` |
+| `relationship` | [relationship.md](relationship.md) | shared Qwen3.8-27B UD-Q4_K_XL | `relationship` |
 
 ## How To Use These Specs
 

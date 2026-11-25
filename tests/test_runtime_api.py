@@ -7,6 +7,7 @@ import unittest
 import zipfile
 import io
 import tarfile
+from email.message import Message
 from http import HTTPStatus
 from typing import Optional
 from datetime import datetime, timedelta, timezone
@@ -49,6 +50,57 @@ class EveWebSecurityTests(unittest.TestCase):
         foreign = HeaderCapture("https://example.com")
         eve_web.EveAppHandler.send_cors_headers(foreign)
         self.assertEqual([], foreign.sent)
+
+    def test_json_reader_rejects_oversized_and_negative_lengths_before_reading(self):
+        request = type(
+            "Request",
+            (),
+            {
+                "headers": {"Content-Length": "9"},
+                "rfile": io.BytesIO(b"{}"),
+            },
+        )()
+        with self.assertRaisesRegex(ValueError, "too large"):
+            eve_web.EveAppHandler.read_json_body(request, maximum_bytes=8)
+        self.assertEqual(0, request.rfile.tell())
+        self.assertTrue(request.close_connection)
+
+        request.headers["Content-Length"] = "-1"
+        with self.assertRaisesRegex(ValueError, "Invalid Content-Length"):
+            eve_web.EveAppHandler.read_json_body(request)
+        self.assertEqual(0, request.rfile.tell())
+
+    def test_json_reader_rejects_an_incomplete_declared_body_and_closes(self):
+        request = type(
+            "Request",
+            (),
+            {
+                "headers": {"Content-Length": "3"},
+                "rfile": io.BytesIO(b"{}"),
+                "close_connection": False,
+            },
+        )()
+
+        with self.assertRaisesRegex(ValueError, "2 of 3 declared bytes"):
+            eve_web.EveAppHandler.read_json_body(request)
+
+        self.assertTrue(request.close_connection)
+
+    def test_json_reader_reports_invalid_utf8_as_a_client_error(self):
+        request = type(
+            "Request",
+            (),
+            {
+                "headers": {"Content-Length": "1"},
+                "rfile": io.BytesIO(b"\xff"),
+                "close_connection": False,
+            },
+        )()
+
+        with self.assertRaisesRegex(ValueError, "Invalid JSON body"):
+            eve_web.EveAppHandler.read_json_body(request)
+
+        self.assertFalse(request.close_connection)
 
 
 class GovernanceService(CountingService):
@@ -293,7 +345,11 @@ class InProcessPostHandler(InProcessGetHandler):
         headers: Optional[dict[str, str]] = None,
     ):
         raw = json.dumps(payload).encode("utf-8")
-        merged_headers = {"Host": "eve-main.local:8787", "Content-Length": str(len(raw))}
+        merged_headers = {
+            "Host": "eve-main.local:8787",
+            "Content-Length": str(len(raw)),
+            "Content-Type": "application/json",
+        }
         if headers:
             merged_headers.update(headers)
         super().__init__(server=server, path=path, headers=merged_headers)
@@ -309,6 +365,7 @@ def issue_get(
     static_dir: Path,
     host: str = "eve-main.local:8787",
     port: int = 8787,
+    advertised_host: Optional[str] = "eve-main.local",
     headers: Optional[dict[str, str]] = None,
 ):
     server = eve_web.create_server(
@@ -316,6 +373,7 @@ def issue_get(
         port=port,
         service=service,
         static_dir=static_dir,
+        advertised_host=advertised_host,
         bind_and_activate=False,
     )
     try:
@@ -339,6 +397,7 @@ def issue_post(
     static_dir: Path,
     host: str = "eve-main.local:8787",
     port: int = 8787,
+    advertised_host: Optional[str] = "eve-main.local",
     headers: Optional[dict[str, str]] = None,
 ):
     server = eve_web.create_server(
@@ -346,6 +405,7 @@ def issue_post(
         port=port,
         service=service,
         static_dir=static_dir,
+        advertised_host=advertised_host,
         bind_and_activate=False,
     )
     try:
@@ -366,7 +426,378 @@ def issue_post(
         server.server_close()
 
 
+class MutationBoundaryHTTPTests(unittest.TestCase):
+    def test_runtime_static_and_json_responses_apply_local_privacy_headers(self):
+        service = CountingService()
+        with TemporaryDirectory() as temp_dir:
+            static_dir = prepare_static_dir(Path(temp_dir))
+            status, headers, body, _ = issue_get(
+                "/",
+                service=service,
+                static_dir=static_dir,
+            )
+
+            self.assertEqual(HTTPStatus.OK, status)
+            self.assertEqual(b"<html></html>", body)
+            self.assertEqual("no-store", headers["Cache-Control"])
+            self.assertEqual("nosniff", headers["X-Content-Type-Options"])
+            self.assertEqual("no-referrer", headers["Referrer-Policy"])
+            self.assertEqual("DENY", headers["X-Frame-Options"])
+            self.assertEqual(
+                "camera=(), geolocation=(), microphone=()",
+                headers["Permissions-Policy"],
+            )
+            self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
+
+            status, headers, _, _ = issue_get(
+                "/api/status",
+                service=service,
+                static_dir=static_dir,
+            )
+            self.assertEqual(HTTPStatus.OK, status)
+            self.assertEqual("no-store", headers["Cache-Control"])
+            self.assertEqual("nosniff", headers["X-Content-Type-Options"])
+            self.assertEqual("no-referrer", headers["Referrer-Policy"])
+
+    def test_runtime_api_blocks_foreign_browser_origin_before_mutation(self):
+        service = CountingService()
+        with TemporaryDirectory() as temp_dir, patch.object(
+            service,
+            "wake_eve_if_needed",
+            return_value={"awake": True},
+        ) as wake:
+            status, _, body, _ = issue_post(
+                "/api/actions/wake",
+                {},
+                service=service,
+                static_dir=prepare_static_dir(Path(temp_dir)),
+                headers={"Origin": "https://untrusted.example"},
+            )
+
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertFalse(json.loads(body)["ok"])
+        self.assertIn("local Eve app origin", json.loads(body)["error"])
+        wake.assert_not_called()
+
+    def test_runtime_api_rejects_cors_safelisted_text_plain_json(self):
+        service = CountingService()
+        with TemporaryDirectory() as temp_dir, patch.object(
+            service,
+            "wake_eve_if_needed",
+            return_value={"awake": True},
+        ) as wake:
+            status, _, body, _ = issue_post(
+                "/api/actions/wake",
+                {},
+                service=service,
+                static_dir=prepare_static_dir(Path(temp_dir)),
+                headers={"Content-Type": "text/plain"},
+            )
+
+        self.assertEqual(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, status)
+        self.assertIn("application/json", json.loads(body)["error"])
+        wake.assert_not_called()
+
+    def test_runtime_api_rejects_duplicate_consumed_header_before_mutation(self):
+        service = CountingService()
+        with TemporaryDirectory() as temp_dir, patch.object(
+            service,
+            "wake_eve_if_needed",
+            return_value={"awake": True},
+        ) as wake:
+            server = eve_web.create_server(
+                host="127.0.0.1",
+                port=8787,
+                service=service,
+                static_dir=prepare_static_dir(Path(temp_dir)),
+                advertised_host="eve-main.local",
+                bind_and_activate=False,
+            )
+            try:
+                handler = InProcessPostHandler(
+                    server=server,
+                    path="/api/actions/wake",
+                    payload={},
+                )
+                headers = Message()
+                headers.add_header("Content-Length", "2")
+                headers.add_header("Content-Type", "application/json")
+                headers.add_header("Origin", "http://localhost:8787")
+                headers.add_header("Origin", "http://localhost:8787")
+                handler.headers = headers
+
+                handler.do_POST()
+
+                self.assertEqual(HTTPStatus.BAD_REQUEST, handler.response_status)
+                self.assertTrue(handler.close_connection)
+                self.assertEqual(0, handler.rfile.tell())
+                self.assertIn("Multiple Origin", handler.wfile.getvalue().decode("utf-8"))
+            finally:
+                server.server_close()
+        wake.assert_not_called()
+
+    def test_runtime_api_blocks_cross_site_fetch_metadata_without_origin(self):
+        service = CountingService()
+        with TemporaryDirectory() as temp_dir, patch.object(
+            service,
+            "wake_eve_if_needed",
+            return_value={"awake": True},
+        ) as wake:
+            status, _, _, _ = issue_post(
+                "/api/actions/wake",
+                {},
+                service=service,
+                static_dir=prepare_static_dir(Path(temp_dir)),
+                headers={"Sec-Fetch-Site": "cross-site"},
+            )
+
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        wake.assert_not_called()
+
+    def test_runtime_api_allows_declared_eve_app_origin_with_json(self):
+        service = CountingService()
+        with TemporaryDirectory() as temp_dir, patch.object(
+            service,
+            "wake_eve_if_needed",
+            return_value={"awake": True},
+        ) as wake:
+            status, _, body, _ = issue_post(
+                "/api/actions/wake",
+                {},
+                service=service,
+                static_dir=prepare_static_dir(Path(temp_dir)),
+                headers={
+                    "Origin": "http://127.0.0.1:3000",
+                    "Sec-Fetch-Site": "same-site",
+                },
+            )
+
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertTrue(json.loads(body)["ok"])
+        wake.assert_called_once_with()
+
+    def test_runtime_rejected_post_query_closes_before_mutation_dispatch(self):
+        service = CountingService()
+        with TemporaryDirectory() as temp_dir, patch.object(
+            service,
+            "wake_eve_if_needed",
+            return_value={"awake": True},
+        ) as wake:
+            server = eve_web.create_server(
+                host="127.0.0.1",
+                port=8787,
+                service=service,
+                static_dir=prepare_static_dir(Path(temp_dir)),
+                bind_and_activate=False,
+            )
+            try:
+                handler = InProcessPostHandler(
+                    server=server,
+                    path="/api/actions/wake?broken-field",
+                    payload={},
+                )
+                handler.do_POST()
+                payload = json.loads(handler.wfile.getvalue())
+            finally:
+                server.server_close()
+
+        self.assertEqual(HTTPStatus.BAD_REQUEST, handler.response_status)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(handler.close_connection)
+        wake.assert_not_called()
+
+    def test_runtime_dynamic_routes_are_exact_bounded_and_percent_decoded(self):
+        service = CountingService()
+        with TemporaryDirectory() as temp_dir:
+            static_dir = prepare_static_dir(Path(temp_dir))
+            with (
+                patch.object(service, "open_message", return_value={"id": "message/one"}) as open_message,
+                patch.object(service, "thread_messages", return_value=[]) as thread_messages,
+            ):
+                message_status, _, message_body, _ = issue_get(
+                    "/api/messages/message%2Fone",
+                    service=service,
+                    static_dir=static_dir,
+                )
+                thread_status, _, _, _ = issue_get(
+                    "/api/thread/thread%2Fwith%20space",
+                    service=service,
+                    static_dir=static_dir,
+                )
+                extra_status, _, _, _ = issue_get(
+                    "/api/messages/message-one/extra",
+                    service=service,
+                    static_dir=static_dir,
+                )
+                invalid_status, _, _, _ = issue_get(
+                    "/api/thread/%00",
+                    service=service,
+                    static_dir=static_dir,
+                )
+
+        self.assertEqual(HTTPStatus.OK, message_status)
+        self.assertEqual("message/one", json.loads(message_body)["data"]["id"])
+        self.assertEqual(HTTPStatus.OK, thread_status)
+        self.assertEqual(HTTPStatus.NOT_FOUND, extra_status)
+        self.assertEqual(HTTPStatus.BAD_REQUEST, invalid_status)
+        open_message.assert_called_once_with("message/one")
+        thread_messages.assert_called_once_with("thread/with space")
+
+    def test_runtime_dynamic_mutation_routes_pass_only_the_exact_decoded_id(self):
+        service = CountingService()
+        with TemporaryDirectory() as temp_dir:
+            static_dir = prepare_static_dir(Path(temp_dir))
+            with (
+                patch.object(service, "mark_message", return_value={"id": "message/one"}) as mark_message,
+                patch.object(
+                    service,
+                    "update_proposal_status",
+                    return_value={"id": "proposal/one"},
+                ) as update_proposal,
+                patch.object(
+                    service,
+                    "mark_eve_chat_followup_seen",
+                    return_value={"id": "followup/one", "status": "seen"},
+                ) as mark_followup,
+            ):
+                message_status, _, _, _ = issue_post(
+                    "/api/messages/message%2Fone/mark",
+                    {"status": "read"},
+                    service=service,
+                    static_dir=static_dir,
+                )
+                proposal_status, _, _, _ = issue_post(
+                    "/api/proposals/proposal%2Fone/status",
+                    {"status": "approved"},
+                    service=service,
+                    static_dir=static_dir,
+                )
+                followup_status, _, _, _ = issue_post(
+                    "/api/eve-chat/followups/followup%2Fone/seen",
+                    {},
+                    service=service,
+                    static_dir=static_dir,
+                )
+                extra_status, _, _, _ = issue_post(
+                    "/api/messages/message-one/extra/mark",
+                    {"status": "read"},
+                    service=service,
+                    static_dir=static_dir,
+                )
+
+        self.assertEqual(HTTPStatus.OK, message_status)
+        self.assertEqual(HTTPStatus.OK, proposal_status)
+        self.assertEqual(HTTPStatus.OK, followup_status)
+        self.assertEqual(HTTPStatus.NOT_FOUND, extra_status)
+        mark_message.assert_called_once_with("message/one", status="read")
+        update_proposal.assert_called_once_with("proposal/one", status="approved")
+        mark_followup.assert_called_once_with("followup/one")
+
+    def test_runtime_bodyless_mutation_consumes_json_and_unknown_post_closes(self):
+        service = CountingService()
+        with TemporaryDirectory() as temp_dir, patch.object(
+            service,
+            "wake_eve_if_needed",
+            return_value={"awake": True},
+        ) as wake:
+            server = eve_web.create_server(
+                host="127.0.0.1",
+                port=8787,
+                service=service,
+                static_dir=prepare_static_dir(Path(temp_dir)),
+                bind_and_activate=False,
+            )
+            try:
+                wake_handler = InProcessPostHandler(
+                    server=server,
+                    path="/api/actions/wake",
+                    payload={"compatibility_field": True},
+                )
+                wake_handler.close_connection = False
+                wake_handler.do_POST()
+
+                unknown_handler = InProcessPostHandler(
+                    server=server,
+                    path="/api/not-admitted",
+                    payload={"unread": "body"},
+                )
+                unknown_handler.close_connection = False
+                unknown_handler.do_POST()
+
+                absolute_handler = InProcessPostHandler(
+                    server=server,
+                    path="http://foreign.example/api/actions/wake",
+                    payload={"unread": "body"},
+                )
+                absolute_handler.close_connection = False
+                absolute_handler.do_POST()
+            finally:
+                server.server_close()
+
+        self.assertEqual(HTTPStatus.OK, wake_handler.response_status)
+        self.assertEqual(len(wake_handler.rfile.getvalue()), wake_handler.rfile.tell())
+        self.assertFalse(wake_handler.close_connection)
+        wake.assert_called_once_with()
+        self.assertEqual(HTTPStatus.NOT_FOUND, unknown_handler.response_status)
+        self.assertEqual(0, unknown_handler.rfile.tell())
+        self.assertTrue(unknown_handler.close_connection)
+        self.assertEqual(HTTPStatus.BAD_REQUEST, absolute_handler.response_status)
+        self.assertEqual(0, absolute_handler.rfile.tell())
+        self.assertTrue(absolute_handler.close_connection)
+
+
 class RuntimeServiceTests(unittest.TestCase):
+    def test_eve_app_snapshot_composes_one_bounded_read_model(self):
+        service = eve_web.EveRuntimeService(status_ttl_seconds=60, model_health_ttl_seconds=60)
+        personal_messages = [{"id": "personal-1"}]
+        thoughts = [{"id": "thought-1"}]
+        activity = [{"id": "activity-1"}]
+        reflections = [{"id": "reflection-1"}]
+        personal_status = {"message_id": "personal-1"}
+        followups = {"items": [{"id": "followup-1"}], "count": 1}
+
+        with (
+            patch.object(service, "messages", return_value=personal_messages) as messages,
+            patch.object(service, "thoughts", return_value=thoughts) as read_thoughts,
+            patch.object(service, "activity", return_value=activity) as read_activity,
+            patch.object(service, "reflections", return_value=reflections) as read_reflections,
+            patch.object(
+                service,
+                "personal_conversation_status",
+                return_value=personal_status,
+            ) as read_personal_status,
+            patch.object(service, "eve_chat_followups", return_value=followups) as read_followups,
+            patch.object(eve_web.eve, "utc_now", return_value="2026-08-23T21:00:00+00:00"),
+        ):
+            snapshot = service.eve_app_snapshot()
+
+        self.assertEqual(eve_web.EVE_APP_SNAPSHOT_SCHEMA, snapshot["schema"])
+        self.assertEqual(7, eve_web.API_VERSION)
+        self.assertEqual(eve_web.API_VERSION, snapshot["api_version"])
+        self.assertEqual("2026-08-23T21:00:00+00:00", snapshot["generated_at"])
+        self.assertIs(personal_messages, snapshot["personal_messages"])
+        self.assertIs(thoughts, snapshot["thoughts"])
+        self.assertIs(activity, snapshot["activity"])
+        self.assertIs(reflections, snapshot["reflections"])
+        self.assertIs(personal_status, snapshot["personal_status"])
+        self.assertIs(followups, snapshot["followups"])
+        messages.assert_called_once_with(
+            limit=30,
+            sender="eve",
+            recipient="user",
+            personal=True,
+        )
+        read_thoughts.assert_called_once_with(limit=24)
+        read_activity.assert_called_once_with(limit=50)
+        read_reflections.assert_called_once_with(limit=5)
+        read_personal_status.assert_called_once_with()
+        read_followups.assert_called_once_with(
+            status="delivered,failed",
+            surface="eve_chat_ui",
+            include_seen=False,
+            limit=12,
+        )
+
     def test_reply_preserves_exact_parent_message_and_thread_for_eve_continuity(self):
         service = eve_web.EveRuntimeService(
             status_ttl_seconds=60, model_health_ttl_seconds=60
@@ -654,11 +1085,21 @@ class RuntimeServiceTests(unittest.TestCase):
             bind_and_activate=False,
         )
         try:
+            self.assertEqual(32, server.max_active_requests)
+            self.assertTrue(
+                issubclass(
+                    eve_web.EveAppHandler,
+                    eve_web.eve_http_server.EveBoundedHTTPRequestHandler,
+                )
+            )
             with patch.object(
                 eve_web.sys,
                 "exc_info",
                 return_value=(ConnectionResetError, ConnectionResetError("reset"), None),
-            ), patch.object(eve_web.ThreadingHTTPServer, "handle_error") as parent_handle_error:
+            ), patch.object(
+                eve_web.eve_http_server.EveBoundedThreadingHTTPServer,
+                "handle_error",
+            ) as parent_handle_error:
                 server.handle_error(object(), ("127.0.0.1", 12345))
         finally:
             server.server_close()
@@ -952,6 +1393,7 @@ class RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(False, seen["config_overrides"]["model_governor_context_overflow_enforce"])
         self.assertEqual("eve_chat_ui", seen["message_metadata"]["surface"])
         self.assertEqual("ui_adapter_only", seen["message_metadata"]["authority"])
+
         self.assertIsNone(seen["thread_id"])
         self.assertNotIn("local UI adapter", body)
         self.assertNotIn("hosted service", body)
@@ -972,6 +1414,30 @@ class RuntimeServiceTests(unittest.TestCase):
         self.assertEqual("none", completion["eve"]["provider_dependency"])
         self.assertFalse(completion["eve"]["hosted_provider_used"])
         self.assertEqual("local_placeholder_only", completion["eve"]["api_key_policy"])
+
+    def test_openai_payload_transport_ids_are_bounded_before_persistence(self):
+        with self.assertRaisesRegex(ValueError, "chat id is too long"):
+            eve_web.openai_chat_transport_metadata(
+                {"metadata": {"chat_id": "x" * 161}}
+            )
+        with self.assertRaisesRegex(ValueError, "AG-UI run id must be printable"):
+            eve_web.copilotkit_agui_context(
+                {
+                    "runId": "run\nid",
+                    "messages": [{"role": "user", "content": "hello"}],
+                }
+            )
+        service = eve_web.EveRuntimeService(
+            status_ttl_seconds=60,
+            model_health_ttl_seconds=60,
+        )
+        with self.assertRaisesRegex(ValueError, "model is too long"):
+            service.openai_chat_completion(
+                {
+                    "model": "x" * 81,
+                    "messages": [{"role": "user", "content": "hello"}],
+                }
+            )
 
     def test_openai_chat_completion_propagates_explicit_synthetic_eval_boundary(self):
         service = eve_web.EveRuntimeService(status_ttl_seconds=60, model_health_ttl_seconds=60)
@@ -1668,6 +2134,35 @@ class RuntimeServiceTests(unittest.TestCase):
         self.assertEqual("eve_chat_ui", payload["data"]["items"][0]["surface"])
         self.assertEqual(5, payload["data"]["items"][0]["limit"])
 
+    def test_eve_app_snapshot_endpoint_exposes_versioned_local_read_model(self):
+        service = CountingService()
+        expected = {
+            "schema": eve_web.EVE_APP_SNAPSHOT_SCHEMA,
+            "api_version": eve_web.API_VERSION,
+            "generated_at": "2026-08-23T21:00:00+00:00",
+            "personal_messages": [],
+            "thoughts": [],
+            "activity": [],
+            "reflections": [],
+            "personal_status": {},
+            "followups": {"items": [], "count": 0},
+        }
+        with TemporaryDirectory() as temp_dir:
+            static_dir = prepare_static_dir(Path(temp_dir))
+            with patch.object(service, "eve_app_snapshot", return_value=expected) as snapshot:
+                status, headers, body, _ = issue_get(
+                    "/api/eve-app/snapshot",
+                    service=service,
+                    static_dir=static_dir,
+                    headers={"Origin": "http://127.0.0.1:3000"},
+                )
+
+        payload = json.loads(body)
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("http://127.0.0.1:3000", headers["Access-Control-Allow-Origin"])
+        self.assertEqual(expected, payload["data"])
+        snapshot.assert_called_once_with()
+
     def test_eve_chat_followup_seen_endpoint_marks_card_seen(self):
         service = EveChatFollowupHTTPService()
         with TemporaryDirectory() as temp_dir:
@@ -2128,6 +2623,88 @@ class RuntimeHTTPServerTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["data"], {"sequence": 1})
 
+    def test_unexpected_runtime_errors_return_opaque_ids_without_exception_text(self):
+        service = CountingService()
+        secret = "private machine path and conversation text"
+        log = io.StringIO()
+
+        with TemporaryDirectory() as temp_dir, patch.object(
+            service,
+            "latest_state",
+            side_effect=RuntimeError(secret),
+        ), patch.object(eve_web.eve_http_server.sys, "stderr", log):
+            static_dir = prepare_static_dir(Path(temp_dir))
+            status, _, body, _ = issue_get(
+                "/api/status",
+                service=service,
+                static_dir=static_dir,
+            )
+            payload = json.loads(body)
+
+        self.assertEqual(HTTPStatus.INTERNAL_SERVER_ERROR, status)
+        self.assertEqual("Eve could not complete this request.", payload["error"])
+        self.assertRegex(payload["error_id"], r"^[0-9a-f]{16}$")
+        self.assertNotIn(secret, body.decode("utf-8"))
+        self.assertNotIn(secret, log.getvalue())
+        self.assertIn(payload["error_id"], log.getvalue())
+        self.assertIn("RuntimeError", log.getvalue())
+
+    def test_openai_internal_error_uses_compatible_content_free_envelope(self):
+        service = OpenAICompatHTTPService()
+        secret = "sensitive backend exception"
+        log = io.StringIO()
+
+        with TemporaryDirectory() as temp_dir, patch.object(
+            service,
+            "openai_chat_completion",
+            side_effect=RuntimeError(secret),
+        ), patch.object(eve_web.eve_http_server.sys, "stderr", log):
+            status, _, body, _ = issue_post(
+                "/v1/chat/completions",
+                {"model": "eve", "messages": [{"role": "user", "content": "Hello"}]},
+                service=service,
+                static_dir=prepare_static_dir(Path(temp_dir)),
+            )
+            payload = json.loads(body)
+
+        error = payload["error"]
+        self.assertEqual(HTTPStatus.INTERNAL_SERVER_ERROR, status)
+        self.assertEqual("server_error", error["type"])
+        self.assertEqual("Eve could not complete this request.", error["message"])
+        self.assertRegex(error["eve_error_id"], r"^[0-9a-f]{16}$")
+        self.assertNotIn(secret, body.decode("utf-8"))
+        self.assertNotIn(secret, log.getvalue())
+
+    def test_runtime_query_contract_rejects_ambiguity_and_resource_amplification(self):
+        service = CountingService()
+        cases = (
+            "/api/activity?limit=1&limit=2",
+            "/api/activity?limit=0",
+            "/api/activity?limit=501",
+            "/api/activity?limit=%2B1",
+            "/api/activity?limit=" + ("9" * 30),
+            "/api/monitor?compact=maybe",
+            "/api/thoughts?broken-field",
+            "/api/thoughts?value="
+            + ("a" * (eve_web.eve_http_query.DEFAULT_MAX_QUERY_CHARACTERS + 1)),
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            static_dir = prepare_static_dir(Path(temp_dir))
+            with patch.object(service, "activity") as activity:
+                for path in cases:
+                    with self.subTest(path=path[:100]):
+                        status, _, body, _ = issue_get(
+                            path,
+                            service=service,
+                            static_dir=static_dir,
+                        )
+                        payload = json.loads(body.decode("utf-8"))
+                        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+                        self.assertFalse(payload["ok"])
+
+        activity.assert_not_called()
+
     def test_openai_models_endpoint_uses_injected_service(self):
         service = CountingService()
 
@@ -2160,6 +2737,29 @@ class RuntimeHTTPServerTests(unittest.TestCase):
         self.assertEqual("chat.completion", payload["object"])
         self.assertEqual("Eve is answering through the adapter.", payload["choices"][0]["message"]["content"])
         self.assertEqual("Hello Eve.", service.seen_payloads[0]["messages"][0]["content"])
+
+    def test_openai_transport_headers_are_bounded_and_unambiguous(self):
+        cases = (
+            {"X-OpenWebUI-Chat-Id": "x" * 161},
+            {
+                "X-OpenWebUI-Message-Id": "assistant-one",
+                "X-OpenWebUI-Assistant-Message-Id": "assistant-two",
+            },
+        )
+        for request_headers in cases:
+            service = OpenAICompatHTTPService()
+            with self.subTest(headers=request_headers), TemporaryDirectory() as temp_dir:
+                status, _, body, _ = issue_post(
+                    "/v1/chat/completions",
+                    {"model": "eve", "messages": [{"role": "user", "content": "Hello"}]},
+                    service=service,
+                    static_dir=prepare_static_dir(Path(temp_dir)),
+                    headers=request_headers,
+                )
+
+            self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+            self.assertEqual([], service.seen_payloads)
+            self.assertIn("error", json.loads(body))
 
     def test_openai_chat_completion_stream_endpoint_uses_sse(self):
         service = OpenAICompatHTTPService()
@@ -2217,6 +2817,61 @@ class RuntimeHTTPServerTests(unittest.TestCase):
             "eve_copilotkit_agui_v1",
             service.seen_payloads[0]["metadata"]["protocol"],
         )
+
+    def test_copilotkit_agui_rejects_malformed_consumed_fields_before_dispatch(self):
+        cases = (
+            {"input": [], "prompt": "hello"},
+            {"prompt": 17},
+            {"model": 17, "prompt": "hello"},
+            {"messages": "hello"},
+            {"messages": [{"role": "user", "content": 17}]},
+        )
+        with TemporaryDirectory() as temp_dir:
+            static_dir = prepare_static_dir(Path(temp_dir))
+            for payload in cases:
+                service = CopilotKitAGUIHTTPService()
+                with self.subTest(payload=payload):
+                    status, _, body, _ = issue_post(
+                        "/api/eve-chat/ag-ui",
+                        payload,
+                        service=service,
+                        static_dir=static_dir,
+                        headers={"Origin": "http://127.0.0.1:3000"},
+                    )
+
+                    self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+                    self.assertEqual([], service.seen_payloads)
+                    self.assertFalse(json.loads(body)["ok"])
+
+    def test_copilotkit_agui_internal_error_is_content_free_and_correlatable(self):
+        service = CopilotKitAGUIHTTPService()
+        secret = "private AG-UI model exception"
+        log = io.StringIO()
+
+        with TemporaryDirectory() as temp_dir, patch.object(
+            service,
+            "openai_chat_completion",
+            side_effect=RuntimeError(secret),
+        ), patch.object(eve_web.eve_http_server.sys, "stderr", log):
+            status, _, body, _ = issue_post(
+                "/api/eve-chat/ag-ui",
+                {
+                    "threadId": "chat-agui-error",
+                    "runId": "run-agui-error",
+                    "messages": [{"role": "user", "content": "Test the error boundary."}],
+                },
+                service=service,
+                static_dir=prepare_static_dir(Path(temp_dir)),
+                headers={"Origin": "http://127.0.0.1:3000"},
+            )
+            text = body.decode("utf-8")
+
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertIn('"type": "RUN_ERROR"', text)
+        self.assertIn("Eve could not complete this run.", text)
+        self.assertRegex(text, r'"errorId": "[0-9a-f]{16}"')
+        self.assertNotIn(secret, text)
+        self.assertNotIn(secret, log.getvalue())
 
     def test_governance_endpoint_uses_injected_service(self):
         service = GovernanceService()
@@ -2288,7 +2943,31 @@ class RuntimeHTTPServerTests(unittest.TestCase):
         self.assertEqual(payload["data"]["fitness"]["roadmap"]["status"], "passed")
         self.assertEqual(payload["data"]["conversation_spine"][0]["trace_id"], "trace-thread-1")
 
-    def test_bootstrap_endpoint_uses_inferred_host(self):
+    def test_monitor_stream_internal_error_is_content_free_and_terminal(self):
+        service = CountingService()
+        secret = "private monitor exception and machine path"
+        log = io.StringIO()
+
+        with TemporaryDirectory() as temp_dir, patch.object(
+            service,
+            "monitor_payload",
+            side_effect=RuntimeError(secret),
+        ), patch.object(eve_web.eve_http_server.sys, "stderr", log):
+            status, _, body, _ = issue_get(
+                "/api/monitor/stream?interval_ms=250",
+                service=service,
+                static_dir=prepare_static_dir(Path(temp_dir)),
+            )
+            text = body.decode("utf-8")
+
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertIn("event: error", text)
+        self.assertIn("monitor update is temporarily unavailable", text)
+        self.assertRegex(text, r'"error_id"\s*:\s*"[0-9a-f]{16}"')
+        self.assertNotIn(secret, text)
+        self.assertNotIn(secret, log.getvalue())
+
+    def test_bootstrap_endpoint_uses_server_advertised_host(self):
         service = CountingService()
 
         with TemporaryDirectory() as temp_dir:
@@ -2314,6 +2993,64 @@ class RuntimeHTTPServerTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["data"]["primary_host"], "eve-main.local")
 
+    def test_bootstrap_endpoint_accepts_one_matching_explicit_endpoint(self):
+        service = CountingService()
+
+        with TemporaryDirectory() as temp_dir:
+            static_dir = prepare_static_dir(Path(temp_dir))
+            with patch.object(
+                service,
+                "bootstrap_payload",
+                return_value={"primary_host": "eve-main.local"},
+            ) as bootstrap_payload:
+                status, _, _, _ = issue_get(
+                    "/api/bootstrap?host=EVE-MAIN.LOCAL&api_port=8787&ollama_port=11435",
+                    service=service,
+                    static_dir=static_dir,
+                )
+
+        self.assertEqual(200, status)
+        bootstrap_payload.assert_called_once_with(
+            primary_host="eve-main.local",
+            api_port=8787,
+            ollama_port=11435,
+        )
+
+    def test_artifact_endpoint_query_rejects_ambiguous_or_unsafe_values_before_service(self):
+        service = CountingService()
+        cases = (
+            "/api/bootstrap?host=eve.local%3Bcurl%20bad.example",
+            "/api/bootstrap?host=eve.local&host=attacker.example",
+            "/api/bootstrap?host=attacker.example",
+            "/api/bootstrap?api_port=0",
+            "/api/bootstrap?api_port=9000",
+            "/api/bootstrap?api_port=%2B8787",
+            "/api/bootstrap?ollama_port=999999999999999999999999999999",
+            "/api/update-manifest?host=%3A%3A1",
+            "/api/update-manifest?host=0.0.0.0",
+            "/api/update-manifest?ollama_port=true",
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            static_dir = prepare_static_dir(Path(temp_dir))
+            with (
+                patch.object(service, "bootstrap_payload") as bootstrap_payload,
+                patch.object(service, "update_manifest") as update_manifest,
+            ):
+                for path in cases:
+                    with self.subTest(path=path):
+                        status, _, body, _ = issue_get(
+                            path,
+                            service=service,
+                            static_dir=static_dir,
+                        )
+                        payload = json.loads(body.decode("utf-8"))
+                        self.assertEqual(400, status)
+                        self.assertFalse(payload["ok"])
+
+        bootstrap_payload.assert_not_called()
+        update_manifest.assert_not_called()
+
     def test_code_bundle_endpoint_uses_injected_service(self):
         service = CountingService()
 
@@ -2334,7 +3071,7 @@ class RuntimeHTTPServerTests(unittest.TestCase):
         with zipfile.ZipFile(io.BytesIO(body), "r") as archive:
             self.assertIn("eve.py", archive.namelist())
 
-    def test_update_manifest_endpoint_uses_inferred_host(self):
+    def test_update_manifest_endpoint_uses_server_advertised_host(self):
         service = CountingService()
 
         with TemporaryDirectory() as temp_dir:
@@ -2374,7 +3111,7 @@ class RuntimeHTTPServerTests(unittest.TestCase):
         self.assertEqual(b"PK-test", body)
         self.assertEqual("application/zip", content_type)
 
-    def test_windows_download_script_is_customized_for_request_host(self):
+    def test_windows_download_script_uses_server_advertised_host(self):
         service = CountingService()
 
         with TemporaryDirectory() as temp_dir:
@@ -2387,6 +3124,42 @@ class RuntimeHTTPServerTests(unittest.TestCase):
         self.assertIn("[int]$PrimaryApiPort = 8787", body)
         self.assertIn("Installing Python from the official installer", body)
         self.assertIn("text/plain", content_type)
+
+    def test_request_host_cannot_poison_generated_pages_or_scripts(self):
+        service = CountingService()
+
+        with TemporaryDirectory() as temp_dir:
+            static_dir = prepare_static_dir(Path(temp_dir))
+            _, _, page, _ = issue_get(
+                "/install",
+                service=service,
+                static_dir=static_dir,
+                host="attacker.example:9999",
+                advertised_host="eve-main.local",
+            )
+            _, _, script, _ = issue_get(
+                "/downloads/install_windows_eve.ps1",
+                service=service,
+                static_dir=static_dir,
+                host='attacker.example";Write-Host PWNED;#',
+                advertised_host="eve-main.local",
+            )
+
+        page_text = page.decode("utf-8")
+        script_text = script.decode("utf-8")
+        self.assertIn("http://eve-main.local:8787", page_text)
+        self.assertIn('[string]$PrimaryHost = "eve-main.local"', script_text)
+        self.assertNotIn("attacker.example", page_text)
+        self.assertNotIn("attacker.example", script_text)
+        self.assertNotIn("PWNED", script_text)
+
+    def test_installer_builder_rejects_shell_metacharacters_defensively(self):
+        with self.assertRaisesRegex(ValueError, "primary host"):
+            eve_web.customized_windows_launcher(
+                "install_windows_eve.cmd",
+                "eve.local;curl bad.example",
+                8787,
+            )
 
     def test_windows_launcher_download_targets_primary_host(self):
         service = CountingService()
@@ -2509,6 +3282,154 @@ class RuntimeHTTPServerTests(unittest.TestCase):
         self.assertIn("--use-primary-ollama", script)
         self.assertIn("http://eve-main.local:8787", readme)
         self.assertEqual("application/gzip", content_type)
+
+
+class ConversationMutationSchemaHTTPTests(unittest.TestCase):
+    def test_openai_stream_rejects_permissive_string_booleans_before_dispatch(self):
+        service = OpenAICompatHTTPService()
+        with TemporaryDirectory() as temp_dir:
+            status, _, body, _ = issue_post(
+                "/v1/chat/completions",
+                {
+                    "model": "eve",
+                    "stream": "false",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+                service=service,
+                static_dir=prepare_static_dir(Path(temp_dir)),
+            )
+
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual([], service.seen_payloads)
+        self.assertIn("JSON Boolean", body.decode("utf-8"))
+
+    def test_conversation_mutation_fields_fail_before_service_dispatch(self):
+        cases = (
+            (
+                "/api/message/ask",
+                {"body": "x" * (eve_web.MAX_CONVERSATION_BODY_CHARACTERS + 1)},
+                "ask",
+            ),
+            (
+                "/api/message/ask",
+                {"body": "hello", "attachments": [{}] * 9},
+                "ask",
+            ),
+            (
+                "/api/message/reply",
+                {
+                    "message_id": "message-1",
+                    "body": "hello",
+                    "subject": "x" * (eve_web.MAX_CONVERSATION_SUBJECT_CHARACTERS + 1),
+                },
+                "reply",
+            ),
+            (
+                "/api/message/reply",
+                {"message_id": "message-1", "body": "hello", "attachments": ["bad"]},
+                "reply",
+            ),
+            (
+                "/api/message/initiate",
+                {"allow_none": "false", "notify": True},
+                "initiate_personal_message",
+            ),
+            (
+                "/api/capture",
+                {"kind": "note", "text": "hello", "tags": ["tag"] * 33},
+                "capture",
+            ),
+            (
+                "/api/messages/message-1/mark",
+                {"status": "x" * 65},
+                "mark_message",
+            ),
+            (
+                "/api/proposals/proposal-1/status",
+                {"status": "x" * 65},
+                "update_proposal_status",
+            ),
+        )
+        with TemporaryDirectory() as temp_dir:
+            static_dir = prepare_static_dir(Path(temp_dir))
+            for path, payload, method_name in cases:
+                service = CountingService()
+                with self.subTest(path=path, method=method_name), patch.object(
+                    service,
+                    method_name,
+                ) as mutation:
+                    status, _, body, _ = issue_post(
+                        path,
+                        payload,
+                        service=service,
+                        static_dir=static_dir,
+                    )
+
+                    self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+                    self.assertFalse(json.loads(body)["ok"])
+                    mutation.assert_not_called()
+
+    def test_typed_conversation_values_are_forwarded_without_coercion(self):
+        service = CountingService()
+        with (
+            TemporaryDirectory() as temp_dir,
+            patch.object(
+                service,
+                "initiate_personal_message",
+                return_value={"reply": None, "messages": []},
+            ) as initiate,
+            patch.object(
+                service,
+                "ask",
+                return_value={"thread_id": "thread-1", "reply": {}, "messages": []},
+            ) as ask,
+        ):
+            static_dir = prepare_static_dir(Path(temp_dir))
+            initiate_status, _, _, _ = issue_post(
+                "/api/message/initiate",
+                {"allow_none": False, "notify": True},
+                service=service,
+                static_dir=static_dir,
+            )
+            ask_status, _, _, _ = issue_post(
+                "/api/message/ask",
+                {
+                    "body": "  first\nsecond  ",
+                    "subject": " Question ",
+                    "client_request_id": " request-1 ",
+                    "attachments": [{"id": "attachment-1"}],
+                },
+                service=service,
+                static_dir=static_dir,
+            )
+
+        self.assertEqual(HTTPStatus.OK, initiate_status)
+        self.assertEqual(HTTPStatus.OK, ask_status)
+        initiate.assert_called_once_with(allow_none=False, notify=True)
+        ask.assert_called_once_with(
+            "first\nsecond",
+            subject="Question",
+            client_request_id="request-1",
+            attachments=[{"id": "attachment-1"}],
+        )
+
+    def test_service_layer_defensively_rejects_unbounded_internal_callers(self):
+        service = CountingService()
+        with patch.object(service, "_run_mutation") as mutation:
+            invalid_calls = (
+                lambda: service.ask("x" * (eve_web.MAX_CONVERSATION_BODY_CHARACTERS + 1)),
+                lambda: service.ask("hello", attachments=[{}] * 9),
+                lambda: service.reply("message-1", "hello", subject="x" * 513),
+                lambda: service.initiate_personal_message(allow_none="false"),  # type: ignore[arg-type]
+                lambda: service.capture("note", "hello", ["tag"] * 33),
+                lambda: service.mark_message("x" * 513, "read"),
+                lambda: service.update_proposal_status("x" * 513, "approved"),
+            )
+            for invalid_call in invalid_calls:
+                with self.subTest(call=invalid_call), self.assertRaises(ValueError):
+                    invalid_call()
+
+        mutation.assert_not_called()
 
 
 if __name__ == "__main__":

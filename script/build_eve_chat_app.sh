@@ -25,6 +25,7 @@ mkdir -p "${BUILD_DIR}" "${MACOS_DIR}" "${RESOURCES_DIR}" "${RUNTIME_BIN}"
 cp "${ROOT_DIR}/bin/eve_app_surface.sh" "${RUNTIME_BIN}/eve_app_surface.sh"
 cp "${ROOT_DIR}/bin/eve_app_server.py" "${RUNTIME_BIN}/eve_app_server.py"
 cp "${ROOT_DIR}/bin/eve_chat_backend_server.sh" "${RUNTIME_BIN}/eve_chat_backend_server.sh"
+cp "${ROOT_DIR}/eve_spotlight_projection.py" "${HOME}/.eve_runtime/eve_spotlight_projection.py"
 chmod +x \
   "${RUNTIME_BIN}/eve_app_surface.sh" \
   "${RUNTIME_BIN}/eve_app_server.py" \
@@ -45,18 +46,98 @@ SH
 chmod +x "${HOME}/.eve_runtime/eve_app_surface.sh"
 
 if [[ -d "/Applications/Xcode.app/Contents/Developer" ]]; then
-  SWIFTC=(env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swiftc)
+  XCODE_DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
+  XCRUN=(env DEVELOPER_DIR="${XCODE_DEVELOPER_DIR}" xcrun)
+  SWIFTC=("${XCRUN[@]}" swiftc)
 else
+  XCODE_DEVELOPER_DIR="$(xcode-select -p)"
+  XCRUN=(xcrun)
   SWIFTC=(swiftc)
 fi
 
+TARGET_TRIPLE="$(uname -m)-apple-macos13.0"
+MODULE_CACHE_DIR="${BUILD_DIR}/module-cache"
+mkdir -p "${MODULE_CACHE_DIR}"
 "${SWIFTC[@]}" -parse-as-library -O \
-  -target "$(uname -m)-apple-macos13.0" \
+  -target "${TARGET_TRIPLE}" \
+  -module-cache-path "${MODULE_CACHE_DIR}" \
   -framework SwiftUI \
   -framework AppKit \
   -framework WebKit \
+  -framework Speech \
+  -framework AVFoundation \
+  -framework FoundationModels \
+  -framework AppIntents \
+  -framework CoreSpotlight \
+  -framework CryptoKit \
+  -framework UniformTypeIdentifiers \
   "${ROOT_DIR}/mac/EveChatApp.swift" \
+  "${ROOT_DIR}/mac/EveNativeSpeechBridge.swift" \
+  "${ROOT_DIR}/mac/EveNativeIntelligence.swift" \
+  "${ROOT_DIR}/mac/EveAppIntents.swift" \
   -o "${PRODUCT}"
+
+# App Intents require compile-time constant extraction plus Xcode's metadata
+# processor. A plain swiftc link produces a working app binary but no intent
+# registration, so fail the canonical build if the bounded Open Eve contract is
+# not present in the signed bundle.
+APP_INTENTS_DIR="${BUILD_DIR}/app-intents"
+APP_INTENTS_PROTOCOLS="${APP_INTENTS_DIR}/protocols.json"
+APP_INTENTS_CONSTANTS="${APP_INTENTS_DIR}/EveAppIntents.swiftconstvalues"
+APP_INTENTS_SOURCE_LIST="${APP_INTENTS_DIR}/sources.list"
+APP_INTENTS_CONSTANT_LIST="${APP_INTENTS_DIR}/const.list"
+APP_INTENTS_METADATA_LIST="${APP_INTENTS_DIR}/metadata.list"
+APP_INTENTS_STATIC_METADATA_LIST="${APP_INTENTS_DIR}/static-metadata.list"
+APP_INTENTS_STRINGSDATA="${APP_INTENTS_DIR}/ExtractedAppShortcutsMetadata.stringsdata"
+APP_INTENTS_METADATA_DIR="${RESOURCES_DIR}/Metadata.appintents"
+SDK_ROOT="$("${XCRUN[@]}" --sdk macosx --show-sdk-path)"
+TOOLCHAIN_DIR="${XCODE_DEVELOPER_DIR}/Toolchains/XcodeDefault.xctoolchain"
+APP_INTENTS_PROCESSOR="$("${XCRUN[@]}" --find appintentsmetadataprocessor)"
+XCODE_BUILD_VERSION="$(env DEVELOPER_DIR="${XCODE_DEVELOPER_DIR}" xcodebuild -version | awk '/Build version/{print $3}')"
+rm -rf "${APP_INTENTS_DIR}" "${APP_INTENTS_METADATA_DIR}"
+mkdir -p "${APP_INTENTS_DIR}"
+cat > "${APP_INTENTS_PROTOCOLS}" <<'JSON'
+["AppIntent","EntityQuery","AppEntity","TransientEntity","AppEnum","AppShortcutProviding","AppShortcutsProvider","AnyResolverProviding","AppIntentsPackage","DynamicOptionsProvider","_IntentValueRepresentable","_AssistantIntentsProvider","_GenerativeFunctionExtractable"]
+JSON
+"${SWIFTC[@]}" -c -parse-as-library \
+  -module-name Eve \
+  -target "${TARGET_TRIPLE}" \
+  -sdk "${SDK_ROOT}" \
+  -module-cache-path "${MODULE_CACHE_DIR}" \
+  -Xfrontend -const-gather-protocols-file \
+  -Xfrontend "${APP_INTENTS_PROTOCOLS}" \
+  -emit-const-values-path "${APP_INTENTS_CONSTANTS}" \
+  "${ROOT_DIR}/mac/EveAppIntents.swift" \
+  -o "${APP_INTENTS_DIR}/EveAppIntents.o"
+printf '%s\n' "${ROOT_DIR}/mac/EveAppIntents.swift" > "${APP_INTENTS_SOURCE_LIST}"
+printf '%s\n' "${APP_INTENTS_CONSTANTS}" > "${APP_INTENTS_CONSTANT_LIST}"
+: > "${APP_INTENTS_METADATA_LIST}"
+: > "${APP_INTENTS_STATIC_METADATA_LIST}"
+: > "${APP_INTENTS_STRINGSDATA}"
+"${APP_INTENTS_PROCESSOR}" \
+  --toolchain-dir "${TOOLCHAIN_DIR}" \
+  --module-name Eve \
+  --sdk-root "${SDK_ROOT}" \
+  --xcode-version "${XCODE_BUILD_VERSION}" \
+  --platform-family macOS \
+  --deployment-target 13.0 \
+  --target-triple "${TARGET_TRIPLE}" \
+  --output "${RESOURCES_DIR}" \
+  --stringsdata-file "${APP_INTENTS_STRINGSDATA}" \
+  --source-file-list "${APP_INTENTS_SOURCE_LIST}" \
+  --metadata-file-list "${APP_INTENTS_METADATA_LIST}" \
+  --static-metadata-file-list "${APP_INTENTS_STATIC_METADATA_LIST}" \
+  --swift-const-vals-list "${APP_INTENTS_CONSTANT_LIST}" \
+  --compile-time-extraction \
+  --deployment-aware-processing \
+  --validate-assistant-intents \
+  --no-app-shortcuts-localization
+if [[ ! -s "${APP_INTENTS_METADATA_DIR}/extract.actionsdata" ]] \
+  || ! grep -q '"OpenEveIntent"' "${APP_INTENTS_METADATA_DIR}/extract.actionsdata" \
+  || ! grep -q '"openAppWhenRun":true' "${APP_INTENTS_METADATA_DIR}/extract.actionsdata"; then
+  echo "Eve App Intents metadata is missing the bounded Open Eve intent." >&2
+  exit 1
+fi
 
 cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -78,9 +159,9 @@ cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>3.4</string>
+  <string>3.5</string>
   <key>CFBundleVersion</key>
-  <string>11</string>
+  <string>12</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>NSPrincipalClass</key>
@@ -126,11 +207,20 @@ codesign --force --deep --sign - "${APP_PATH}" >/dev/null
 pkill -x "${APP_NAME}" >/dev/null 2>&1 || true
 
 SURFACE_PID_PATH="${HOME}/.eve_runtime/eve-app/eve-app.pid"
-surface_pid="$(cat "${SURFACE_PID_PATH}" 2>/dev/null || true)"
+surface_pid_hint="$(cat "${SURFACE_PID_PATH}" 2>/dev/null || true)"
+surface_pid=""
+if [[ "${surface_pid_hint}" =~ ^[1-9][0-9]*$ && "${surface_pid_hint}" != "1" ]] &&
+  kill -0 "${surface_pid_hint}" 2>/dev/null; then
+  surface_command="$(ps -p "${surface_pid_hint}" -o command= 2>/dev/null || true)"
+  if [[ "${surface_command}" == *eve_app_server.py* ]]; then
+    surface_pid="${surface_pid_hint}"
+  fi
+fi
 if [[ -z "${surface_pid}" ]] && command -v lsof >/dev/null 2>&1; then
   surface_pid="$(lsof -tiTCP:3000 -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
 fi
-if [[ -n "${surface_pid}" ]] && kill -0 "${surface_pid}" 2>/dev/null; then
+if [[ "${surface_pid}" =~ ^[1-9][0-9]*$ && "${surface_pid}" != "1" ]] &&
+  kill -0 "${surface_pid}" 2>/dev/null; then
   surface_command="$(ps -p "${surface_pid}" -o command= 2>/dev/null || true)"
   if [[ "${surface_command}" == *eve_app_server.py* ]]; then
     kill "${surface_pid}" 2>/dev/null || true
@@ -139,6 +229,8 @@ if [[ -n "${surface_pid}" ]] && kill -0 "${surface_pid}" 2>/dev/null; then
       sleep 0.1
     done
     kill -9 "${surface_pid}" 2>/dev/null || true
+  elif [[ -n "${surface_command}" ]]; then
+    echo "Port 3000 belongs to an unrelated process; leaving it untouched: ${surface_command}" >&2
   fi
 fi
 rm -f "${SURFACE_PID_PATH}"

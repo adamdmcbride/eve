@@ -1,7 +1,7 @@
 # Fast Lane Living Spec
 
 Status: canonical
-Last reviewed: 2026-08-23
+Last reviewed: 2026-10-17
 Current authority: yes
 Supersedes: none
 Superseded by: none
@@ -10,7 +10,17 @@ Date: 2026-04-24
 
 Lane: `fast`
 
-Current model: Gemma 3 4B Q4 as `eve-fast`; this resident substrate also serves the logical `relationship` lane.
+Current model: Qwen3.8-27B UD-Q4_K_XL via shared `eve-deep` at `127.0.0.1:8081`; all five logical lanes share this one resident substrate.
+
+## October 17 residency override
+
+The operator explicitly authorized Qwen3.8-only to relieve host storage/swap pressure.
+This changes physical routing, not this lane's contract, anti-contract or humanity
+expression. It is not a quality promotion or a measured latency win. All five
+logical modes share one 32K/one-slot server, so contention and slower hot-path
+responses remain risks. Qwen3.5-9B and Gemma3-4B services are inactive and their
+weights were removed by the separate cleanup owner; do not automatically restore
+or download them. Historical comparisons below are not current rollback availability.
 
 ## Contract
 

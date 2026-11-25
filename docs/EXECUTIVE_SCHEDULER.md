@@ -12,7 +12,7 @@ This document defines Eve's routed cognition doctrine.
 
 ## Doctrine
 
-Eve is one control system that allocates cognition. The five logical lane faculties are attention modes, not personalities, rivals, or a committee transcript. They currently map to three resident substrates (`fast`+`relationship`, `observer`+`planner`, and separate `deep`); physical model/server count is not identity doctrine.
+Eve is one control system that allocates cognition. The five logical lane faculties are attention modes, not personalities, rivals, or a committee transcript. Under the operator-authorized October 17 resource override they all map to the one existing Qwen3.8 `eve-deep` substrate; the earlier three-substrate deployment remains history. Physical model/server count is not identity doctrine, and this consolidation is not a measured quality win.
 
 The scheduler's job is not to be Eve's soul. Eve Core owns identity, values, memory authority, goals, permissions, and final judgment. The executive scheduler allocates attention so Eve can stay coherent, useful, fast, and honest about risk.
 

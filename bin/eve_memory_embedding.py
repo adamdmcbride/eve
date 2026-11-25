@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import re
+import tempfile
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,6 +67,7 @@ def build_lexical_rows(notes: list[dict]) -> list[dict]:
                 "text": note.get("text"),
                 "tags": [str(tag) for tag in note.get("tags") or [] if str(tag).strip()],
                 "terms": dict(terms),
+                **{key: note[key] for key in ("observed_at", "valid_until", "status", "supersedes") if key in note},
             }
         )
     return rows
@@ -103,18 +105,34 @@ def encode_passages(model, tokenizer, texts: list[str]):
 
 
 def build_rows(notes: list[dict], embeddings: list[list[float]]) -> tuple[list[dict], list[dict]]:
+    if len(notes) != len(embeddings):
+        raise ValueError("Embedding count does not match note count")
+    dimensions = None
+    for vector in embeddings:
+        if not vector or any(isinstance(value, bool) or not math.isfinite(float(value)) for value in vector):
+            raise ValueError("Embeddings must be nonempty finite numeric vectors")
+        if dimensions is not None and len(vector) != dimensions:
+            raise ValueError("Embedding dimensions must match")
+        dimensions = len(vector)
     json_rows: list[dict] = []
     lance_rows: list[dict] = []
-    for note, vector in zip(notes, embeddings, strict=False):
+    for note, vector in zip(notes, embeddings):
         base = {
             "id": note.get("id"),
             "source": note.get("source"),
             "title": note.get("title"),
             "text": note.get("text"),
             "tags": [str(tag) for tag in note.get("tags") or [] if str(tag).strip()],
+            **{key: note[key] for key in ("observed_at", "valid_until", "status", "supersedes") if key in note},
         }
         json_rows.append({**base, "embedding": [float(item) for item in vector]})
-        lance_rows.append({**base, "vector": [float(item) for item in vector]})
+        # Arrow inference can silently drop optional keys absent from the first
+        # row. Use one stable string column for optional evidence metadata; old
+        # tables without the column remain readable without a migration.
+        metadata = {key: base[key] for key in ("observed_at", "valid_until", "status", "supersedes") if key in base}
+        lance_base = {key: value for key, value in base.items() if key not in metadata}
+        lance_rows.append({**lance_base, "vector": [float(item) for item in vector],
+                           "evidence_metadata": json.dumps(metadata, allow_nan=False)})
     return json_rows, lance_rows
 
 
@@ -145,7 +163,17 @@ def build_json_index(
         "entries": rows,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    # Readers keep the previous derived index if serialization/write fails.
+    serialized = json.dumps(payload, indent=2, allow_nan=False)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=output_path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(serialized)
+        temporary.replace(output_path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return payload
 
 
@@ -190,12 +218,22 @@ def score_from_distance(distance: float) -> float:
 
 
 def base_match_from_item(item: dict) -> dict:
+    metadata = {}
+    if "evidence_metadata" in item:
+        try:
+            metadata = json.loads(item["evidence_metadata"])
+            if not isinstance(metadata, dict):
+                raise ValueError("Evidence metadata must be an object")
+        except (TypeError, ValueError):
+            metadata = {"status": "invalid_metadata"}
+    metadata.update({key: item[key] for key in ("observed_at", "valid_until", "status", "supersedes") if key in item})
     return {
         "id": item.get("id"),
         "source": item.get("source"),
         "title": item.get("title"),
         "text": item.get("text"),
         "tags": item.get("tags") if isinstance(item.get("tags"), list) else [],
+        **{key: metadata[key] for key in ("observed_at", "valid_until", "status", "supersedes") if key in metadata},
     }
 
 

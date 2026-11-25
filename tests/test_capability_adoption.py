@@ -56,6 +56,97 @@ def review(state="candidate", *, visible=True):
 
 
 class CapabilityAdoptionPureTests(unittest.TestCase):
+    def test_explicit_package_anchor_prevents_high_overlap_wrong_capability(self):
+        wrong = capability(
+            "surface.eve_chat_same_thread_followup",
+            "Eve Chat same-thread deferred follow-up",
+            category="conversation_delivery",
+            evidence={
+                "description": (
+                    "Execute one bounded operational action tree, verify its consequence, "
+                    "and record the result in the original thread."
+                )
+            },
+        )
+        correct = capability(
+            "integration.durable-task-execution",
+            "Durable task execution",
+            available=False,
+            callable=False,
+            verified=False,
+            category="agent_integration",
+            evidence={"local_surfaces": ["py_trees operational action tree"]},
+        )
+
+        result = adoption.resolve_capability_first(
+            "verify py_trees 2.4 operational action trees execute and record consequences",
+            matrix(wrong, correct),
+            {"feature_reviews": []},
+        )
+
+        self.assertEqual("configure_or_admit_existing", result["classification"])
+        self.assertEqual("integration.durable-task-execution", result["matched_capability"]["id"])
+        wrong_match = adoption.match_score(result["objective"], wrong)
+        self.assertEqual(["pytrees"], wrong_match["missing_identifier_anchors"])
+        self.assertFalse(wrong_match["credible"])
+
+    def test_matching_explicit_package_anchor_is_credible_with_sparse_prose(self):
+        match = adoption.match_score(
+            "verify py_trees 2.4 compatibility",
+            {
+                "id": "integration.durable-task-execution",
+                "name": "Durable task execution",
+                "evidence": {"local_surfaces": ["py_trees operational action tree"]},
+            },
+        )
+
+        self.assertEqual(["pytrees"], match["matched_identifier_anchors"])
+        self.assertEqual([], match["missing_identifier_anchors"])
+        self.assertTrue(match["credible"])
+
+    def test_natural_hyphenated_modifier_is_not_a_package_anchor(self):
+        match = adoption.match_score(
+            "use local-only Langfuse tracing",
+            {
+                "id": "eve:oss:langfuse",
+                "name": "Langfuse",
+                "evidence": {"purpose": "local trace observability"},
+            },
+        )
+
+        self.assertNotIn("localonly", match["identifier_anchors"])
+        self.assertTrue(match["credible"])
+
+    def test_proposal_only_and_tool_less_are_not_package_anchors(self):
+        match = adoption.match_score(
+            "keep Hermes proposal-only with tool-less constrained execution",
+            {
+                "id": "hermes:tools_toolsets",
+                "subsystem": "hermes",
+                "family": "tools_toolsets",
+                "current_state": "broad_cli_authority_enabled",
+                "decision": "defer",
+                "configuration_action": "Use the constrained adapter and disable ordinary CLI toolsets.",
+            },
+        )
+
+        self.assertNotIn("proposalonly", match["identifier_anchors"])
+        self.assertNotIn("toolless", match["identifier_anchors"])
+        self.assertTrue(match["credible"])
+
+    def test_generic_slash_list_is_not_a_repository_anchor(self):
+        match = adoption.match_score(
+            "Langfuse model/tool/memory provenance",
+            {
+                "id": "eve:oss:langfuse",
+                "name": "Langfuse",
+                "evidence": {"purpose": "model and tool trace provenance"},
+            },
+        )
+
+        self.assertNotIn("modeltoolmemory", match["identifier_anchors"])
+        self.assertTrue(match["credible"])
+
     def test_generic_adoption_verbs_do_not_make_ledger_observation_credible(self):
         match = adoption.match_score(
             "Evaluate and adopt Langfuse v4.14.1",
@@ -111,6 +202,196 @@ class CapabilityAdoptionPureTests(unittest.TestCase):
         )
         self.assertEqual("configure_or_admit_existing", result["classification"])
         self.assertEqual("openclaw", result["organ_route"]["primary_organ"])
+
+    def test_installed_feature_family_prevents_false_build_required(self):
+        result = adoption.resolve_capability_first(
+            "local-only Langfuse tracing with model tool and memory provenance and no hosted export",
+            matrix(
+                capability(
+                    "ledger.generic-local-model",
+                    "Run multiple local model lanes",
+                    available=True,
+                    callable=False,
+                    verified=True,
+                    category="remembered_capability",
+                    evidence={"statement": "Local model, tool, and memory work."},
+                )
+            ),
+            {
+                "feature_reviews": [],
+                "feature_family_reviews": [
+                    {
+                        "id": "eve:oss:langfuse",
+                        "subsystem": "eve",
+                        "family": "oss:langfuse",
+                        "current_state": "installed_importable:4.14.4",
+                        "decision": "use_existing",
+                        "rationale": "Local trace observability SDK installed for redacted model and tool provenance.",
+                        "configuration_action": "Use the existing bounded local lab path and require a local endpoint before export.",
+                        "authority_boundary": "Observability only; no hosted export or scheduler authority.",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual("configure_or_admit_existing", result["classification"])
+        self.assertEqual("eve:oss:langfuse", result["matched_feature_family"]["id"])
+        self.assertEqual(
+            "ledger.generic-local-model",
+            result["evidence"]["shadowed_capability_id"],
+        )
+        self.assertEqual("existing_feature_family", result["organ_route"]["authority"])
+        self.assertFalse(result["coding_allowed"])
+        self.assertIn("existing bounded local lab path", result["recommended_action"])
+
+    def test_hermes_tool_authority_objective_routes_to_existing_configuration(self):
+        result = adoption.resolve_capability_first(
+            "keep Hermes proposal-only by disabling ordinary CLI tool authority and requiring tool-less constrained proposal generation",
+            matrix(),
+            {
+                "feature_reviews": [],
+                "feature_family_reviews": [
+                    {
+                        "id": "hermes:tools_toolsets",
+                        "subsystem": "hermes",
+                        "family": "tools_toolsets",
+                        "current_state": "broad_cli_authority_enabled",
+                        "decision": "defer",
+                        "rationale": "Hermes ordinary CLI exposes tool authority outside Eve's constrained adapter.",
+                        "configuration_action": "Back up the Hermes profile, disable ordinary CLI toolsets, verify, and restore-test.",
+                        "authority_boundary": "Eve-owned Hermes paths use enabled_toolsets=[] and strict proposal JSON.",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual("configure_or_admit_existing", result["classification"])
+        self.assertEqual("hermes:tools_toolsets", result["matched_feature_family"]["id"])
+        self.assertEqual("hermes", result["organ_route"]["primary_organ"])
+        self.assertFalse(result["coding_allowed"])
+
+    def test_verified_callable_feature_family_routes_to_use_existing(self):
+        result = adoption.resolve_capability_first(
+            "search the OpenClaw memory wiki",
+            matrix(),
+            {
+                "feature_reviews": [],
+                "feature_family_reviews": [
+                    {
+                        "id": "openclaw:memory_wiki",
+                        "subsystem": "openclaw",
+                        "family": "memory_wiki",
+                        "current_state": "resident_callable",
+                        "decision": "use_existing",
+                        "configuration_action": "Call the existing resident wiki search tool.",
+                        "lifecycle": {
+                            "stage": "verified",
+                            "callable_now": True,
+                            "consequence_verified": True,
+                        },
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual("use_existing", result["classification"])
+        self.assertEqual("openclaw", result["organ_route"]["primary_organ"])
+        self.assertFalse(result["coding_allowed"])
+
+    def test_detailed_workflow_objective_resolves_existing_integrated_family_bundle(self):
+        objective = (
+            "turn Eve's curated verified episodes into a reproducible local adapter experiment "
+            "with private holdout, DVC snapshot, no downloads, and shadow promotion evidence"
+        )
+        result = adoption.resolve_capability_first(
+            objective,
+            matrix(
+                capability(
+                    "ledger.generic-training-note",
+                    "Local verified training evidence",
+                    available=True,
+                    callable=False,
+                    verified=True,
+                    category="remembered_capability",
+                )
+            ),
+            {
+                "feature_reviews": [],
+                "feature_family_reviews": [
+                    {
+                        "id": "eve:oss:peft",
+                        "subsystem": "eve",
+                        "family": "oss:peft",
+                        "current_state": "installed_importable:0.20.0",
+                        "decision": "use_existing",
+                        "rationale": "LoRA adapter experiments from verified Eve episodes.",
+                        "configuration_action": "Use the existing bounded trainer lab.",
+                    },
+                    {
+                        "id": "eve:oss:dvc",
+                        "subsystem": "eve",
+                        "family": "oss:dvc",
+                        "current_state": "installed_importable:3.67.1",
+                        "decision": "use_existing",
+                        "rationale": "Version curated adapter datasets after private holdout splitting.",
+                        "configuration_action": "Run the no-upload snapshot and restore canary.",
+                    },
+                    {
+                        "id": "eve:organ:oss_improvement_substrate",
+                        "subsystem": "eve",
+                        "family": "organ:oss_improvement_substrate",
+                        "current_state": "working",
+                        "decision": "configure",
+                        "rationale": (
+                            "Unify local curated adapter datasets, DVC manifests, trainer recipes, "
+                            "and promotion evidence as a governed self-improvement organ."
+                        ),
+                        "configuration_action": "Repair the organ contract before adding a replacement.",
+                    },
+                ],
+            },
+        )
+
+        self.assertEqual("configure_or_admit_existing", result["classification"])
+        self.assertEqual(
+            "eve:organ:oss_improvement_substrate",
+            result["matched_feature_family"]["id"],
+        )
+        self.assertFalse(result["coding_allowed"])
+        self.assertGreaterEqual(
+            len(result["feature_family_match"]["high_signal_overlap"]),
+            3,
+        )
+        self.assertEqual(
+            {
+                "eve:oss:peft",
+                "eve:oss:dvc",
+                "eve:organ:oss_improvement_substrate",
+            },
+            {item["id"] for item in result["capability_bundle"]},
+        )
+
+    def test_verbose_generic_objective_does_not_match_on_low_signal_words(self):
+        result = adoption.resolve_capability_first(
+            "create a reproducible local watercolor animation with verified current evidence",
+            matrix(),
+            {
+                "feature_reviews": [],
+                "feature_family_reviews": [
+                    {
+                        "id": "eve:organ:oss_improvement_substrate",
+                        "subsystem": "eve",
+                        "family": "organ:oss_improvement_substrate",
+                        "current_state": "working",
+                        "decision": "configure",
+                        "rationale": "Local current verified evidence for software improvement.",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual("build_required", result["classification"])
+        self.assertEqual([], result["capability_bundle"])
 
     def test_exact_candidate_target_routes_to_isolated_canary(self):
         feature_review = review("candidate")
@@ -211,6 +492,137 @@ class CapabilityAdoptionPureTests(unittest.TestCase):
         second = adoption.select_next_target(matrix(gap), {"feature_reviews": [feature_review]}, prior)
         self.assertEqual(feature_review["id"], second["id"])
 
+    def test_target_rotation_does_not_treat_eves_reply_as_build_authority(self):
+        hallucinated_gap = capability(
+            "gap:reply-promise",
+            "Create a verified path for: I will start an undefined scan",
+            available=False,
+            callable=False,
+            verified=False,
+            category="capability_gap",
+        )
+        hallucinated_gap["evidence"] = {"source": "reply", "proposal_id": "proposal-1"}
+        feature_review = review("candidate")
+
+        selected = adoption.select_next_target(
+            matrix(hallucinated_gap),
+            {"feature_reviews": [feature_review]},
+            [],
+        )
+
+        self.assertEqual(feature_review["id"], selected["id"])
+        self.assertEqual(1, selected["selection_evidence"]["excluded_self_narration_gap_count"])
+
+    def test_human_confirmed_reply_gap_can_drive_target_rotation(self):
+        confirmed_gap = capability(
+            "gap:confirmed-adapter",
+            "Build the browser adapter the operator confirmed",
+            available=False,
+            callable=False,
+            verified=False,
+            category="capability_gap",
+        )
+        confirmed_gap["evidence"] = {
+            "source": "reply",
+            "human_confirmed": True,
+            "source_authority": "human_confirmed",
+        }
+
+        selected = adoption.select_next_target(matrix(confirmed_gap), {"feature_reviews": []}, [])
+
+        self.assertEqual(confirmed_gap["id"], selected["id"])
+        self.assertEqual(0, selected["selection_evidence"]["excluded_self_narration_gap_count"])
+
+    def test_installed_python_update_without_matching_release_track_is_selected(self):
+        intelligence = {
+            "generated_at": "2026-08-23T00:00:00+00:00",
+            "feature_reviews": [],
+            "subsystems": {
+                "eve": {
+                    "components": [
+                        {
+                            "id": "phoenix-eve-runtime",
+                            "name": "Arize Phoenix observability package",
+                            "kind": "python_package",
+                            "package": "arize-phoenix",
+                            "release_repository": "Arize-ai/phoenix",
+                            "release_feature_mode": "research_only",
+                            "local_version": "14.6.0",
+                            "latest_version": "20.3.0",
+                            "update_available": True,
+                        }
+                    ]
+                }
+            },
+        }
+
+        selected = adoption.select_next_target(matrix(), intelligence, [])
+
+        self.assertEqual("installed_component_update", selected["kind"])
+        self.assertEqual("phoenix-eve-runtime", selected["component_id"])
+        self.assertEqual("20.3.0", selected["target_version"])
+
+    def test_matching_release_candidate_deduplicates_installed_update_target(self):
+        feature_review = {
+            **review("lab_candidate"),
+            "id": "release:ragas@v0.4.3",
+            "component_id": "ragas-eve-runtime",
+            "target_version": "v0.4.3",
+        }
+        intelligence = {
+            "feature_reviews": [feature_review],
+            "subsystems": {
+                "eve": {
+                    "components": [
+                        {
+                            "id": "ragas-eve-runtime",
+                            "kind": "python_package",
+                            "package": "ragas",
+                            "local_version": "0.3.2",
+                            "latest_version": "0.4.3",
+                            "update_available": True,
+                        }
+                    ]
+                }
+            },
+        }
+
+        selected = adoption.select_next_target(matrix(), intelligence, [])
+
+        self.assertEqual(feature_review["id"], selected["id"])
+
+    def test_structured_installed_component_update_resolves_to_canary(self):
+        component_record = {
+            "id": "phoenix-eve-runtime",
+            "name": "Arize Phoenix observability package",
+            "kind": "python_package",
+            "package": "arize-phoenix",
+            "release_feature_mode": "research_only",
+            "adoption": "Run a local no-export trace canary.",
+        }
+        target = {
+            "id": "component-update:phoenix-eve-runtime@20.3.0",
+            "kind": "installed_component_update",
+            "component_id": "phoenix-eve-runtime",
+            "target_version": "20.3.0",
+            "installed_version": "14.6.0",
+            "source_authority": "installed_component_watcher",
+            "objective": "Arize Phoenix package update 14.6.0 to 20.3.0",
+        }
+
+        result = adoption.resolve_capability_first(
+            target["objective"],
+            matrix(),
+            {"feature_reviews": []},
+            components=[component_record],
+            target=target,
+        )
+
+        self.assertEqual("canary_existing_update", result["classification"])
+        self.assertEqual("phoenix-eve-runtime", result["matched_component"]["id"])
+        self.assertEqual("20.3.0", result["matched_feature_review"]["target_version"])
+        self.assertTrue(adoption.python_candidate_plan(result["matched_feature_review"], result["matched_component"])["eligible"])
+
     def test_python_candidate_plan_accepts_normal_semver_only(self):
         plan = adoption.python_candidate_plan(
             review("candidate"),
@@ -286,6 +698,33 @@ class CapabilityOnlineResearchTests(unittest.TestCase):
 
 
 class CapabilityAdoptionEveIntegrationTests(unittest.TestCase):
+    def test_runtime_cycle_delegates_execution_to_runtime_bundle(self):
+        with patch.object(eve, "delegate_cli_to_runtime", return_value=0) as delegate, patch.object(
+            eve, "run_capability_adoption_cycle"
+        ) as local_cycle:
+            code = eve.main(
+                [
+                    "capabilities",
+                    "adoption",
+                    "cycle",
+                    "--objective",
+                    "inspect current Hermes tools",
+                    "--research",
+                    "--no-handoff",
+                    "--runtime",
+                    "--full",
+                ]
+            )
+
+        self.assertEqual(0, code)
+        delegated = delegate.call_args.args[0]
+        self.assertEqual(["capabilities", "adoption", "cycle"], delegated[:3])
+        self.assertIn("--runtime", delegated)
+        self.assertIn("--research", delegated)
+        self.assertIn("--no-handoff", delegated)
+        self.assertIn("inspect current Hermes tools", delegated)
+        local_cycle.assert_not_called()
+
     def test_dagster_candidate_contract_loads_eves_real_definition(self):
         code = eve.capability_python_candidate_smoke_code(
             "dagster-eve-runtime",
@@ -508,6 +947,74 @@ class CapabilityAdoptionEveIntegrationTests(unittest.TestCase):
         self.assertTrue(record["available"])
         self.assertTrue(record["callable"])
         self.assertTrue(record["verified"])
+
+    def test_failed_canary_signature_extracts_only_allowlisted_diagnostic(self):
+        canary = {
+            "status": "failed",
+            "component_id": "ragas-eve-runtime",
+            "package": "ragas",
+            "requirement": "ragas==0.4.3",
+            "target_version": "v0.4.3",
+            "live_environment_changed": False,
+            "commands": [
+                {"command": ["uv", "pip", "install"], "returncode": 0, "ok": True},
+                {
+                    "command": ["python", "-I", "-c", "<python:hash>"],
+                    "returncode": 1,
+                    "ok": False,
+                    "timed_out": False,
+                    "stderr_tail": (
+                        "/private/user/path with token=do-not-retain\n"
+                        "ModuleNotFoundError: No module named "
+                        "'langchain_community.chat_models.vertexai'"
+                    ),
+                },
+            ],
+        }
+
+        result = adoption.summarize_candidate_canary_failure(canary)
+
+        self.assertEqual("import_api_smoke", result["phase"])
+        self.assertEqual("ModuleNotFoundError", result["exception_type"])
+        self.assertEqual("langchain_community.chat_models.vertexai", result["missing_module"])
+        self.assertFalse(result["raw_output_retained"])
+        self.assertFalse(result["live_environment_changed"])
+        self.assertIn("ragas==0.4.3", result["repair_objective"])
+        self.assertNotIn("do-not-retain", repr(result))
+        self.assertNotIn("/private/user/path", repr(result))
+
+    def test_failed_canary_signature_preserves_unknown_when_trace_is_truncated(self):
+        canary = {
+            "status": "failed",
+            "component_id": "example-agent",
+            "package": "example-agent",
+            "requirement": "example-agent==2.0.0",
+            "commands": [
+                {
+                    "command": ["python", "-I", "-c", "<python:hash>"],
+                    "returncode": 1,
+                    "ok": False,
+                    "stderr": "Traceback truncated before the exception",
+                }
+            ],
+        }
+
+        result = adoption.summarize_candidate_canary_failure(canary)
+
+        self.assertEqual("unknown", result["exception_type"])
+        self.assertIn("lacks the terminal exception", result["repair_objective"])
+        self.assertTrue(result["output_sha256"])
+
+    def test_successful_canary_has_no_repair_signature(self):
+        self.assertEqual(
+            {},
+            adoption.summarize_candidate_canary_failure(
+                {
+                    "status": "passed",
+                    "commands": [{"command": ["python"], "returncode": 0, "ok": True}],
+                }
+            ),
+        )
 
 
 if __name__ == "__main__":

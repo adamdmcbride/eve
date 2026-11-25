@@ -7,6 +7,7 @@ import os
 import selectors
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -105,9 +106,81 @@ def parse_json_object(text: str) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+GATEWAY_RUNNING_MARKER = "a gateway is running for this state directory"
+GATEWAY_UNREACHABLE_MARKERS = ("econnrefused", "gateway unreachable", "could not connect", "connection refused")
+CONFIG_WARNING_MARKERS = ("[config] warnings", "plugin not installed", "stale config entry")
+GATEWAY_SUCCESS_STATUSES = {"ok", "completed"}
+
+
+def unwrap_agent_envelope(payload: dict) -> dict:
+    """Flatten OpenClaw's gateway envelope {runId,status,result:{payloads,meta}} to the embedded shape {payloads,meta}."""
+    if not isinstance(payload, dict):
+        return {}
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else None
+    if result is None or not ("payloads" in result or "meta" in result):
+        return payload
+    flat = dict(result)
+    for key in ("reply", "text", "message", "error", "status", "summary", "runId", "deliveryStatus"):
+        if key in payload and key not in flat:
+            flat[key] = payload[key]
+    return flat
+
+
+def openclaw_gateway_port(profile: str) -> int:
+    config_path = openclaw_state_dir(profile) / "openclaw.json"
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        gateway = data.get("gateway") if isinstance(data, dict) else None
+        return int((gateway or {}).get("port") or 0)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return 0
+
+
+def gateway_running(profile: str, timeout_seconds: float = 0.4) -> bool:
+    """Port probe; OpenClaw itself decides from its gateway lock file, so the refusal fallback stays."""
+    port = openclaw_gateway_port(profile)
+    if port <= 0:
+        return False
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout_seconds):
+            return True
+    except OSError:
+        return False
+
+
+def split_config_warnings(stderr: str) -> tuple[list[str], str]:
+    """Separate OpenClaw's config/plugin warnings from real error text (stderr is the whole log stream under --json)."""
+    warnings: list[str] = []
+    remaining: list[str] = []
+    for line in stderr.splitlines():
+        lowered = line.lower()
+        if any(marker in lowered for marker in CONFIG_WARNING_MARKERS):
+            warnings.append(line.strip())
+        else:
+            remaining.append(line)
+    return warnings, "\n".join(remaining).strip()
+
+
+def gateway_refusal(stdout: str, stderr: str) -> bool:
+    return GATEWAY_RUNNING_MARKER in f"{stdout}\n{stderr}".lower()
+
+
+def gateway_unreachable(stdout: str, stderr: str) -> bool:
+    lowered = f"{stdout}\n{stderr}".lower()
+    return any(marker in lowered for marker in GATEWAY_UNREACHABLE_MARKERS)
+
+
+def structured_error_message(stdout: str) -> str:
+    payload = parse_json_object(stdout)
+    error = payload.get("error")
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("type") or "").strip()
+    return str(error or "").strip()
+
+
 def extract_cli_reply_text(text: str) -> str:
-    """Extract the final assistant text from OpenClaw's CLI JSON envelope."""
-    payload = parse_json_object(text)
+    """Extract the final assistant text from OpenClaw's CLI JSON envelope (embedded or gateway shape)."""
+    payload = unwrap_agent_envelope(parse_json_object(text))
     if not payload:
         return ""
     for key in ("reply", "text", "message"):
@@ -132,7 +205,7 @@ def extract_cli_reply_text(text: str) -> str:
 
 def openclaw_needs_continuation(stdout: str, stderr: str) -> bool:
     for text in (stdout, stderr):
-        payload = parse_json_object(text)
+        payload = unwrap_agent_envelope(parse_json_object(text))
         meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
         completion = meta.get("completion") if isinstance(meta.get("completion"), dict) else {}
         stop_reason = str(meta.get("stopReason") or completion.get("stopReason") or completion.get("finishReason") or "").lower()
@@ -368,7 +441,7 @@ def normalize_openclaw_agent_result(
     prose-wrapped JSON triggers the existing same-session contract retry and
     can never become a false repair success.
     """
-    payload = parse_json_object(stdout)
+    payload = unwrap_agent_envelope(parse_json_object(stdout))
     if not payload:
         return {}
     reply = extract_cli_reply_text(stdout)
@@ -400,7 +473,18 @@ def normalize_openclaw_agent_result(
         if marker in lowered_stderr and marker not in hard_failures:
             hard_failures.append(marker)
 
-    existing_error = str(payload.get("error") or "").strip()
+    existing_error_value = payload.get("error")
+    if isinstance(existing_error_value, dict):
+        # OpenClaw >= 2026.9 returns {"type": "cli_error", "message": ...}; a str() of the
+        # dict hid the real message behind a Python repr in every status record.
+        existing_error = str(existing_error_value.get("message") or existing_error_value.get("type") or "").strip()
+    else:
+        existing_error = str(existing_error_value or "").strip()
+    gateway_status = str(payload.get("status") or "").strip().lower()
+    if gateway_status == "in_flight" and not existing_error:
+        existing_error = "OpenClaw gateway reports this session's run is still in flight; not re-running"
+    elif gateway_status and gateway_status not in GATEWAY_SUCCESS_STATUSES and not existing_error:
+        existing_error = f"OpenClaw gateway agent status {gateway_status}: {payload.get('summary') or ''}".strip()
     meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
     replay_invalid = bool(payload.get("replayInvalid") is True or meta.get("replayInvalid") is True)
     error = existing_error or contract_error
@@ -657,42 +741,54 @@ def main() -> int:
     returncode = 1
     stdout = ""
     stderr = ""
-    for attempt in range(3):
-        if attempt == 0:
+    # OpenClaw >= 2026.9 refuses `--local` while a Gateway owns the state dir
+    # (Eve keeps the eve-repair Gateway alive under launchd), so choose the
+    # transport from a port probe and fall back in either direction once.
+    use_local = not gateway_running(args.profile)
+    transport_switches = 0
+    config_warnings: list[str] = []
+    first_turn_pending = True
+    # The CLI's own deadline must fire before the outer process-tree kill; in
+    # gateway mode an outer kill leaves the run in flight inside the gateway.
+    cli_timeout = max(60, int(args.timeout) - 60)
+    for attempt in range(4):
+        if first_turn_pending:
             turn_prompt = prompt
         elif openclaw_needs_continuation(stdout, stderr):
             turn_prompt = enforce_response_contract(CONTINUATION_PROMPT)
         else:
             turn_prompt = enforce_response_contract(CONTRACT_RETRY_PROMPT)
+        command = [openclaw_bin, "--profile", args.profile, "agent", "--agent", args.agent, "--session-id", session_id]
+        if use_local:
+            command.append("--local")
+        command.extend(["--json", "--timeout", str(cli_timeout), "--message", turn_prompt])
         returncode, stdout, stderr = run_openclaw_agent(
-            [
-                openclaw_bin,
-                "--profile",
-                args.profile,
-                "agent",
-                "--agent",
-                args.agent,
-                "--session-id",
-                session_id,
-                "--local",
-                "--json",
-                "--timeout",
-                str(args.timeout),
-                "--message",
-                turn_prompt,
-            ],
+            command,
             profile=args.profile,
             agent=args.agent,
             session_id=session_id,
             cwd=ROOT,
             timeout=args.timeout + 60,
         )
+        warnings, stderr = split_config_warnings(stderr)
+        config_warnings.extend(item for item in warnings if item not in config_warnings)
+        if use_local and gateway_refusal(stdout, stderr) and transport_switches < 1:
+            use_local = False
+            transport_switches += 1
+            continue  # same prompt, through the gateway this time
+        if not use_local and gateway_unreachable(stdout, stderr) and transport_switches < 1:
+            use_local = True
+            transport_switches += 1
+            continue  # same prompt, embedded runtime this time
+        first_turn_pending = False
         normalized = normalize_openclaw_agent_result(
             stdout,
             stderr,
             returncode,
         )
         if normalized:
+            normalized["config_warnings"] = config_warnings
+            normalized["transport"] = "local" if use_local else "gateway"
             stdout = json.dumps(normalized, ensure_ascii=False)
             returncode = 0 if normalized.get("ok") is True else 2
         if returncode == 0:
@@ -702,7 +798,7 @@ def main() -> int:
     if returncode != 0:
         if args.json and stdout.strip():
             print(stdout.strip())
-        raise SystemExit(stderr.strip() or stdout.strip() or "OpenClaw repair turn failed.")
+        raise SystemExit(structured_error_message(stdout) or stderr.strip() or stdout.strip() or "OpenClaw repair turn failed.")
 
     if args.json:
         print(stdout.strip())
