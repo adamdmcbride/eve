@@ -36,6 +36,59 @@ class OpenClawStatusTests(unittest.TestCase):
             eve_openclaw.openclaw_workspace({}),
         )
 
+    def test_gateway_socket_permission_denial_is_inconclusive(self):
+        with patch("eve_openclaw.socket.create_connection", side_effect=PermissionError(1, "not permitted")):
+            observation = eve_openclaw.gateway_reachability_observation(19011)
+
+        self.assertFalse(observation["reachable"])
+        self.assertFalse(observation["observation_complete"])
+        self.assertFalse(observation["observation_authoritative"])
+        self.assertTrue(observation["observation_environment_limited"])
+        self.assertEqual("restricted_environment", observation["failure_kind"])
+        self.assertEqual("EPERM", observation["error_code"])
+
+    def test_restricted_socket_probe_preserves_last_host_authoritative_gateway_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            state_dir = root / "state"
+            workspace.mkdir()
+            state_dir.mkdir()
+            (state_dir / "openclaw.json").write_text(
+                json.dumps({"plugins": {"allow": ["memory-core"]}}),
+                encoding="utf-8",
+            )
+            previous = {
+                "updated_at": "2026-08-23T12:00:00+00:00",
+                "gateway_reachable": True,
+                "gateway_status_ok": True,
+                "gateway_probe_authoritative": True,
+                "gateway_last_authoritative_reachable": True,
+                "gateway_last_authoritative_checked_at": "2026-08-23T12:00:00+00:00",
+            }
+            observation = {
+                "reachable": False,
+                "observation_complete": False,
+                "observation_authoritative": False,
+                "observation_environment_limited": True,
+                "failure_kind": "restricted_environment",
+                "error_code": "EPERM",
+            }
+            config = {
+                "openclaw_workspace": str(workspace),
+                "openclaw_state_dir": str(state_dir),
+            }
+            with patch("eve_openclaw.load_openclaw_status", return_value=previous), patch(
+                "eve_openclaw.load_openclaw_sync_history", return_value=[]
+            ), patch("eve_openclaw.gateway_reachability_observation", return_value=observation):
+                status = eve_openclaw.collect_openclaw_status(config)
+
+        self.assertTrue(status["gateway_reachable"])
+        self.assertTrue(status["gateway_status_ok"])
+        self.assertFalse(status["gateway_socket_probe_authoritative"])
+        self.assertTrue(status["gateway_socket_probe_environment_limited"])
+        self.assertEqual("restricted_environment", status["gateway_socket_probe_failure_kind"])
+
     def test_openclaw_template_has_explicit_admitted_plugin_allow_list(self):
         template = json.loads(
             (eve_openclaw.ROOT / "openclaw" / "config" / "eve-openclaw.base.json").read_text(
@@ -350,6 +403,53 @@ class OpenClawStatusTests(unittest.TestCase):
 
         self.assertFalse(collect_status.call_args.kwargs["include_gateway_probe"])
         self.assertFalse(collect_status.call_args.kwargs["include_memory_probe"])
+
+    def test_source_openclaw_status_does_not_replace_live_runtime_state(self):
+        args = argparse.Namespace(
+            runtime=False,
+            no_gateway_probe=True,
+            no_memory_probe=True,
+            full=False,
+            json=False,
+        )
+        authority = {
+            "execution_side": "source_checkout",
+            "daemon_runtime_running": True,
+            "runtime_mirror_written": False,
+            "persistence": "source_only_preserved_live_runtime",
+        }
+        with patch.object(eve, "load_config", return_value={}), patch.object(
+            eve.eve_openclaw,
+            "collect_openclaw_status",
+            return_value={"summary": "restricted source status"},
+        ), patch.object(eve, "observation_artifact_state_authority", return_value=(False, authority)), patch.object(
+            eve.eve_openclaw, "save_openclaw_status"
+        ) as save_status, patch.object(eve, "load_state", return_value={}), patch.object(
+            eve, "save_state"
+        ) as save_state, patch("sys.stdout", new_callable=io.StringIO):
+            result = eve.cmd_openclaw_status(args)
+
+        self.assertEqual(0, result)
+        self.assertFalse(save_status.call_args.kwargs["mirror_runtime"])
+        save_state.assert_not_called()
+
+    def test_runtime_openclaw_audit_delegates_to_runtime_bundle(self):
+        args = argparse.Namespace(
+            runtime=True,
+            timeout=30,
+            record_channel_inventory=False,
+            full=True,
+            json=False,
+        )
+        with patch.object(eve, "delegate_cli_to_runtime", return_value=0) as delegate, patch.object(
+            eve, "build_openclaw_full_audit"
+        ) as build:
+            result = eve.cmd_openclaw_full_audit(args)
+
+        self.assertEqual(0, result)
+        self.assertEqual(["openclaw", "audit"], delegate.call_args.args[0][:2])
+        self.assertIn("--full", delegate.call_args.args[0])
+        build.assert_not_called()
 
     def test_cleanup_stale_temp_artifacts_removes_old_sync_temps_only(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1028,11 +1128,103 @@ class OpenClawStatusTests(unittest.TestCase):
 
             self.assertTrue(result["ok"])
             self.assertEqual(["slack"], result["configured_channels"])
+            self.assertTrue(result["configured_channels_observed"])
             records = eve_store.read_jsonl_records(temp_path / "channels.jsonl")
             self.assertEqual(1, len(records))
             self.assertEqual("openclaw_channel_inventory", records[0]["event_type"])
             self.assertFalse(records[0]["external_send_attempted"])
             self.assertFalse(records[0]["canonical_memory_authority"])
+
+    def test_openclaw_channel_inventory_marks_restricted_failure_inconclusive(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            restricted = {
+                "ok": False,
+                "payload": {},
+                "observation_complete": False,
+                "observation_authoritative": False,
+                "observation_environment_limited": True,
+                "failure_kind": "restricted_environment",
+                "diagnostic_codes": [
+                    "state_db_permission_hardening_denied",
+                    "llama_cpp_runtime_extension_unresolved",
+                ],
+            }
+            with (
+                patch.object(eve_openclaw_body, "OPENCLAW_CHANNEL_EVENTS_PATH", temp_path / "channels.jsonl"),
+                patch.object(
+                    eve_openclaw_body,
+                    "RUNTIME_OPENCLAW_CHANNEL_EVENTS_PATH",
+                    temp_path / "runtime" / "channels.jsonl",
+                ),
+                patch.object(eve_openclaw_body, "run_openclaw_json_command", return_value=restricted),
+            ):
+                result = eve.run_openclaw_channel_inventory(timeout=5, source="unit_test")
+
+            self.assertFalse(result["ok"])
+            self.assertFalse(result["observation_complete"])
+            self.assertFalse(result["observation_authoritative"])
+            self.assertTrue(result["observation_environment_limited"])
+            self.assertEqual([], result["configured_channels"])
+            self.assertIn("count was not observed", result["summary"])
+            records = eve_store.read_jsonl_records(temp_path / "channels.jsonl")
+            self.assertEqual("inconclusive_environment", records[0]["status"])
+            self.assertFalse(records[0]["payload"]["configured_channels_observed"])
+
+    def test_full_audit_never_converts_unobserved_capabilities_into_missing_ones(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            status = {
+                "gateway_reachable": True,
+                "memory_status_ok": True,
+                "summary": "Last host-authoritative OpenClaw status is ready.",
+            }
+            channel_inventory = {
+                "ok": False,
+                "configured_channels": [],
+                "configured_channels_observed": False,
+                "channel_health_issues": [],
+                "observation_complete": False,
+                "observation_authoritative": False,
+                "observation_environment_limited": True,
+            }
+            skills_result = {
+                "ok": False,
+                "payload": {},
+                "observation_complete": False,
+                "observation_authoritative": False,
+                "observation_environment_limited": True,
+                "failure_kind": "restricted_environment",
+                "diagnostic_codes": ["state_db_permission_hardening_denied"],
+            }
+            with (
+                patch.object(eve, "APP_DIR", temp_path / ".eve"),
+                patch.object(eve, "load_config", return_value={}),
+                patch.object(eve_openclaw, "openclaw_workspace", return_value=temp_path),
+                patch.object(eve_openclaw, "collect_openclaw_status", return_value=status),
+                patch.object(eve_openclaw, "save_openclaw_status"),
+                patch.object(
+                    eve_openclaw_body,
+                    "build_openclaw_body_contract_report",
+                    return_value={"contracts": [{}] * len(eve_openclaw_body.OPENCLAW_BODY_CONTRACT_ORDER)},
+                ),
+                patch.object(eve_openclaw_body, "read_openclaw_worker_events", return_value=[]),
+                patch.object(eve_openclaw_body, "read_openclaw_routine_events", return_value=[]),
+                patch.object(eve_openclaw_body, "read_openclaw_channel_events", return_value=[]),
+                patch.object(eve, "run_openclaw_channel_inventory", return_value=channel_inventory),
+                patch.object(eve_openclaw_body, "run_openclaw_json_command", return_value=skills_result),
+                patch.object(eve, "openclaw_bootstrap_budget_report", return_value={"ok": True, "total_bytes": 1, "total_limit": 2}),
+                patch.object(eve_openclaw_body, "append_evidence_event", return_value={"id": "event-1"}),
+            ):
+                report = eve.build_openclaw_full_audit(timeout=5)
+
+            self.assertFalse(report["ok"])
+            self.assertEqual("inconclusive_environment", report["status"])
+            self.assertIsNone(report["checks"]["channels_ready"])
+            self.assertIsNone(report["checks"]["skills_ready"])
+            self.assertEqual([], report["missing_eve_skills"])
+            self.assertEqual(10, len(report["unobserved_eve_skills"]))
+            self.assertIn("no missing-channel or missing-skill claim", report["summary"])
 
     def test_openclaw_channel_inventory_gives_capabilities_longer_budget(self):
         calls = []

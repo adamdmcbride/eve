@@ -1,7 +1,7 @@
 # Deep Lane Living Spec
 
 Status: canonical
-Last reviewed: 2026-08-23
+Last reviewed: 2026-10-17
 Current authority: yes
 Supersedes: none
 Superseded by: none
@@ -10,11 +10,21 @@ Date: 2026-04-24
 
 Lane: `deep`
 
-Current model: Qwen3.8-27B UD-Q4_K_XL as `eve-deep`
+Current model: Qwen3.8-27B UD-Q4_K_XL via shared `eve-deep` at `127.0.0.1:8081`; all five logical lanes share this one resident substrate.
 
-Immediate local rollback: Qwen3.6-35B-A3B UD-Q3_K_S
+Rollback: retain the current Qwen3.8 weight/server configuration. Prior multi-model baselines are historical, not an admitted automatic restore/download path.
 
 Historical comparison baseline: Gemma 3 12B Q4
+
+## October 17 residency override
+
+The operator explicitly authorized Qwen3.8-only to relieve host storage/swap pressure.
+This changes physical routing, not this lane's contract, anti-contract or humanity
+expression. It is not a quality promotion or a measured latency win. All five
+logical modes share one 32K/one-slot server, so contention and slower hot-path
+responses remain risks. Qwen3.5-9B and Gemma3-4B services are inactive and their
+weights were removed by the separate cleanup owner; do not automatically restore
+or download them. Historical comparisons below are not current rollback availability.
 
 ## Contract
 

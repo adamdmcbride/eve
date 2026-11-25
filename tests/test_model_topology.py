@@ -58,6 +58,45 @@ THREE_SUBSTRATE_CONFIG = {
 
 
 class ModelTopologyContractTests(unittest.TestCase):
+    def test_explicit_single_substrate_routes_all_contracts_to_deep_only(self):
+        config = {**THREE_SUBSTRATE_CONFIG, "model_lane_topology_mode": "single_substrate"}
+        snapshot = eve_model_topology.topology_snapshot(config)
+        self.assertTrue(snapshot["valid"])
+        self.assertEqual(1, snapshot["substrate_count"])
+        self.assertEqual(5, snapshot["logical_lane_count"])
+        self.assertEqual(["deep"], eve_model_topology.active_substrate_profiles(config))
+        for route in eve.model_lane_topology_snapshot(config)["routes"]:
+            self.assertEqual("eve-deep", route["substrate_model"])
+            self.assertEqual("http://127.0.0.1:8081", route["substrate_host"])
+        for alias in ["eve-fast", "eve-observer", "eve-planner", "eve-relationship"]:
+            self.assertEqual("eve-deep", eve_model_topology.effective_substrate_model(config, alias))
+
+    def test_single_substrate_watchdog_never_enables_removed_profiles(self):
+        config = {**THREE_SUBSTRATE_CONFIG, "model_lane_topology_mode": "single_substrate"}
+        with patch.object(eve_model_watchdog.eve_platform, "is_macos", return_value=True), patch.object(
+            eve_model_watchdog.subprocess, "run"
+        ) as run:
+            report = eve_model_watchdog.reconcile_llama_cpp_service_topology(config)
+        self.assertTrue(report["valid"])
+        commands = [call.args[0] for call in run.call_args_list]
+        deep = eve_model_topology.profile_launch_label("deep")
+        self.assertEqual([deep], report["active_labels"])
+        for profile in ["fast", "observer", "planner", "relationship"]:
+            label = "gui/%s/%s" % (os.getuid(), eve_model_topology.profile_launch_label(profile))
+            self.assertIn(["launchctl", "disable", label], commands)
+            self.assertIn(["launchctl", "bootout", label], commands)
+            self.assertNotIn(["launchctl", "enable", label], commands)
+
+    def test_single_substrate_blocks_extra_hermes_model_before_probing_or_spawn(self):
+        with patch.object(eve, "ensure_store"), patch.object(
+            eve, "load_config", return_value={"model_lane_topology_mode": "single_substrate"}
+        ), patch.object(eve, "hermes_local_lab_model_path") as model_path:
+            result = eve.start_hermes_local_lab()
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["started"])
+        self.assertEqual("single_substrate_policy_disallows_extra_model", result["reason"])
+        model_path.assert_not_called()
+
     def test_fresh_eve_defaults_to_local_llama_cpp_on_three_substrates(self):
         config = dict(eve.DEFAULT_CONFIG)
         routes = {item["lane"]: item for item in eve.model_lane_records(config)}
@@ -260,9 +299,19 @@ class ModelTopologyContractTests(unittest.TestCase):
         }
         openclaw["models"]["providers"]["llamacpp-deep"]["timeoutSeconds"] = 450
 
+        eve_config = {
+            **THREE_SUBSTRATE_CONFIG,
+            "llama_cpp_ctx_size": 16384,
+            "llama_cpp_parallel_slots": 2,
+            "deep_llama_cpp_ctx_size": 32768,
+            "deep_llama_cpp_parallel_slots": 1,
+            "observer_llama_cpp_ctx_size": 16384,
+            "observer_llama_cpp_parallel_slots": 1,
+        }
+
         updated, report = (
             eve_openclaw_topology_sync.reconcile_openclaw_topology_config(
-                THREE_SUBSTRATE_CONFIG, openclaw
+                eve_config, openclaw
             )
         )
         providers = updated["models"]["providers"]
@@ -292,9 +341,27 @@ class ModelTopologyContractTests(unittest.TestCase):
             providers["llamacpp-observer"]["models"][0]["contextWindow"],
         )
         self.assertEqual(
+            8192,
+            providers["llamacpp"]["models"][0]["contextWindow"],
+        )
+        self.assertEqual(
+            8192,
+            providers["llamacpp-relationship"]["models"][0]["contextWindow"],
+        )
+        self.assertEqual(
+            7424,
+            providers["llamacpp-relationship"]["models"][0]["contextTokens"],
+        )
+        self.assertEqual(
             15616,
             providers["llamacpp-planner"]["models"][0]["contextTokens"],
         )
+        report_routes = {
+            item["logical_lane"]: item for item in report["routes"]
+        }
+        self.assertEqual(16384, report_routes["fast"]["server_context_window"])
+        self.assertEqual(2, report_routes["fast"]["parallel_slots"])
+        self.assertEqual(8192, report_routes["fast"]["context_window"])
         self.assertIn("llamacpp-planner/eve-observer", aliases)
         self.assertIn("llamacpp-relationship/eve-fast", aliases)
         self.assertNotIn("llamacpp-planner/eve-planner", aliases)

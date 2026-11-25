@@ -911,6 +911,9 @@ final class EveMonitorModel: ObservableObject {
     private let requiredAPIVersion = 5
     private let powerStateKey = "eve.monitor.poweredOff"
     private let baseURL = URL(string: "http://127.0.0.1:8787")!
+    private let routeSegmentCharacters = CharacterSet(
+        charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+    )
     private let compactMonitorQuery = [URLQueryItem(name: "compact", value: "1")]
     private let coreServiceProbeTargets: [(id: String, url: URL)] = [
         ("monitor-api", URL(string: "http://127.0.0.1:8787/api/monitor?compact=1")!),
@@ -1973,7 +1976,9 @@ final class EveMonitorModel: ObservableObject {
 
     private func loadPersonalConversation(threadID: String) async {
         do {
-            let safeThreadID = threadID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? threadID
+            guard let safeThreadID = encodedRouteSegment(threadID) else {
+                throw MonitorAPIError.invalidResponse
+            }
             let records: [MonitorMessageRecord] = try await request(
                 "/api/thread/\(safeThreadID)",
                 timeout: 4
@@ -2402,8 +2407,7 @@ final class EveMonitorModel: ObservableObject {
         queryItems: [URLQueryItem] = [],
         timeout: TimeInterval
     ) async throws -> Payload {
-        let endpoint = baseURL.appendingPathComponent(path.trimmingCharacters(in: CharacterSet(charactersIn: "/")))
-        var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
+        var components = endpointComponents(path)
         components?.queryItems = queryItems.isEmpty ? nil : queryItems
         guard let url = components?.url else { throw MonitorAPIError.invalidResponse }
         var request = URLRequest(url: url)
@@ -2420,7 +2424,9 @@ final class EveMonitorModel: ObservableObject {
     }
 
     private func post<Payload: Decodable, Body: Encodable>(_ path: String, body: Body, timeout: TimeInterval) async throws -> Payload {
-        let url = baseURL.appendingPathComponent(path.trimmingCharacters(in: CharacterSet(charactersIn: "/")))
+        guard let url = endpointComponents(path)?.url else {
+            throw MonitorAPIError.invalidResponse
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = timeout
@@ -2436,6 +2442,18 @@ final class EveMonitorModel: ObservableObject {
             return data
         }
         throw MonitorAPIError.server(envelope.error ?? "Eve returned an error.")
+    }
+
+    private func encodedRouteSegment(_ value: String) -> String? {
+        guard !value.isEmpty else { return nil }
+        return value.addingPercentEncoding(withAllowedCharacters: routeSegmentCharacters)
+    }
+
+    private func endpointComponents(_ path: String) -> URLComponents? {
+        let relative = path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+        components?.percentEncodedPath = "/\(relative)"
+        return components
     }
 
     private func runHelper(_ command: String) {

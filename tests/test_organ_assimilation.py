@@ -19,6 +19,11 @@ def five_lane_records():
 
 
 class OrganAssimilationTests(unittest.TestCase):
+    def setUp(self):
+        observer = patch.object(eve, "observe_core_runner", return_value={"available": False})
+        observer.start()
+        self.addCleanup(observer.stop)
+
     def test_organ_registry_preserves_five_lane_boundary(self):
         self.assertIn("five_model_lanes", eve.ORGAN_ASSIMILATION_REGISTRY)
         self.assertIn("OpenClaw", eve.ORGAN_ASSIMILATION_REGISTRY["openclaw_body_action_nervous_system"]["label"])
@@ -548,7 +553,8 @@ class OrganAssimilationTests(unittest.TestCase):
             "service_status": {"langfuse": "server_ready"},
         }
         dvc_manifest = {
-            "status": "ready",
+            "status": "verified",
+            "restore": {"verified": True},
             "file_count": 4,
             "dvc": {
                 "available": True,
@@ -604,6 +610,14 @@ class OrganAssimilationTests(unittest.TestCase):
             patch.object(eve, "autonomy_latest_explorer_whole_system_result", return_value={"status": "passed"}),
         ):
             report = eve.build_lab_live_activation_report(dict(eve.DEFAULT_CONFIG), prefer_runtime=False)
+
+            for manifest_status, restored in [("ready", True), ("verified", False), ("verified", "false"), ("verified", None)]:
+                with self.subTest(manifest_status=manifest_status, restored=restored):
+                    dvc_manifest.update({"status": manifest_status, "restore": {"verified": restored}})
+                    incomplete = eve.build_lab_live_activation_report(dict(eve.DEFAULT_CONFIG), prefer_runtime=False)
+                    dvc_layer = next(layer for layer in incomplete["layers"] if layer["id"] == "dvc_dataset_versioning")
+                    self.assertEqual("lab_ready", dvc_layer["status"])
+                    self.assertFalse(dvc_layer["live_now"])
 
         by_id = {item["id"]: item for item in report["layers"]}
         self.assertEqual("live_with_gates", report["status"])

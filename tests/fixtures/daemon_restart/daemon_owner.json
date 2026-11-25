@@ -1,0 +1,10 @@
+{
+  "schema_id": "eve.daemon_owner.v1",
+  "owner_id": "fixture-owner",
+  "pid": 12345,
+  "run_mode": "recurrent",
+  "code_path": "/fixture/eve.py",
+  "state_root": "/fixture/.eve",
+  "started_at": "2026-09-17T05:01:14+00:00",
+  "status": "running"
+}

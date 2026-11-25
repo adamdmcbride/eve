@@ -355,7 +355,7 @@ class TrainingDatasetTests(unittest.TestCase):
             examples[0]["tool_action_evidence"]["user_consequence_observed_text"],
         )
 
-    def test_rejected_continuous_thought_becomes_grounded_correction_pair(self) -> None:
+    def test_legacy_fallback_is_not_automatically_an_ideal_correction_pair(self) -> None:
         record = {
             "schema_version": eve.CONTINUOUS_THOUGHT_LEARNING_SCHEMA_VERSION,
             "id": "thought-learning-1",
@@ -392,18 +392,9 @@ class TrainingDatasetTests(unittest.TestCase):
             "safe_for_training": True,
         }
 
-        examples, excluded = eve.training_examples_from_continuous_thought_learning([record])
-
-        self.assertEqual([], excluded)
-        self.assertEqual(1, len(examples))
-        row = examples[0]
-        self.assertEqual("continuous_thought_learning", row["source"])
-        self.assertEqual(record["attempted_response"], row["actual_response"])
-        self.assertEqual(record["preferred_response"], row["preferred_response"])
-        self.assertEqual("eve-deep", row["tool_action_evidence"]["critic_model"])
-        self.assertFalse(row["provenance"]["candidate_is_state_evidence"])
-        self.assertFalse(row["provenance"]["canonical_memory_writer"])
-        self.assertIn("self_narration_rejected", row["labels"])
+        examples, excluded = eve.training_examples_from_continuous_thought_learning([record], reviews=[])
+        self.assertEqual([], examples)
+        self.assertEqual("missing_valid_external_correction_review", excluded[0]["reason"])
 
     def test_continuous_thought_learning_record_is_candidate_only_and_non_promoting(self) -> None:
         state_record = {
@@ -442,7 +433,8 @@ class TrainingDatasetTests(unittest.TestCase):
             "rejected_model_candidate_not_state_evidence",
             saved_record["candidate_status"],
         )
-        self.assertTrue(saved_record["safe_for_training"])
+        self.assertFalse(saved_record["safe_for_training"])
+        self.assertEqual("error_handling_regression", saved_record["example_role"])
         self.assertFalse(saved_record["authority"]["canonical_memory_writer"])
         self.assertFalse(saved_record["authority"]["model_promotion_authority"])
         self.assertTrue(saved_record["authority"]["training_candidate_only"])

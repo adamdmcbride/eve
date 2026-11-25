@@ -2,7 +2,7 @@
 
 Status: evidence-log  
 Last reviewed: 2026-08-23  
-Current authority: direct-dependency review complete; transitive inventory pending  
+Current authority: direct-dependency review complete; exact public SBOM reviewed; next-SBOM recheck pending  
 Supersedes: none  
 Superseded by: none
 
@@ -29,6 +29,25 @@ This is release engineering, not legal advice.
    `tests/test_dependency_license_audit.py` so project metadata, `uv.lock`, the
    notice inventory, install groups, reviewed versions, and forbidden direct
    dependencies cannot drift silently.
+8. Retrieved GitHub's SPDX 2.3 SBOM for public `main`
+   `e33ce6d9512fc549a6fa65c444c08af5952da3ea`, generated at
+   `2026-08-23T19:20:07Z`: 187 packages, 414 dependency relationships, SBOM
+   SHA-256 `227dfdf79159d4be82f2b6adc0c730bb14a6b052bf2896f9189eed8f4d262073`.
+9. Verified the three pinned GitHub Actions' exact license files as MIT and
+   recorded their immutable URLs and hashes in `public_release.json`.
+10. Resolved two scanner-overbroad package conclusions against exact official
+    PyPI JSON: `aiohappyeyeballs==2.7.1` and `typing-extensions==4.16.0` both
+    declare PSF licensing. Their exact metadata hashes are recorded in policy.
+11. Resolved the SBOM root package's `NOASSERTION` against the exact Apache-2.0
+    `LICENSE` at public-main commit `e33ce6d9512fc549a6fa65c444c08af5952da3ea`;
+    its SHA-256 is
+    `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30`.
+12. Bound SBOM review to the checkout's complete resolved Python package
+    inventory: every registry package/version in `uv.lock`, plus the project
+    name/version, must
+    exactly equal the SBOM's PyPI package URLs. Non-Python packages such as
+    pinned GitHub Actions remain independently license-reviewed. The audit also
+    records the exact `uv.lock` SHA-256.
 
 No dependency archive or third-party license copy is added to the Eve source
 tree by this audit.
@@ -46,24 +65,42 @@ tree by this audit.
 
 - `mlx-embeddings` was removed from the `techlab` extra.
 - `arize-phoenix` was removed from the `oss-lab` extra.
+- `peft` was removed from the public `oss-lab` extra. Its exact SBOM path was
+  `Eve -> PEFT 0.20.0 -> Torch 2.13.0 -> CUDA toolkit`; that path introduced
+  seven `LicenseRef-NVIDIA-Proprietary` packages and two CUDA packages with
+  `NOASSERTION`. PEFT remains a detectable, separately installed lab tool; this
+  change removes automatic public distribution, not Eve's governed adapter capability.
 - DVC and Ragas were removed from the public `oss-lab` extra after the initial
   GitHub dependency graph exposed open advisories with no patched release for
   their affected dependency paths. Their optional probes remain fail-closed
   and user-managed rather than installing a knowingly vulnerable graph.
-- `public_release.json` lists both as forbidden declared dependencies.
+- `public_release.json` lists all three license-blocked direct dependencies as
+  forbidden declarations.
 - The release audit fails if either dependency is reintroduced into
   `pyproject.toml`.
 - Existing optional integration probes remain non-authoritative and can report
   a separately installed local component.
-- Deterministic direct-dependency gate: 17 declared dependencies, zero errors,
+- Deterministic direct-dependency gate: 16 declared dependencies, zero errors,
   zero warnings.
+- The dependency audit now accepts `--sbom <spdx.json> --source-revision <sha>`
+  and fails closed on unresolved or non-permissive transitive licenses unless
+  an exact package URL has a reviewed effective license, evidence URL, and
+  evidence SHA-256 in `public_release.json`. SBOM runs require an immutable
+  full-length revision and record the analyzed artifact's own SHA-256 and SPDX
+  creation metadata.
+- The current pre-removal public SBOM correctly remains blocked with ten
+  errors after the six exact evidence overrides: seven proprietary NVIDIA
+  packages, two unresolved CUDA packages, and one stale-lock-inventory finding.
+  Its PyPI graph contains all 147 currently expected package identities plus
+  26 pre-removal extras (`peft`, `torch`, and their acceleration graph). The
+  audit reviewed 178 of 187 packages and reported zero warnings.
 
 ## Remaining gate
 
-Publish the clean source root first, then generate and review GitHub's
-dependency-graph SBOM for that exact root commit before the first public tag.
-GitHub supports `uv` version updates and transitive dependency submission, so
-the repository includes a weekly `uv` Dependabot configuration in addition to
-the deterministic direct-dependency gate. Any unknown, conflicting, or
-source-available transitive license remains a tag blocker until explicitly
-resolved.
+Merge the PEFT removal through the protected public PR flow, wait for GitHub's
+dependency graph to regenerate, then run the conservative SPDX audit against
+that new exact commit. The current published SBOM is expected to remain blocked
+because it truthfully describes the pre-removal commit. Any remaining unknown,
+conflicting, source-available, or proprietary transitive license remains a tag
+blocker until explicitly resolved. No first public tag should be created before
+that new-SBOM readback passes.

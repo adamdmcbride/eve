@@ -20,6 +20,9 @@ import re
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import eve_predictive_dynamics as predictive_dynamics
+import eve_perceptual_inference as perceptual_inference
+
 
 EVENT_SCHEMA = "eve.sensory_event.v1"
 FRAME_SCHEMA = "eve.sensory_frame.v1"
@@ -27,6 +30,8 @@ ADAPTER_SCHEMA = "eve.sensory_adapter_event.v1"
 QUALITY_SPACE_SCHEMA = "eve.perceptual_quality_space.v1"
 ATTENTION_SCHEMA_SCHEMA = "eve.attention_schema.v1"
 PREDICTIVE_PERCEPTION_SCHEMA = "eve.predictive_perception.v1"
+RECURRENT_PROCESSING_SCHEMA = "eve.input_recurrent_processing.v1"
+PERCEPTUAL_ORGANIZATION_SCHEMA = "eve.perceptual_organization.v1"
 BOUNDARY = (
     "Functional selective perception over typed evidence; not proof of "
     "subjective sensation or consciousness."
@@ -39,6 +44,14 @@ ATTENTION_SCHEMA_BOUNDARY = (
 PREDICTIVE_PERCEPTION_BOUNDARY = (
     "Recurrent prediction and precision-weighted error over admitted feature "
     "state; not a claim that prediction error is consciously experienced."
+)
+RECURRENT_PROCESSING_BOUNDARY = (
+    "Inspectable algorithmic recurrence inside Eve's feature-only input organ; "
+    "not biological reentry, subjective perception, or proof of consciousness."
+)
+PERCEPTUAL_ORGANIZATION_BOUNDARY = (
+    "Organized feature-only entity and multisensory episode representations; "
+    "not raw scene reconstruction, phenomenal unity, or proof of consciousness."
 )
 MODALITIES = {
     "auditory",
@@ -438,6 +451,127 @@ def predict_next_features(
     return prediction if len(prediction) > 1 else {}
 
 
+def predict_next_features_from_history(
+    current: object,
+    prior_channel: object,
+    *,
+    source_precision: object = 100.0,
+) -> Tuple[Dict[str, object], Dict[str, List[object]], Dict[str, Dict[str, object]]]:
+    """Forecast admitted features from bounded recurrent channel history.
+
+    The returned history contains only the same sparse normalized dimensions
+    already admitted by :func:`normalize_event`.  Forecast summaries omit raw
+    expert traces and have no sensor, memory, tool, or action authority.
+    Malformed prior state is ignored per feature rather than poisoning a live
+    perception frame.
+    """
+    current_features = current if isinstance(current, dict) else {}
+    prior = prior_channel if isinstance(prior_channel, dict) else {}
+    modality = _text(current_features.get("feature_modality"), 32)
+    prior_features = prior.get("last_features") if isinstance(prior.get("last_features"), dict) else {}
+    prior_modality = _text(prior_features.get("feature_modality"), 32)
+    raw_history = prior.get("feature_history") if isinstance(prior.get("feature_history"), dict) else {}
+    compatible = bool(modality and modality == prior_modality)
+    history: Dict[str, List[object]] = {}
+    predictions: Dict[str, object] = {"feature_modality": modality} if modality else {}
+    models: Dict[str, Dict[str, object]] = {}
+    for key, current_value in current_features.items():
+        if key == "feature_modality":
+            continue
+        admitted: List[object] = []
+        if compatible and isinstance(raw_history.get(key), list):
+            for value in raw_history[key][-predictive_dynamics.MAX_HISTORY :]:
+                if key in FEATURE_LIMITS and _is_finite_number(value):
+                    numeric = float(value)
+                    if 0.0 <= numeric <= float(FEATURE_LIMITS[key]):
+                        admitted.append(numeric)
+                elif key in FEATURE_ENUMS and isinstance(value, str) and value in FEATURE_ENUMS[key]:
+                    admitted.append(value)
+                elif key in {"active", "visible"} and isinstance(value, bool):
+                    admitted.append(value)
+        if key in FEATURE_LIMITS and _is_finite_number(current_value):
+            current_value = float(current_value)
+        elif key in FEATURE_ENUMS and isinstance(current_value, str) and current_value in FEATURE_ENUMS[key]:
+            pass
+        elif key in {"active", "visible"} and isinstance(current_value, bool):
+            pass
+        else:
+            continue
+        admitted.append(current_value)
+        admitted = admitted[-predictive_dynamics.MAX_HISTORY :]
+        history[key] = admitted
+        if len(admitted) < 2:
+            predictions[key] = current_value
+            models[key] = {
+                "schema_version": predictive_dynamics.SCHEMA,
+                "kind": "uncalibrated",
+                "selected_expert": "persistence_bootstrap",
+                "history_length": len(admitted),
+                "forecast_precision": 0.0,
+                "prediction": current_value,
+                "action_authority": False,
+            }
+            continue
+        if key in FEATURE_LIMITS and len(admitted) == 2:
+            # Preserve Eve's established two-sample motion expectation while
+            # marking it as a weak bootstrap hypothesis.  Once a third outcome
+            # exists, prospective expert errors select the recurrent model.
+            projected = _clamp(
+                float(admitted[-1]) + float(admitted[-1]) - float(admitted[-2]),
+                0.0,
+                float(FEATURE_LIMITS[key]),
+                float(admitted[-1]),
+            )
+            try:
+                bootstrap_precision = _clamp(source_precision, 0.0, 100.0, 0.0) * 0.5
+            except (TypeError, ValueError):
+                bootstrap_precision = 0.0
+            predictions[key] = round(projected, 6)
+            models[key] = {
+                "schema_version": predictive_dynamics.SCHEMA,
+                "kind": "numeric",
+                "selected_expert": "velocity_bootstrap",
+                "history_length": len(admitted),
+                "forecast_precision": round(bootstrap_precision, 3),
+                "prediction": round(projected, 6),
+                "action_authority": False,
+            }
+            continue
+        try:
+            forecast = predictive_dynamics.forecast_feature_history(
+                admitted,
+                limit=FEATURE_LIMITS.get(key),
+                source_precision=source_precision,
+            )
+        except (TypeError, ValueError):
+            predictions[key] = current_value
+            models[key] = {
+                "schema_version": predictive_dynamics.SCHEMA,
+                "kind": "invalid_prior_fallback",
+                "selected_expert": "persistence_fallback",
+                "history_length": len(admitted),
+                "forecast_precision": 0.0,
+                "prediction": current_value,
+                "action_authority": False,
+            }
+            continue
+        predictions[key] = forecast["prediction"]
+        models[key] = {
+            "schema_version": forecast["schema_version"],
+            "kind": forecast["kind"],
+            "selected_expert": forecast["selected_expert"],
+            "history_length": forecast["history_length"],
+            "forecast_precision": forecast["forecast_precision"],
+            "prediction": forecast["prediction"],
+            "action_authority": False,
+        }
+    return (
+        predictions if len(predictions) > 1 else {},
+        history,
+        models,
+    )
+
+
 def feature_prediction_error(
     actual: object,
     predicted: object,
@@ -796,6 +930,12 @@ def _event_score(event: Dict[str, object], habituation_factor: float, return_pen
     if event.get("safety_critical"):
         base = max(base, 98.0)
     effective = max(0.0, min(100.0, base * habituation_factor - return_penalty))
+    # Repetition may attenuate telemetry, not a newly delivered human turn or
+    # a still-critical condition. Apply capture floors after habituation.
+    if event.get("direct_human"):
+        effective = max(effective, 94.0)
+    if event.get("safety_critical"):
+        effective = max(effective, 98.0)
     return round(effective, 2), {
         "bottom_up": round(bottom_up, 2),
         "top_down": round(top_down, 2),
@@ -823,6 +963,8 @@ def _habituation(
     recovery_seconds: int,
     quality_space_enabled: bool,
     predictive_coding_enabled: bool,
+    predictive_dynamics_enabled: bool,
+    generative_perception_enabled: bool,
 ) -> Tuple[int, float, bool, Dict[str, object]]:
     prior_habituation = _prior_dict(prior_frame, "habituation")
     prior_channels = _prior_dict(prior_frame, "channels")
@@ -872,6 +1014,43 @@ def _habituation(
             "surprising": False,
             "lesioned": True,
         }
+    )
+    prior_prediction_models = (
+        prior_channel.get("prediction_models")
+        if isinstance(prior_channel.get("prediction_models"), dict)
+        else {}
+    )
+    if prediction_error.get("comparable") and prior_prediction_models:
+        prediction_error["forecast"] = "bounded_multi_hypothesis"
+        prediction_error["selected_experts"] = {
+            key: _text(model.get("selected_expert"), 40)
+            for key, model in prior_prediction_models.items()
+            if isinstance(model, dict) and _text(model.get("selected_expert"), 40)
+        }
+        precisions = [
+            float(model.get("forecast_precision") or 0.0)
+            for model in prior_prediction_models.values()
+            if isinstance(model, dict)
+            and _is_finite_number(model.get("forecast_precision"))
+        ]
+        prediction_error["mean_forecast_precision"] = (
+            round(sum(precisions) / len(precisions), 3) if precisions else None
+        )
+    else:
+        precisions = [
+            float(model.get("forecast_precision") or 0.0)
+            for model in prior_prediction_models.values()
+            if isinstance(model, dict)
+            and _is_finite_number(model.get("forecast_precision"))
+        ]
+    event["perceptual_hypothesis"] = perceptual_inference.infer_hypothesis(
+        event.get("features"),
+        prior_channel.get("predicted_features"),
+        sensory_precision=event.get("precision"),
+        prior_precision=(sum(precisions) / len(precisions) if precisions else 0.0),
+        feature_limits=FEATURE_LIMITS,
+        feature_enums=FEATURE_ENUMS,
+        lesioned=not bool(generative_perception_enabled),
     )
     quality_changed = bool(
         quality.get("comparable")
@@ -928,10 +1107,23 @@ def _habituation(
         factor = max(factor, 0.90)
     if event.get("safety_critical"):
         factor = 1.0
-    next_prediction = predict_next_features(
-        event.get("features"),
-        prior_channel.get("last_features"),
-    )
+    if predictive_coding_enabled and predictive_dynamics_enabled:
+        next_prediction, feature_history, prediction_models = predict_next_features_from_history(
+            event.get("features"),
+            prior_channel,
+            source_precision=event.get("precision"),
+        )
+    elif predictive_coding_enabled:
+        next_prediction = predict_next_features(
+            event.get("features"),
+            prior_channel.get("last_features"),
+        )
+        feature_history = {}
+        prediction_models = {}
+    else:
+        next_prediction = {}
+        feature_history = {}
+        prediction_models = {}
     return repeat_count, round(factor, 3), changed, {
         "channel": channel,
         "fingerprint": fingerprint,
@@ -941,6 +1133,8 @@ def _habituation(
         "prediction_error": prediction_error,
         "last_features": copy.deepcopy(event.get("features") or {}),
         "predicted_features": next_prediction,
+        "feature_history": feature_history,
+        "prediction_models": prediction_models,
     }
 
 
@@ -1053,6 +1247,131 @@ def _bind_events(
         member_ids.update(grouped_member_ids)
     unbound = [item for item in scored if str(item.get("id")) not in member_ids]
     return unbound, episodes
+
+
+def _perceptual_organization(
+    events: Sequence[Dict[str, object]],
+    episodes: Sequence[Dict[str, object]],
+    entity_tracks: Sequence[Dict[str, object]],
+    candidates: Sequence[Dict[str, object]],
+    winner: Dict[str, object],
+    *,
+    enabled: bool,
+) -> Dict[str, object]:
+    """Project typed input features into bounded entity/episode structure.
+
+    The representation is intentionally weaker than a reconstructed visual
+    scene.  It records only already-admitted sparse features, co-reference,
+    temporal binding, figure/ground selection, and persistent entity tracks.
+    """
+    if not enabled:
+        return {
+            "schema_version": PERCEPTUAL_ORGANIZATION_SCHEMA,
+            "enabled": False,
+            "lesioned": True,
+            "representation_count": 0,
+            "entity_track_count": 0,
+            "figure": {},
+            "ground": [],
+            "representations": [],
+            "causal_role": "disabled",
+            "boundary": PERCEPTUAL_ORGANIZATION_BOUNDARY,
+        }
+
+    by_id = {
+        str(item.get("id")): item
+        for item in events
+        if isinstance(item, dict) and item.get("id")
+    }
+    representations: List[Dict[str, object]] = []
+    for episode in episodes[:8]:
+        members = [
+            by_id[member_id]
+            for member_id in episode.get("member_ids") or []
+            if str(member_id) in by_id
+        ]
+        member_views: List[Dict[str, object]] = []
+        observed_times: List[datetime] = []
+        for member in members:
+            observed = _parse_time(member.get("observed_at"))
+            if observed is not None:
+                observed_times.append(observed)
+            features = (
+                copy.deepcopy(member.get("features"))
+                if isinstance(member.get("features"), dict)
+                else {}
+            )
+            member_views.append(
+                {
+                    "id": member.get("id"),
+                    "modality": member.get("modality"),
+                    "source": member.get("source"),
+                    "fingerprint": member.get("fingerprint"),
+                    "features": features,
+                    "feature_dimensions": sorted(
+                        key for key in features if key != "feature_modality"
+                    ),
+                    "precision": member.get("precision"),
+                }
+            )
+        span_seconds = (
+            round((max(observed_times) - min(observed_times)).total_seconds(), 3)
+            if len(observed_times) >= 2
+            else 0.0
+        )
+        representations.append(
+            {
+                "representation_id": episode.get("id"),
+                "subject": episode.get("subject"),
+                "modalities": copy.deepcopy(episode.get("modalities") or []),
+                "members": member_views,
+                "member_count": len(member_views),
+                "relations": ["co_referential", "co_temporal", "cross_modal"],
+                "temporal_span_seconds": span_seconds,
+                "binding_basis": episode.get("binding_basis"),
+                "precision": episode.get("precision"),
+                "persistence": "features_only",
+            }
+        )
+
+    def role_view(item: object) -> Dict[str, object]:
+        candidate = item if isinstance(item, dict) else {}
+        if not candidate:
+            return {}
+        return {
+            "id": candidate.get("id"),
+            "modality": candidate.get("modality"),
+            "subject": candidate.get("subject"),
+            "fingerprint": candidate.get("fingerprint"),
+            "selection_score": candidate.get(
+                "selection_score", candidate.get("attention_score")
+            ),
+        }
+
+    figure = role_view(winner)
+    ground = [
+        role_view(item)
+        for item in candidates
+        if isinstance(item, dict) and item.get("id") != winner.get("id")
+    ][:7]
+    return {
+        "schema_version": PERCEPTUAL_ORGANIZATION_SCHEMA,
+        "enabled": True,
+        "lesioned": False,
+        "representation_count": len(representations),
+        "entity_track_count": len(entity_tracks),
+        "figure": figure,
+        "ground": ground,
+        "representations": representations,
+        "organization_basis": [
+            "source-attributed sparse features",
+            "entity or correlation identity",
+            "bounded temporal binding",
+            "capacity-limited figure/ground selection",
+        ],
+        "causal_role": "cross-modal binding and organized attention input",
+        "boundary": PERCEPTUAL_ORGANIZATION_BOUNDARY,
+    }
 
 
 def _coalesce_candidates(
@@ -1381,6 +1700,10 @@ def _project_next_attention_state(
                 _clamp(float(components.get("base") or 0.0) * factor - penalty),
                 2,
             )
+            if candidate.get("direct_human"):
+                candidate["attention_score"] = max(candidate["attention_score"], 94.0)
+            if candidate.get("safety_critical"):
+                candidate["attention_score"] = max(candidate["attention_score"], 98.0)
             candidate["repeat_count"] = next_repeat
         projected.append(candidate)
     controlled, _ = _apply_attention_schema_control(
@@ -1505,7 +1828,18 @@ def _score_prior_attention_prediction(
 
 
 def _orienting_request(winner: Dict[str, object], threshold: float) -> Dict[str, object]:
-    if not winner or _selection_score(winner) < threshold:
+    hypothesis = (
+        winner.get("perceptual_hypothesis")
+        if isinstance(winner.get("perceptual_hypothesis"), dict)
+        else {}
+    )
+    uncertainty_sampling = bool(
+        hypothesis.get("needs_active_sampling")
+        and float(winner.get("goal_relevance") or 0.0) >= 60.0
+    )
+    if not winner or (
+        _selection_score(winner) < threshold and not uncertainty_sampling
+    ):
         return {}
     modality = str(winner.get("modality") or "world")
     requires_permission = bool(winner.get("requires_permission"))
@@ -1538,8 +1872,13 @@ def _orienting_request(winner: Dict[str, object], threshold: float) -> Dict[str,
         "maximum_sample_seconds": 15,
         "authority": "proposal_only",
         "reason": (
-            "Highest admitted selection score after bounded attention control; "
-            "execution remains under Eve's existing capability and permission gates."
+            (
+                "A goal-relevant top-down and bottom-up feature conflict remains "
+                "ambiguous and proposes one bounded evidence sample; "
+                if uncertainty_sampling
+                else "Highest admitted selection score after bounded attention control; "
+            )
+            + "execution remains under Eve's existing capability and permission gates."
         ),
     }
 
@@ -1556,9 +1895,15 @@ def build_frame(
     quality_space_enabled: bool = True,
     attention_schema_enabled: bool = True,
     predictive_coding_enabled: bool = True,
+    predictive_dynamics_enabled: bool = True,
+    input_recurrence_enabled: bool = True,
+    perceptual_organization_enabled: bool = True,
+    generative_perception_enabled: bool = True,
 ) -> Dict[str, object]:
     timestamp = _now(now)
     bounded_capacity = max(1, min(8, int(capacity or DEFAULT_CAPACITY)))
+    supplied_prior = prior_frame if isinstance(prior_frame, dict) else {}
+    effective_prior = supplied_prior if input_recurrence_enabled else {}
     normalized: List[Dict[str, object]] = []
     seen_ids: set[str] = set()
     for raw in events:
@@ -1569,8 +1914,8 @@ def build_frame(
         seen_ids.add(event_id)
         normalized.append(event)
 
-    prior_habituation = _prior_dict(prior_frame, "habituation")
-    prior_channels = _prior_dict(prior_frame, "channels")
+    prior_habituation = _prior_dict(effective_prior, "habituation")
+    prior_channels = _prior_dict(effective_prior, "channels")
     habituation = copy.deepcopy(prior_habituation)
     channels = copy.deepcopy(prior_channels)
     scored: List[Dict[str, object]] = []
@@ -1579,13 +1924,15 @@ def build_frame(
     for event in normalized:
         repeat_count, factor, changed, memory = _habituation(
             event,
-            prior_frame=prior_frame,
+            prior_frame=effective_prior,
             timestamp=timestamp,
             recovery_seconds=max(1, int(recovery_seconds)),
             quality_space_enabled=bool(quality_space_enabled),
             predictive_coding_enabled=bool(predictive_coding_enabled),
+            predictive_dynamics_enabled=bool(predictive_dynamics_enabled),
+            generative_perception_enabled=bool(generative_perception_enabled),
         )
-        penalty = _recent_orientation_penalty(event, prior_frame, timestamp)
+        penalty = _recent_orientation_penalty(event, effective_prior, timestamp)
         score, components = _event_score(event, factor, penalty)
         event["attention_score"] = score
         event["score_components"] = components
@@ -1603,14 +1950,19 @@ def build_frame(
             "last_seen_at": timestamp,
             "last_features": copy.deepcopy(event.get("features") or {}),
             "predicted_features": copy.deepcopy(memory.get("predicted_features") or {}),
+            "feature_history": copy.deepcopy(memory.get("feature_history") or {}),
+            "prediction_models": copy.deepcopy(memory.get("prediction_models") or {}),
             "repeat_count": repeat_count,
         }
         scored.append(event)
 
-    unbound, episodes = _bind_events(
-        scored,
-        binding_window_seconds=max(0, int(binding_window_seconds)),
-    )
+    if perceptual_organization_enabled:
+        unbound, episodes = _bind_events(
+            scored,
+            binding_window_seconds=max(0, int(binding_window_seconds)),
+        )
+    else:
+        unbound, episodes = list(scored), []
     coalesced_candidates, duplicate_candidates = _coalesce_candidates(
         [*unbound, *episodes]
     )
@@ -1666,18 +2018,30 @@ def build_frame(
         orient_threshold=float(orient_threshold),
     )
     attention_schema["calibration"] = _score_prior_attention_prediction(
-        prior_frame,
+        effective_prior,
         candidates,
         winner,
     )
-    entity_tracks = _entity_tracks(
+    entity_tracks = (
+        _entity_tracks(
+            normalized,
+            prior_frame=effective_prior,
+            timestamp=timestamp,
+        )
+        if perceptual_organization_enabled
+        else []
+    )
+    perceptual_organization = _perceptual_organization(
         normalized,
-        prior_frame=prior_frame,
-        timestamp=timestamp,
+        episodes,
+        entity_tracks,
+        candidates,
+        winner,
+        enabled=bool(perceptual_organization_enabled),
     )
     recent_orientations = [
         copy.deepcopy(item)
-        for item in ((prior_frame or {}).get("recent_orientations") or [])
+        for item in (effective_prior.get("recent_orientations") or [])
         if isinstance(item, dict)
     ][-7:]
     if orientation:
@@ -1696,7 +2060,7 @@ def build_frame(
     }
     prior_active = {
         str(item.get("fingerprint"))
-        for item in ((prior_frame or {}).get("observations") or [])
+        for item in (effective_prior.get("observations") or [])
         if isinstance(item, dict) and item.get("fingerprint")
     }
     retained = active_fingerprints | prior_active
@@ -1724,6 +2088,56 @@ def build_frame(
         float(item.get("weighted_error") or 0.0)
         for item in prediction_errors
     ]
+    perceptual_hypotheses = [
+        item.get("perceptual_hypothesis")
+        for item in scored
+        if isinstance(item.get("perceptual_hypothesis"), dict)
+    ]
+    recurrent_channels = {
+        str(channel_key)
+        for channel_key, channel in channels.items()
+        if isinstance(channel, dict)
+        and (
+            int(channel.get("repeat_count") or 0) >= 2
+            or any(
+                isinstance(model, dict)
+                and int(model.get("history_length") or 0) >= 2
+                for model in (
+                    channel.get("prediction_models", {}).values()
+                    if isinstance(channel.get("prediction_models"), dict)
+                    else []
+                )
+            )
+        )
+    }
+    recurrent_dimension_count = sum(
+        1
+        for channel in channels.values()
+        for model in (
+            channel.get("prediction_models", {}).values()
+            if isinstance(channel.get("prediction_models"), dict)
+            else []
+        )
+        if isinstance(model, dict) and int(model.get("history_length") or 0) >= 2
+    )
+    recurrent_track_count = sum(
+        1
+        for track in entity_tracks
+        if isinstance(track, dict) and int(track.get("observation_count") or 0) >= 2
+    )
+    prior_state_present = bool(
+        supplied_prior
+        and any(
+            supplied_prior.get(key)
+            for key in (
+                "habituation",
+                "channels",
+                "entity_tracks",
+                "recent_orientations",
+                "attention_schema",
+            )
+        )
+    )
     return {
         "schema_version": FRAME_SCHEMA,
         "generated_at": timestamp,
@@ -1752,6 +2166,56 @@ def build_frame(
         "channels": channels,
         "recent_orientations": recent_orientations[-8:],
         "attention_schema": attention_schema,
+        "generative_perception": {
+            "schema_version": perceptual_inference.SCHEMA_ID,
+            "enabled": bool(generative_perception_enabled),
+            "lesioned": not bool(generative_perception_enabled),
+            "hypothesis_count": len(perceptual_hypotheses),
+            "comparable_count": sum(
+                1 for item in perceptual_hypotheses if item.get("comparable")
+            ),
+            "top_down_dominant_count": sum(
+                1 for item in perceptual_hypotheses if item.get("dominance") == "top_down"
+            ),
+            "sensory_override_count": sum(
+                1 for item in perceptual_hypotheses if item.get("sensory_override")
+            ),
+            "active_sampling_proposal_count": sum(
+                1 for item in perceptual_hypotheses if item.get("needs_active_sampling")
+            ),
+            "observation_rewritten": False,
+            "proposal_only": True,
+            "causal_role": "feature hypothesis selection and proposal-only uncertainty sampling",
+            "boundary": perceptual_inference.BOUNDARY,
+        },
+        "recurrent_processing": {
+            "schema_version": RECURRENT_PROCESSING_SCHEMA,
+            "enabled": bool(input_recurrence_enabled),
+            "lesioned": not bool(input_recurrence_enabled),
+            "prior_state_present": prior_state_present,
+            "prior_state_consumed": bool(input_recurrence_enabled and prior_state_present),
+            "channel_count": sum(
+                1 for channel in channels.values() if isinstance(channel, dict)
+            ),
+            "recurrent_channel_count": len(recurrent_channels),
+            "recurrent_dimension_count": recurrent_dimension_count,
+            "recurrent_entity_track_count": recurrent_track_count,
+            "feedback_paths": [
+                "habituation_and_dishabituation",
+                "feature_prediction_and_error",
+                "entity_tracking",
+                "attention_prediction_calibration",
+                "inhibition_of_return",
+            ],
+            "state_retention": "bounded feature-only prior frame",
+            "causal_role": (
+                "current input processing depends on bounded prior input state"
+                if input_recurrence_enabled
+                else "disabled"
+            ),
+            "boundary": RECURRENT_PROCESSING_BOUNDARY,
+        },
+        "perceptual_organization": perceptual_organization,
         "predictive_perception": {
             "schema_version": PREDICTIVE_PERCEPTION_SCHEMA,
             "enabled": bool(predictive_coding_enabled),
@@ -1771,7 +2235,40 @@ def build_frame(
                 else None
             ),
             "error_threshold": DEFAULT_PREDICTION_ERROR_THRESHOLD,
-            "forecast": "clipped_constant_velocity_numeric_and_persistent_categorical",
+            "forecast": (
+                "bounded_multi_hypothesis_numeric_and_categorical"
+                if predictive_coding_enabled and predictive_dynamics_enabled
+                else (
+                    "clipped_constant_velocity_numeric_and_persistent_categorical"
+                    if predictive_coding_enabled
+                    else "disabled"
+                )
+            ),
+            "dynamics_enabled": bool(
+                predictive_coding_enabled and predictive_dynamics_enabled
+            ),
+            "history_retention_limit": predictive_dynamics.MAX_HISTORY,
+            "selected_expert_counts": {
+                expert: sum(
+                    1
+                    for channel in channels.values()
+                    for model in (
+                        channel.get("prediction_models", {}).values()
+                        if isinstance(channel.get("prediction_models"), dict)
+                        else []
+                    )
+                    if isinstance(model, dict)
+                    and model.get("selected_expert") == expert
+                )
+                for expert in (
+                    "persistence_bootstrap",
+                    "velocity_bootstrap",
+                    "persistence",
+                    "velocity",
+                    "acceleration",
+                    "period_2",
+                )
+            },
             "precision_weighted": True,
             "causal_role": "habituation, dishabituation, novelty, and attention",
             "boundary": PREDICTIVE_PERCEPTION_BOUNDARY,
@@ -1830,6 +2327,9 @@ def public_frame(frame: object) -> Dict[str, object]:
         "channels",
         "recent_orientations",
         "attention_schema",
+        "generative_perception",
+        "recurrent_processing",
+        "perceptual_organization",
         "predictive_perception",
         "quality_space",
         "privacy",

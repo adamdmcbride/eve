@@ -20,8 +20,18 @@ except ImportError:  # pragma: no cover
 
 
 MIN_SAFE_WAL_SQLITE_VERSION = (3, 51, 3)
-_INITIALIZED_PATHS: set[str] = set()
+_INITIALIZED_PATHS: Dict[str, Tuple[int, int]] = {}
 _INITIALIZE_LOCK = threading.Lock()
+
+
+class EveConnection(sqlite3.Connection):
+    """SQLite connection whose context manager also releases the handle."""
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        try:
+            return bool(super().__exit__(exc_type, exc, traceback))
+        finally:
+            self.close()
 
 
 def utc_now() -> str:
@@ -77,6 +87,16 @@ def _lock_path(path: Path) -> Path:
     return path.with_suffix(path.suffix + ".lock")
 
 
+def _database_identity(path: Path) -> Optional[Tuple[int, int]]:
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return None
+    if stat_result.st_size <= 0:
+        return None
+    return int(stat_result.st_dev), int(stat_result.st_ino)
+
+
 @contextmanager
 def single_writer_lock(path: Path | str, timeout_seconds: float = 10.0) -> Iterator[None]:
     db_path = _db_path(path)
@@ -84,6 +104,10 @@ def single_writer_lock(path: Path | str, timeout_seconds: float = 10.0) -> Itera
     lock_path = _lock_path(db_path)
     started = time.monotonic()
     with lock_path.open("a+", encoding="utf-8") as lock_file:
+        try:
+            os.fchmod(lock_file.fileno(), 0o600)
+        except OSError:
+            pass
         if fcntl is None:
             yield
             return
@@ -125,10 +149,15 @@ def single_writer_lock(path: Path | str, timeout_seconds: float = 10.0) -> Itera
 def connect_database(path: Path | str, *, read_only: bool = False) -> sqlite3.Connection:
     db_path = _db_path(path)
     if read_only:
-        conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True, timeout=10.0)
+        conn = sqlite3.connect(
+            f"{db_path.as_uri()}?mode=ro",
+            uri=True,
+            timeout=10.0,
+            factory=EveConnection,
+        )
     else:
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(db_path), timeout=10.0)
+        conn = sqlite3.connect(str(db_path), timeout=10.0, factory=EveConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 10000")
     conn.execute("PRAGMA foreign_keys = ON")
@@ -141,7 +170,8 @@ def initialize_database(path: Path | str) -> None:
     db_path = _db_path(path)
     key = str(db_path)
     with _INITIALIZE_LOCK:
-        if key in _INITIALIZED_PATHS and db_path.exists():
+        current_identity = _database_identity(db_path)
+        if current_identity is not None and _INITIALIZED_PATHS.get(key) == current_identity:
             return
         with single_writer_lock(db_path):
             with connect_database(db_path) as conn:
@@ -238,7 +268,11 @@ def initialize_database(path: Path | str) -> None:
                     """
                 )
                 conn.commit()
-        _INITIALIZED_PATHS.add(key)
+        initialized_identity = _database_identity(db_path)
+        if initialized_identity is not None:
+            _INITIALIZED_PATHS[key] = initialized_identity
+        else:
+            _INITIALIZED_PATHS.pop(key, None)
 
 
 def execute_write(path: Path | str, sql: str, params: Iterable[Any]) -> None:

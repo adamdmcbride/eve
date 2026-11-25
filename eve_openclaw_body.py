@@ -183,6 +183,91 @@ def parsed_json_has_payload(value: object) -> bool:
     return value is not None
 
 
+def openclaw_command_diagnostic_codes(output: object) -> List[str]:
+    """Return non-secret, machine-readable failure signatures for one CLI call."""
+
+    text = str(output or "").lower()
+    codes: List[str] = []
+    if "[state/db] skipped permission hardening" in text and "eperm: operation not permitted" in text:
+        codes.append("state_db_permission_hardening_denied")
+    if "openclaw config is invalid" in text:
+        codes.append("profile_invalid")
+    if "plugin llama-cpp: runtime extension entry not found: ./dist/index.js" in text:
+        codes.append("llama_cpp_runtime_extension_unresolved")
+    if "plugins.allow now gates bundled provider discovery" in text:
+        codes.append("bundled_discovery_migration_pending")
+    return codes
+
+
+def openclaw_command_profile_problem_lines(output: object) -> List[str]:
+    """Extract only the human-readable ``Problem:`` block from CLI stderr."""
+
+    problems: List[str] = []
+    in_problem_block = False
+    for raw_line in str(output or "").splitlines():
+        stripped = raw_line.strip()
+        if stripped.lower() == "problem:":
+            in_problem_block = True
+            continue
+        if not in_problem_block:
+            continue
+        if stripped.startswith("- "):
+            problems.append(stripped[2:].strip().lower())
+            continue
+        if stripped and not raw_line[:1].isspace():
+            break
+    return problems
+
+
+def openclaw_command_observation_fields(
+    *,
+    returncode: Optional[int],
+    output: object,
+    failure_kind: str = "command_failure",
+) -> Dict[str, object]:
+    """Classify whether a failed OpenClaw CLI result can support absence claims.
+
+    The managed Codex runner can read Eve's OpenClaw state but cannot chmod the
+    state database.  OpenClaw 2026.7.1 then reports the already-installed
+    llama-cpp runtime extension as missing.  That exact pair is a restricted
+    observation, not evidence that channels, skills, or plugins are absent.
+    Any additional or different failure remains authoritative.
+    """
+
+    diagnostic_codes = openclaw_command_diagnostic_codes(output)
+    profile_problems = openclaw_command_profile_problem_lines(output)
+    restricted_problem = "plugins.allow: plugin llama-cpp: runtime extension entry not found: ./dist/index.js"
+    only_restricted_problem = not profile_problems or profile_problems == [restricted_problem]
+    succeeded = returncode == 0
+    environment_limited = bool(
+        not succeeded
+        and "state_db_permission_hardening_denied" in diagnostic_codes
+        and "llama_cpp_runtime_extension_unresolved" in diagnostic_codes
+        and only_restricted_problem
+    )
+    if succeeded:
+        normalized_kind = "none"
+        summary = "OpenClaw command completed; its returned payload is a current observation."
+    elif environment_limited:
+        normalized_kind = "restricted_environment"
+        summary = (
+            "Restricted state-database permissions made this OpenClaw command inconclusive; "
+            "the result cannot support a missing-capability claim."
+        )
+    else:
+        normalized_kind = normalize_text(failure_kind, fallback="command_failure", limit=80)
+        summary = "OpenClaw command failed in the current execution environment."
+    return {
+        "observation_complete": succeeded,
+        "observation_authoritative": not environment_limited,
+        "observation_environment_limited": environment_limited,
+        "failure_kind": normalized_kind,
+        "diagnostic_codes": diagnostic_codes,
+        "profile_problem_count": len(profile_problems),
+        "observation_summary": summary,
+    }
+
+
 def run_openclaw_json_command(args: Sequence[str], *, timeout: int = 20) -> Dict[str, object]:
     command = ["openclaw", "--profile", "eve-repair", *args]
     try:
@@ -193,13 +278,32 @@ def run_openclaw_json_command(args: Sequence[str], *, timeout: int = 20) -> Dict
             capture_output=True,
             timeout=timeout,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired as exc:
+        output = "\n".join(str(item or "") for item in (exc.stdout, exc.stderr, exc))
         return {
             "ok": False,
             "command": command,
             "returncode": None,
             "error": normalize_text(exc, limit=400),
             "payload": {},
+            **openclaw_command_observation_fields(
+                returncode=None,
+                output=output,
+                failure_kind="timeout",
+            ),
+        }
+    except OSError as exc:
+        return {
+            "ok": False,
+            "command": command,
+            "returncode": None,
+            "error": normalize_text(exc, limit=400),
+            "payload": {},
+            **openclaw_command_observation_fields(
+                returncode=None,
+                output=exc,
+                failure_kind="launch_error",
+            ),
         }
     stdout = result.stdout or ""
     stderr = result.stderr or ""
@@ -208,6 +312,10 @@ def run_openclaw_json_command(args: Sequence[str], *, timeout: int = 20) -> Dict
         stderr_payload = parse_mixed_json(stderr)
         if parsed_json_has_payload(stderr_payload):
             payload = stderr_payload
+    observation = openclaw_command_observation_fields(
+        returncode=result.returncode,
+        output=f"{stdout}\n{stderr}",
+    )
     return {
         "ok": result.returncode == 0,
         "command": command,
@@ -215,6 +323,7 @@ def run_openclaw_json_command(args: Sequence[str], *, timeout: int = 20) -> Dict
         "stdout_excerpt": normalize_text(stdout, limit=300),
         "stderr_excerpt": normalize_text(stderr, limit=300),
         "payload": compact_json_value(payload),
+        **observation,
     }
 
 
@@ -847,14 +956,18 @@ def build_hook_callback_event(raw_event: Dict[str, object], *, source: str = "op
     }
 
 
-def append_evidence_event(event: Dict[str, object]) -> Dict[str, object]:
+def append_evidence_event(
+    event: Dict[str, object],
+    *,
+    mirror_runtime: bool = True,
+) -> Dict[str, object]:
     record = dict(event)
     record.setdefault("id", str(uuid.uuid4()))
     record.setdefault("created_at", utc_now())
     record.setdefault("substrate_id", OPENCLAW_BODY_SUBSTRATE_ID)
     record["canonical_memory_authority"] = False
     eve_store.append_jsonl_record(OPENCLAW_EVIDENCE_EVENTS_PATH, record, ensure_ascii=True)
-    if not paths_equivalent(OPENCLAW_EVIDENCE_EVENTS_PATH, RUNTIME_OPENCLAW_EVIDENCE_EVENTS_PATH):
+    if mirror_runtime and not paths_equivalent(OPENCLAW_EVIDENCE_EVENTS_PATH, RUNTIME_OPENCLAW_EVIDENCE_EVENTS_PATH):
         try:
             eve_store.append_jsonl_record(RUNTIME_OPENCLAW_EVIDENCE_EVENTS_PATH, record, ensure_ascii=True)
         except OSError:

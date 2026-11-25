@@ -64,6 +64,46 @@ class SystemTaskTests(unittest.TestCase):
         self.assertEqual(1, sum(1 for task in first_created if task.get("kind") == "gpu_followup_reflection"))
         self.assertEqual(0, sum(1 for task in second_created if task.get("kind") == "gpu_followup_reflection"))
 
+    def test_cpu_snapshot_refresh_updates_existing_semantic_tasks(self):
+        with TemporaryDirectory() as tmpdir:
+            tasks_path = Path(tmpdir) / "system_tasks.jsonl"
+            eve_store.write_jsonl_records(tasks_path, [])
+            state = {}
+
+            with patch.object(eve, "SYSTEM_TASKS_PATH", tasks_path), patch.object(
+                eve, "append_entry", return_value=None
+            ), patch.object(eve, "load_config", return_value={}), patch.object(
+                eve, "cleanup_candidate_specs", return_value=[]
+            ), patch.object(
+                eve, "system_background_gate_reason", return_value=""
+            ):
+                eve.refresh_system_tasks_from_snapshot(
+                    self._snapshot("2026-06-13T23:00:00+00:00", "first scan"),
+                    state,
+                    "daemon",
+                    config={},
+                )
+                first_records = {
+                    record["kind"]: record
+                    for record in eve_store.read_jsonl_records(tasks_path)
+                    if record.get("kind") in {"workspace_attention_digest", "retrieval_prep_pack"}
+                }
+                second_created = eve.refresh_system_tasks_from_snapshot(
+                    self._snapshot("2026-06-13T23:10:00+00:00", "second scan"),
+                    state,
+                    "daemon",
+                    config={},
+                )
+
+            records = eve_store.read_jsonl_records(tasks_path)
+            for kind in ("workspace_attention_digest", "retrieval_prep_pack"):
+                matching = [record for record in records if record.get("kind") == kind]
+                self.assertEqual(1, len(matching), kind)
+                self.assertEqual(first_records[kind]["id"], matching[0]["id"], kind)
+                self.assertEqual("2026-06-13T23:10:00+00:00", matching[0]["metadata"]["scanned_at"])
+                self.assertIn("second scan", matching[0]["summary"])
+                self.assertEqual(0, sum(1 for task in second_created if task.get("kind") == kind))
+
     def test_gpu_followup_snapshot_refresh_does_not_reopen_completed_task(self):
         with TemporaryDirectory() as tmpdir:
             tasks_path = Path(tmpdir) / "system_tasks.jsonl"
@@ -112,6 +152,66 @@ class SystemTaskTests(unittest.TestCase):
         self.assertEqual(1, len(open_gpu_tasks))
         self.assertNotEqual("completed-gpu", open_gpu_tasks[0]["id"])
         self.assertEqual("2026-06-13T23:20:00+00:00", open_gpu_tasks[0]["metadata"]["scanned_at"])
+
+    def test_completed_cpu_semantic_task_stays_closed_and_allows_one_new_task(self):
+        title = "Digest the current workspace focus on CPU"
+        semantic_key = eve.system_task_dedupe_key(
+            "workspace_attention_digest",
+            "new scan after closure",
+            "eve.py",
+            "eve.py",
+        )
+        with TemporaryDirectory() as tmpdir:
+            tasks_path = Path(tmpdir) / "system_tasks.jsonl"
+            eve_store.write_jsonl_records(
+                tasks_path,
+                [
+                    eve.normalize_system_task(
+                        {
+                            "id": "completed-workspace",
+                            "kind": "workspace_attention_digest",
+                            "title": title,
+                            "status": "completed",
+                            "lane": "cpu",
+                            # This deliberately matches the next snapshot's
+                            # semantic fallback key. A completed cycle must not
+                            # be mutated back to planned merely because the
+                            # recurring writer reuses that stable identity.
+                            "dedupe_key": semantic_key,
+                            "metadata": {"evidence_key": "old"},
+                        }
+                    )
+                ],
+            )
+            state = {}
+
+            with patch.object(eve, "SYSTEM_TASKS_PATH", tasks_path), patch.object(
+                eve, "append_entry", return_value=None
+            ), patch.object(eve, "load_config", return_value={}), patch.object(
+                eve, "cleanup_candidate_specs", return_value=[]
+            ), patch.object(
+                eve, "system_background_gate_reason", return_value=""
+            ):
+                eve.refresh_system_tasks_from_snapshot(
+                    self._snapshot("2026-06-13T23:20:00+00:00", "new scan after closure"),
+                    state,
+                    "daemon",
+                    config={},
+                )
+
+            records = eve_store.read_jsonl_records(tasks_path)
+            completed = [record for record in records if record.get("id") == "completed-workspace"][0]
+            open_tasks = [
+                record
+                for record in records
+                if record.get("kind") == "workspace_attention_digest"
+                and record.get("status") in eve.SYSTEM_TASK_OPEN_STATUSES
+            ]
+
+        self.assertEqual("completed", completed["status"])
+        self.assertEqual(1, len(open_tasks))
+        self.assertNotEqual("completed-workspace", open_tasks[0]["id"])
+        self.assertEqual("2026-06-13T23:20:00+00:00", open_tasks[0]["metadata"]["scanned_at"])
 
 
 if __name__ == "__main__":

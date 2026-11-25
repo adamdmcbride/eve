@@ -3,11 +3,57 @@ from unittest import mock
 import json
 
 import eve
+import eve_autobiography
+import eve_common_ground
 import eve_consciousness
 import eve_sensory
+import eve_context_learning
 
 
 def fixture_inputs():
+    common_ground = eve_common_ground.build_model(
+        [
+            {
+                "created_at": "2026-07-12T17:59:00+00:00",
+                "thread_id": "fixture-thread",
+                "source_message_id": "fixture-user-1",
+                "reply_message_id": "fixture-eve-1",
+                "inbound_preview": "Is the verified result current?",
+                "reply_preview": "The earlier summary said the result passed.",
+                "synthetic": False,
+            }
+        ],
+        [
+            {
+                "timestamp": "2026-07-12T17:59:30+00:00",
+                "kind": "conversational",
+                "thread_id": "fixture-thread",
+                "scored_reply_id": "fixture-eve-1",
+                "observed_message_id": "fixture-user-2",
+                "observed": "correction",
+                "evidence_id": "fixture-common-ground-evidence",
+            }
+        ],
+        now="2026-07-12T18:00:00+00:00",
+    )
+    autobiography = eve_autobiography.build_state(
+        [
+            {
+                "id": "fixture-autobiographical-episode",
+                "created_at": "2026-07-12T17:58:00+00:00",
+                "source": "verified_fixture_change",
+                "thread_id": "fixture-thread",
+                "what_happened": "A failed verification contradicted Eve's earlier summary.",
+                "what_user_cared_about": "causal learning from verified outcomes",
+                "what_eve_got_wrong": "treated an unverified action as success",
+                "what_changed_afterward": "inspect the failed verification and revise the action model",
+                "evidence_ids": ["fixture-action-evidence"],
+                "metadata": {"change_verified": True},
+            }
+        ],
+        query="failed verification contradiction action model",
+        now="2026-07-12T18:00:00+00:00",
+    )
     return {
         "source": "test",
         "workspace": {
@@ -40,7 +86,34 @@ def fixture_inputs():
             "open_loops": ["Show that the architecture changes behavior"],
             "next_relational_move": "Demonstrate the causal change honestly.",
         },
-        "other_minds_model": {"summary": "the user and the runtime are distinct causal sources."},
+        "other_minds_model": {
+            "summary": "the user and the runtime are distinct causal sources.",
+            "social_prediction": {
+                "schema_version": "eve.observable_social_model.v1",
+                "authority": "observable_behavior_only",
+                "evidence_count": 4,
+                "scored_count": 4,
+                "abstention_count": 0,
+                "response_prior": {
+                    "acceptance": 0.2,
+                    "correction": 0.2,
+                    "answer": 0.1,
+                    "follow_up_question": 0.2,
+                    "continuation": 0.2,
+                    "topic_shift": 0.1,
+                },
+                "observed_counts": {"acceptance": 2, "correction": 1, "continuation": 1},
+                "mean_normalized_brier": 0.22,
+                "top1_accuracy": 0.5,
+                "last_observed_class": "correction",
+                "last_prediction_id": "social-prediction:fixture",
+                "distribution_shift": None,
+                "recent_evidence_ids": ["social-evidence-fixture"],
+                "contains_user_text": False,
+                "contains_private_mental_state": False,
+            },
+            "common_ground": common_ground,
+        },
         "homeostasis": {
             "regulation_mode": "orient",
             "dominant_pressures": ["surprise load 70"],
@@ -52,7 +125,14 @@ def fixture_inputs():
                     "level": 70,
                     "trend": "rising",
                     "reason": "A predicted action failed verification.",
-                }
+                },
+                {
+                    "id": "body_hunger",
+                    "label": "body hunger",
+                    "level": 20,
+                    "trend": "flat",
+                    "reason": "Food distance 4.5; body walk.",
+                },
             ],
         },
         "plan_model": {
@@ -106,7 +186,9 @@ def fixture_inputs():
             ],
             "next_experiments": [],
         },
+        "autobiography": autobiography,
         "memory_items": [
+            eve_autobiography.transient_memory_item(autobiography),
             {
                 "id": "memory-1",
                 "source": "relationship_episode",
@@ -154,6 +236,223 @@ class ConsciousStateKernelTests(unittest.TestCase):
         self.assertGreater(state["interoception"]["arousal"], 0)
         self.assertIn("observer", state["predictions"]["process"]["lanes"])
         self.assertTrue(state["metacognition"]["available"])
+
+    def test_allostatic_forecast_and_enactive_sampling_enter_recurrent_state_selectively(self):
+        inputs = fixture_inputs()
+        intact = eve_consciousness.build_conscious_state(**inputs)
+        allostasis_lesioned = eve_consciousness.build_conscious_state(
+            **{**inputs, "lesions": ["allostasis"]}
+        )
+        enaction_lesioned = eve_consciousness.build_conscious_state(
+            **{**inputs, "lesions": ["interoceptive_enaction"]}
+        )
+
+        interoception = intact["interoception"]
+        self.assertTrue(interoception["pressure_records"])
+        self.assertTrue(interoception["allostasis"]["available"])
+        self.assertTrue(interoception["allostasis"]["baseline_forecast"]["trajectories"])
+        self.assertEqual(
+            "measured_pressure_trajectory",
+            intact["predictions"]["interoception"]["basis"],
+        )
+        self.assertTrue(intact["predictions"]["interoception"]["multi_horizon"])
+        self.assertEqual(
+            "proposal_only",
+            interoception["sampling_proposal"]["authority"],
+        )
+        self.assertFalse(allostasis_lesioned["interoception"]["allostasis"]["available"])
+        self.assertEqual({}, allostasis_lesioned["interoception"]["sampling_proposal"])
+        self.assertTrue(enaction_lesioned["interoception"]["allostasis"]["available"])
+        self.assertEqual({}, enaction_lesioned["interoception"]["sampling_proposal"])
+
+    def test_social_prediction_and_feedback_enter_other_minds_selectively(self):
+        inputs = fixture_inputs()
+        intact = eve_consciousness.build_conscious_state(**inputs)
+        prediction_lesioned = eve_consciousness.build_conscious_state(
+            **{**inputs, "lesions": ["social_prediction"]}
+        )
+        feedback_lesioned = eve_consciousness.build_conscious_state(
+            **{**inputs, "lesions": ["social_feedback"]}
+        )
+
+        social = intact["other_minds"]["social_prediction"]
+        self.assertTrue(intact["other_minds"]["social_prediction_available"])
+        self.assertTrue(intact["other_minds"]["social_feedback_available"])
+        self.assertEqual(4, social["scored_count"])
+        self.assertEqual({}, prediction_lesioned["other_minds"]["social_prediction"])
+        self.assertFalse(
+            prediction_lesioned["other_minds"]["social_prediction_available"]
+        )
+        self.assertTrue(
+            feedback_lesioned["other_minds"]["social_prediction_available"]
+        )
+        self.assertFalse(
+            feedback_lesioned["other_minds"]["social_feedback_available"]
+        )
+        self.assertEqual(
+            0,
+            feedback_lesioned["other_minds"]["social_prediction"]["scored_count"],
+        )
+
+    def test_social_feedback_is_unexercised_without_scored_evidence(self):
+        inputs = fixture_inputs()
+        inputs["other_minds_model"]["social_prediction"].update(
+            evidence_count=0,
+            scored_count=0,
+            mean_normalized_brier=None,
+            top1_accuracy=None,
+            last_observed_class="",
+            last_prediction_id="",
+            recent_evidence_ids=[],
+        )
+        baseline = eve_consciousness.build_conscious_state(**inputs)
+        lesioned = eve_consciousness.build_conscious_state(
+            **{**inputs, "lesions": ["social_feedback"]}
+        )
+
+        self.assertEqual(
+            0,
+            eve_consciousness.causal_signature(baseline)["social_feedback_coupling"],
+        )
+        self.assertEqual(
+            0,
+            eve_consciousness.causal_signature(lesioned)["social_feedback_coupling"],
+        )
+
+    def test_grounded_allostatic_effect_cannot_override_a_direct_human_turn(self):
+        prior_inputs = fixture_inputs()
+        prior = eve_consciousness.build_conscious_state(**prior_inputs)
+        prior["learning"]["action_models"]["service_health_check"] = {
+            "action_id": "service_health_check",
+            "observation_count": 1,
+            "observations": [
+                {
+                    "evidence_kind": "lived_homeostatic_consequence",
+                    "evidence_id": "homeostasis-service-1",
+                    "source_cycle_id": "homeostasis-source-cycle-1",
+                    "execution_id": "homeostasis-execution-1",
+                    "action_id": "service_health_check",
+                    "verification_ok": True,
+                    "ok": True,
+                    "elapsed_cycles": 1,
+                    "execution_cost": 5,
+                    "homeostasis_before": {"surprise_load": 70},
+                    "homeostasis_after": {"surprise_load": 90},
+                }
+            ],
+        }
+        prior["recurrent"]["checkpoint_digest"] = ""
+        prior["recurrent"]["checkpoint_digest"] = eve_consciousness.state_checkpoint_digest(prior)
+
+        autonomous_inputs = fixture_inputs()
+        autonomous_inputs["previous_state"] = prior
+        autonomous = eve_consciousness.build_conscious_state(**autonomous_inputs)
+        service = next(
+            item
+            for item in autonomous["action_model"]["affordances"]
+            if item["id"] == "service_health_check"
+        )
+        self.assertTrue(service["allostatic_effect_grounded"])
+        self.assertLess(service["allostatic_adjustment"], 0)
+
+        human_inputs = fixture_inputs()
+        human_inputs.update(
+            previous_state=prior,
+            inbound="Please answer me now rather than optimizing the machine.",
+        )
+        human_turn = eve_consciousness.build_conscious_state(**human_inputs)
+        service_during_human_turn = next(
+            item
+            for item in human_turn["action_model"]["affordances"]
+            if item["id"] == "service_health_check"
+        )
+        self.assertEqual(
+            "respond_to_user",
+            human_turn["action_model"]["selected_intention"]["id"],
+        )
+        self.assertEqual(0.0, service_during_human_turn["allostatic_adjustment"])
+        self.assertTrue(service_during_human_turn["allostatic_human_interrupt"])
+
+    def test_verified_cycle_consequence_can_seed_lived_homeostatic_action_learning(self):
+        inputs = fixture_inputs()
+        opened = eve_consciousness.build_conscious_state(**inputs)
+        predicted = opened["predictions"]["process"]
+        completed = eve_consciousness.complete_cycle(
+            opened,
+            actual_process={
+                "lanes": list(predicted["forecast_lanes"]),
+                "tools_used": ["service_health_check"]
+                if predicted["forecast_needs_tools"]
+                else [],
+                "revision_used": bool(predicted["forecast_needs_revision"]),
+                "action_id": "service_health_check",
+                "execution_id": "homeostasis-live-execution-1",
+            },
+            outcome={
+                "ok": True,
+                "observed": True,
+                "summary": "The bounded action verified and pressure was remeasured.",
+                "evidence_id": "homeostasis-live-evidence-1",
+                "verification_ok": True,
+                "homeostasis_after": {"surprise_load": 45},
+                "elapsed_cycles": 2,
+                "execution_cost": 4,
+            },
+            now="2026-07-12T18:02:00+00:00",
+        )
+        observation = completed["learning"]["action_models"]["service_health_check"][
+            "observations"
+        ][-1]
+
+        self.assertEqual("lived_homeostatic_consequence", observation["evidence_kind"])
+        self.assertEqual(70.0, observation["homeostasis_before"]["surprise_load"])
+        self.assertEqual(45.0, observation["homeostasis_after"]["surprise_load"])
+        self.assertEqual("homeostasis-live-execution-1", observation["execution_id"])
+
+        next_inputs = fixture_inputs()
+        next_inputs["previous_state"] = completed
+        next_inputs["homeostasis"]["pressures"][0].update(
+            level=45,
+            trend="falling",
+        )
+        next_state = eve_consciousness.build_conscious_state(**next_inputs)
+        service_forecast = next(
+            item
+            for item in next_state["interoception"]["allostasis"]["candidate_forecasts"]
+            if item["action_id"] == "service_health_check"
+        )
+        self.assertTrue(service_forecast["grounded_effect"])
+        self.assertEqual(2.0, service_forecast["mean_recovery_latency_cycles"])
+        self.assertEqual(4.0, service_forecast["mean_execution_cost"])
+
+        unverified = eve_consciousness.complete_cycle(
+            opened,
+            actual_process={
+                "lanes": list(predicted["forecast_lanes"]),
+                "tools_used": ["service_health_check"]
+                if predicted["forecast_needs_tools"]
+                else [],
+                "revision_used": bool(predicted["forecast_needs_revision"]),
+                "action_id": "service_health_check",
+                "execution_id": "homeostasis-unverified-execution",
+            },
+            outcome={
+                "ok": True,
+                "observed": True,
+                "summary": "A pressure claim lacked independent verification.",
+                "evidence_id": "homeostasis-unverified-evidence",
+                "verification_ok": False,
+                "homeostasis_after": {"surprise_load": 20},
+                "elapsed_cycles": 1,
+                "execution_cost": 1,
+            },
+            now="2026-07-12T18:02:00+00:00",
+        )
+        unverified_observation = unverified["learning"]["action_models"][
+            "service_health_check"
+        ]["observations"][-1]
+        self.assertEqual("cycle_action_consequence", unverified_observation["evidence_kind"])
+        self.assertNotIn("homeostasis_after", unverified_observation)
 
     def test_current_turn_ignites_and_predicts_deep_recurrent_processing(self):
         inputs = fixture_inputs()
@@ -853,7 +1152,10 @@ class ConsciousStateKernelTests(unittest.TestCase):
         )
 
     def test_lived_reply_consequences_causally_change_next_cycle_prediction(self):
-        seed = eve_consciousness.build_conscious_state(**fixture_inputs())
+        seed_inputs = fixture_inputs()
+        seed_inputs.update(inbound="Continue the same task.", now="2026-07-12T18:00:00+00:00")
+        seed = eve_consciousness.build_conscious_state(**seed_inputs)
+        credit = eve_context_learning.capture_credit(seed, "respond_to_user")
         negative = json.loads(json.dumps(seed))
         positive = json.loads(json.dumps(seed))
         for index in range(3):
@@ -866,6 +1168,8 @@ class ConsciousStateKernelTests(unittest.TestCase):
                 evidence_id=f"negative-evidence-{index}",
                 reply_message_id=f"negative-reply-{index}",
                 observed_message_id=f"negative-user-{index}",
+                source_credit={**credit, "source_cycle_id": f"negative-cycle-{index}"},
+                now="2026-07-12T18:00:00+00:00",
             )
             positive, positive_applied = eve_consciousness.apply_delayed_action_consequence(
                 positive,
@@ -876,14 +1180,16 @@ class ConsciousStateKernelTests(unittest.TestCase):
                 evidence_id=f"positive-evidence-{index}",
                 reply_message_id=f"positive-reply-{index}",
                 observed_message_id=f"positive-user-{index}",
+                source_credit={**credit, "source_cycle_id": f"positive-cycle-{index}"},
+                now="2026-07-12T18:00:00+00:00",
             )
             self.assertTrue(negative_applied)
             self.assertTrue(positive_applied)
 
         negative_inputs = fixture_inputs()
-        negative_inputs.update(previous_state=negative, inbound="Continue the same task.")
+        negative_inputs.update(previous_state=negative, inbound="Continue the same task.", now="2026-07-12T18:01:00+00:00")
         positive_inputs = fixture_inputs()
-        positive_inputs.update(previous_state=positive, inbound="Continue the same task.")
+        positive_inputs.update(previous_state=positive, inbound="Continue the same task.", now="2026-07-12T18:01:00+00:00")
         negative_next = eve_consciousness.build_conscious_state(**negative_inputs)
         positive_next = eve_consciousness.build_conscious_state(**positive_inputs)
         negative_reply = next(
@@ -913,13 +1219,17 @@ class ConsciousStateKernelTests(unittest.TestCase):
         report = eve_consciousness.run_causal_ablation_suite(inputs)
 
         self.assertTrue(report["passed"], report)
-        self.assertEqual(len(eve_consciousness.LESIONS), report["passed_count"])
+        # This fixture has no qualified procedural history. Do not claim that
+        # an idle new learning edge passed an ablation it did not exercise.
+        self.assertEqual(len(eve_consciousness.LESIONS) - 1, report["passed_count"])
         self.assertEqual(len(eve_consciousness.LESIONS), report["candidate_total"])
-        self.assertEqual([], report["not_exercised"])
+        self.assertEqual(["contextual_action_learning"], report["not_exercised"])
         self.assertTrue(report["lesions"]["metacognition"]["first_order_action_preserved"])
         self.assertEqual(0, report["lesions"]["action_model"]["lesioned"])
         self.assertGreater(report["lesions"]["homeostasis"]["baseline"], 0)
         for lesion in eve_consciousness.LESIONS:
+            if lesion in report["not_exercised"]:
+                continue
             self.assertLess(report["lesions"][lesion]["lesioned"], report["lesions"][lesion]["baseline"])
 
     def test_causal_ablation_marks_idle_plan_model_unexercised_not_failed(self):
@@ -931,8 +1241,8 @@ class ConsciousStateKernelTests(unittest.TestCase):
         report = eve_consciousness.run_causal_ablation_suite(inputs)
 
         self.assertTrue(report["passed"], report)
-        self.assertEqual(len(eve_consciousness.LESIONS) - 1, report["total"])
-        self.assertEqual(["plan_model"], report["not_exercised"])
+        self.assertEqual(len(eve_consciousness.LESIONS) - 2, report["total"])
+        self.assertEqual(["plan_model", "contextual_action_learning"], report["not_exercised"])
         self.assertEqual("not_exercised", report["lesions"]["plan_model"]["status"])
         self.assertIsNone(report["lesions"]["plan_model"]["passed"])
 
@@ -1009,6 +1319,38 @@ class ConsciousStateKernelTests(unittest.TestCase):
             report["conditions"]["service_focus_lesioned"]["selected_action"],
             report["conditions"]["update_focus_lesioned"]["selected_action"],
         )
+
+    def test_state_dependent_query_succession_beats_reliability_control(self):
+        report = eve_consciousness.run_state_dependent_query_succession_suite()
+
+        self.assertTrue(report["passed"], report)
+        self.assertEqual("GWT-4", report["indicator_id"])
+        self.assertEqual(6, report["case_count"])
+        self.assertEqual(100.0, report["intact_chain_completion_percent"])
+        self.assertEqual(0.0, report["lesion_chain_completion_percent"])
+        self.assertEqual(100.0, report["directional_effect_percent"])
+        self.assertTrue(
+            all(item["first_action_correct"] for item in report["cases"])
+        )
+        self.assertTrue(
+            all(item["intact_selected_target"] for item in report["cases"])
+        )
+        self.assertFalse(
+            any(item["lesion_selected_target"] for item in report["cases"])
+        )
+        self.assertFalse(report["resident_autonomous_querying_established"])
+        self.assertFalse(report["consciousness_proven"])
+
+    def test_state_dependent_query_cases_fail_closed_on_trivial_or_duplicate_chains(self):
+        cases = eve_consciousness.default_state_dependent_query_cases()
+        cases[0]["target_module"] = cases[0]["locator_module"]
+        with self.assertRaisesRegex(ValueError, "must differ"):
+            eve_consciousness.run_state_dependent_query_succession_suite(cases)
+
+        cases = eve_consciousness.default_state_dependent_query_cases()
+        cases[1]["id"] = cases[0]["id"]
+        with self.assertRaisesRegex(ValueError, "unique"):
+            eve_consciousness.run_state_dependent_query_succession_suite(cases)
 
     def test_broadcast_rank_reaches_autonomy_guidance_and_deterministic_choice(self):
         report = eve_consciousness.run_broadcast_action_counterfactual_suite()
@@ -1137,6 +1479,36 @@ class ConsciousStateKernelTests(unittest.TestCase):
             ]["passed"]
         )
         self.assertTrue(report["checks"]["consequence_idempotence_survives_history_churn"]["passed"])
+
+    def test_regulatory_interrupt_is_matched_when_live_pressure_is_saturated_and_inquiry_wins(self):
+        inputs = fixture_inputs()
+        inputs["homeostasis"]["regulation_mode"] = "stabilize"
+        inputs["homeostasis"]["pressures"][0]["level"] = 100
+        inputs["homeostasis"]["pressures"][0]["trend"] = "steady"
+        inputs["world_model"]["open_questions"] = [
+            {
+                "id": "inquiry-regulatory-control",
+                "question": "Which current service observation resolves the open question?",
+                "status": "open",
+                "priority": 100,
+                "confidence": 95,
+                "candidate_actions": ["service_health_check"],
+                "selected_action": "service_health_check",
+                "source": "fixture",
+            }
+        ]
+
+        report = eve_consciousness.run_durable_continuity_suite(inputs)
+        regulatory = report["checks"]["regulatory_prediction_interrupt"]
+
+        self.assertTrue(report["passed"], report)
+        self.assertTrue(regulatory["passed"], regulatory)
+        self.assertEqual(0, regulatory["matched_error"])
+        self.assertGreater(regulatory["surprised_error"], regulatory["matched_error"])
+        self.assertTrue(regulatory["matched_counterfactual"])
+        self.assertEqual("interoceptive_prediction_error", regulatory["winner_kind"])
+        self.assertTrue(regulatory["inquiry_preserved"])
+        self.assertIn("inquiry", regulatory["salient_kinds"])
 
     def test_checkpoint_tamper_fails_closed_instead_of_importing_forged_learning(self):
         first = eve_consciousness.build_conscious_state(

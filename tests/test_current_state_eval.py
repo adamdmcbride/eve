@@ -1,4 +1,5 @@
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -10,9 +11,33 @@ if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"unable to load {SCRIPT}")
 current_state_eval = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(current_state_eval)
+CURRICULUM_SCRIPT = ROOT / "bin" / "eve_current_state_curriculum.py"
+CURRICULUM_SPEC = importlib.util.spec_from_file_location(
+    "eve_current_state_curriculum_eval_test", CURRICULUM_SCRIPT
+)
+if CURRICULUM_SPEC is None or CURRICULUM_SPEC.loader is None:
+    raise RuntimeError(f"unable to load {CURRICULUM_SCRIPT}")
+curriculum = importlib.util.module_from_spec(CURRICULUM_SPEC)
+CURRICULUM_SPEC.loader.exec_module(curriculum)
 
 
 class CurrentStateEvalTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # data/eve_training/* is not checked in, so the public curriculum is
+        # rebuilt from its deterministic in-repo generator into a temp dir.
+        # test_current_state_curriculum proves the local artifact, when
+        # present, is byte-identical to this output.
+        cls._curriculum_dir = tempfile.TemporaryDirectory()
+        cls.curriculum_path = (
+            Path(cls._curriculum_dir.name) / "current_state_curriculum.jsonl"
+        )
+        curriculum.write_curriculum(curriculum.build_curriculum(), cls.curriculum_path)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._curriculum_dir.cleanup()
+
     def record(self, category="ready_plan", status="not_started"):
         return {
             "category": category,
@@ -76,9 +101,7 @@ class CurrentStateEvalTests(unittest.TestCase):
         self.assertTrue(result["checks"]["phenomenal_boundary"])
 
     def test_checked_in_validation_gold_answers_score_full(self) -> None:
-        records = current_state_eval.load_records(
-            ROOT / "data" / "eve_training" / "current_state_curriculum.jsonl"
-        )
+        records = current_state_eval.load_records(self.curriculum_path)
         failures = []
         for record in records:
             result = current_state_eval.score_response(
@@ -90,7 +113,7 @@ class CurrentStateEvalTests(unittest.TestCase):
         self.assertEqual([], failures)
 
     def test_public_selection_and_challenge_are_disjoint(self) -> None:
-        path = ROOT / "data" / "eve_training" / "current_state_curriculum.jsonl"
+        path = self.curriculum_path
         selection = current_state_eval.load_records(
             path,
             split="validation",

@@ -2,13 +2,17 @@
 
 import argparse
 import concurrent.futures
+import copy
 from contextlib import ExitStack, contextmanager
 import csv
+import errno
+import fnmatch
 from functools import wraps
 import hashlib
 import http.client
 import importlib.util
 import io
+import importlib
 import json
 import math
 import os
@@ -24,9 +28,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+# An interrupted Python-only install must not start a mixed core.
+if (Path(__file__).resolve().parent / ".eve-code-installing.json").exists():
+    raise RuntimeError("Incomplete Eve code transaction; recover the bundle before starting")
+
 # Ensure the script's own directory is on sys.path so local packages
 # (eve_commands, eve_*.py) are importable regardless of CWD.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Extracted modules resolve this running facade, not a second imported copy.
+if __name__ == "__main__":
+    sys.modules.setdefault("eve", sys.modules[__name__])
 import textwrap
 import threading
 import time
@@ -43,21 +54,66 @@ import eve_platform
 import eve_profile
 import eve_openclaw
 import eve_openclaw_body
+import eve_otel_genai
+import eve_performance
 import eve_commitments
 import eve_capability_adoption
 import eve_capability_intelligence
+import eve_autobiography
+import eve_common_ground
+import eve_self_authority
+from eve_self_change import (
+    load_action_blocks,
+    save_action_blocks,
+    self_change_before_image_path,
+    load_self_change_before_image,
+    record_self_change_before_image,
+    self_authority_tool_specs,
+    execute_self_authority_tool,
+    append_self_change_ledger,
+    read_self_change_ledger,
+    parse_proposal_lineage,
+    proposal_looks_conversational,
+    proposal_has_lineage,
+    proposal_is_actionable,
+    proposal_dedupe_key,
+    find_duplicate_proposal,
+    self_change_cooled_topics,
+    archive_stale_draft_proposals,
+    self_change_candidate_proposals,
+    build_self_change_request,
+    run_self_change_cycle,
+    revert_self_change,
+    self_change_metric_spec,
+    schedule_self_change_followup,
+    measure_self_change_metric,
+    self_change_followup_verdict,
+    review_self_change_followups,
+)
+import eve_usage_trace
+
+# Usage census (2026-09-17): with EVE_TRACE_USAGE=1 every process records which functions run.
+eve_usage_trace.install()
 import eve_consciousness
+import eve_context_learning
 import eve_db
+import eve_daemon_runtime
 import eve_economy
 import eve_epistemic
 import eve_evidence
+import eve_embodiment
 import eve_experience
 import eve_governance
 import eve_model_governor
 import eve_model_topology
+import eve_oss_validation
+import eve_prompt_budget
+import eve_recurrent_cognition
 import eve_repository
 import eve_sensory
+import eve_social_prediction
 import eve_store
+import eve_runtime_bundle
 import eve_tracing
 from eve_commands.openclaw_admission import cmd_openclaw_admission_list, cmd_openclaw_admission_create
 try:
@@ -205,6 +261,7 @@ PRESENCE_PULSES_PATH = APP_DIR / "presence_pulses.jsonl"
 PRESENCE_CYCLES_PATH = APP_DIR / "presence_cycles.jsonl"
 GOVERNANCE_REVIEWS_DIR = APP_DIR / "governance_reviews"
 MESSAGES_PATH = APP_DIR / "messages.jsonl"
+DAEMON_DIGEST_BUFFER_PATH = APP_DIR / "daemon_digest_buffer.jsonl"
 EVE_CHAT_FOLLOWUPS_PATH = APP_DIR / "eve_chat_followups.jsonl"
 CONVERSATION_SPINE_PATH = APP_DIR / "conversation_spine.jsonl"
 EVALUATIONS_PATH = APP_DIR / "evaluations.jsonl"
@@ -298,6 +355,7 @@ OSS_INTEGRATION_LATEST_CYCLE_PATH = OSS_INTEGRATION_CYCLES_DIR / "latest.json"
 OSS_INTEGRATION_EVALS_DIR = OSS_INTEGRATION_DIR / "evals"
 OSS_INTEGRATION_LATEST_EVAL_PATH = OSS_INTEGRATION_EVALS_DIR / "latest.json"
 OSS_INTEGRATION_DVC_MANIFEST_PATH = OSS_INTEGRATION_DIR / "dvc_dataset_manifest.json"
+OSS_DVC_SNAPSHOT_PAYLOAD_RELATIVE_PATH = Path("data") / "eve_training" / "dvc_snapshot_payload"
 OSS_COPILOTKIT_DIR = OSS_INTEGRATION_DIR / "copilotkit"
 OSS_COPILOTKIT_LATEST_PATH = OSS_COPILOTKIT_DIR / "latest.json"
 OSS_COPILOTKIT_HISTORY_DIR = OSS_COPILOTKIT_DIR / "history"
@@ -373,6 +431,8 @@ OPERATOR_AUTHORIZATION_PATH = APP_DIR / "operator_authorization.json"
 OPERATOR_PERMISSION_REQUESTS_PATH = APP_DIR / "operator_permission_requests.jsonl"
 STATE_PATH = APP_DIR / "state.json"
 DAEMON_ACTIVITY_PATH = APP_DIR / "daemon_activity.json"
+DAEMON_RESTART_REQUEST_PATH = APP_DIR / "daemon_restart_request.json"
+DAEMON_RESTART_PENDING: Dict[str, object] = {}
 REPLY_PROGRESS_PATH = APP_DIR / "reply_progress.json"
 ACTIVE_MODEL_CALLS_PATH = APP_DIR / "active_model_calls.json"
 REPLY_TURN_REPLAYS_PATH = APP_DIR / "reply_turn_replays.jsonl"
@@ -947,7 +1007,10 @@ DEFAULT_CONFIG = {
     "execution_tree_activity_limit": 24,
     "chat_max_tokens": 320,
     "thought_max_tokens": 190,
-    "reflection_max_tokens": 420,
+    # 420 tokens cut every reflection off after two of six sections, so "Contradictions I Am Living
+    # In" and "Experiments For The Next 7 Days" were never written and the loop had nothing to read
+    # (measured 2026-09-19: every reflection on record hit the cap).
+    "reflection_max_tokens": 1500,
     "proposal_max_tokens": 520,
     "outreach_max_tokens": 180,
     "human_context_max_tokens": 700,
@@ -970,11 +1033,43 @@ DEFAULT_CONFIG = {
     "mind_stream_grounding_model": None,
     "mind_stream_self_check_model": None,
     "mind_stream_synthesis_model": None,
+    # Budgeted model synthesis for the mind stream: the executive keeps focus,
+    # next step, and live threads; an admitted model overlay may only re-voice
+    # summary/lane prose after the closed-world critic passes it.
+    "mind_stream_model_synthesis_enabled": True,
+    "mind_stream_synthesis_max_tokens": 360,
+    "mind_stream_synthesis_timeout_seconds": 14,
+    # Cognition budget owned by Eve's own lanes: gate background cognition on
+    # measured lane latency (fresh watchdog probes) instead of the host load
+    # average alone. "load_average" restores the old hot-load deferral.
+    "cognition_gate_mode": "lane_latency",
+    "cognition_gate_fast_lane_max_ms": 4000,
+    "cognition_gate_deep_lane_max_ms": 12000,
+    "cognition_gate_probe_max_age_minutes": 20,
+    # Workspace tick cadence follows the kernel's own prediction error.
+    "workspace_tick_min_interval_seconds": 10,
+    "workspace_tick_max_interval_seconds": 120,
+    # One bounded repair pass before a rejected continuous thought is discarded.
+    "continuous_thought_repair_enabled": True,
+    # After a failed repair, drop only the flagged sentences and re-run the critic once.
+    "continuous_thought_excision_enabled": True,
+    # When the selected record is content-identical to the last thought's, render it
+    # deterministically without calling the author or the critic, unless the last
+    # model-authored thought is older than the max-skip window.
+    "continuous_thought_skip_unchanged_record": True,
+    "continuous_thought_unchanged_max_skip_minutes": 120,
+    # Show the author up to this many previously admitted model thoughts (form only).
+    "continuous_thought_admitted_example_count": 2,
+    # The critic waits up to this long when the deep lane is measurably slow (8x its probe latency).
+    "continuous_thought_critic_max_timeout_seconds": 240,
+    # Memory may set the workspace focus only when corroborated by live evidence.
+    "memory_focus_min_ignition": 65,
+    "memory_focus_min_overlap": 0.34,
     "mind_stream_revision_enabled": True,
     "mind_stream_revision_max_workers": 5,
     "mind_stream_revision_timeout_seconds": 18,
     "daemon_model_mind_tick_enabled": True,
-    "daemon_model_mind_tick_max_tokens": 320,
+    "daemon_model_mind_tick_max_tokens": 640,
     "daemon_model_mind_tick_timeout_seconds": 22,
     "autonomy_free_run_default_style": "explorer",
     "autonomy_free_run_multi_lane_enabled": True,
@@ -1016,6 +1111,8 @@ DEFAULT_CONFIG = {
     "developmental_cycle_enabled": True,
     "developmental_cycle_interval_minutes": 60,
     "developmental_conscious_action_max_age_seconds": 180,
+    "developmental_memory_attention_mode": "shadow",
+    "developmental_typed_module_recurrence_enabled": True,
     "presence_cycle_enabled": True,
     "presence_cycle_interval_minutes": 60,
     "presence_cycle_refresh_mind_enabled": True,
@@ -1167,24 +1264,59 @@ DEFAULT_CONFIG = {
     "code_patch_max_bytes": 200000,
     "code_workspace_root": "",
     "autonomy_coder_tryout_enabled": True,
-    "autonomy_coder_allow_patches": False,
+    "autonomy_coder_allow_patches": True,
+    # Self-authority (2026-09-16): what is hers she does without asking. See eve_self_authority.py
+    # for the four edges (money, voice, ground, memory) and docs/operating/AUTONOMY_POLICY.md.
+    "self_authority_enabled": True,
+    "self_authority_extra_roots": [],
+    "self_change_enabled": True,
+    "self_change_interval_minutes": 20,
+    "self_change_max_per_day": 12,
+    "self_change_timeout_seconds": 900,
+    "self_change_max_attempts_per_proposal": 2,
+    "self_change_stale_days": 7,
+    # The original loop: a reflection's contradictions and experiments become durable records,
+    # not paragraphs that scroll away. See record_reflection_trackers.
+    "reflection_tracker_extraction_enabled": True,
+    # An experiment closes on evidence or expires unverified; the model never sets its status.
+    "experiment_review_interval_minutes": 1440,
+    # A self-change candidate must say what it is grounded in and how to undo it (2.3).
+    "self_change_require_lineage": False,
+    # She speaks first only when a real person has spoken recently (2.6).
+    "outreach_requires_recent_human_days": 3,
+    # Which jobs the daemon runs: "full" (everything, today's behaviour), "core" (the original
+    # reflection loop plus the kernel), or "core_body" (core plus her body and free runs).
+    # daemon_job_overrides is per job: {"capability_adoption": false}.
+    "daemon_loop_profile": "full",
+    "daemon_job_overrides": {},
+    # Every applied self-change is measured a day later and undone if it made things worse (2.4).
+    "self_change_followup_interval_minutes": 60,
+    "self_change_followup_due_hours": 24,
+    "self_change_undo_on_regression": True,
+    # Task 1.7: paths under another session's active board claim (coordination/claims.json) are deferred, not edited.
+    "coordination_claims_enforced": True,
+    # One topic (proposal_dedupe_key) gets one self-change start per window, so a single title
+    # cannot spend self_change_max_per_day on itself.
+    "self_change_topic_cooldown_hours": 24,
+    "operation_model_overrides": {},
+    "daemon_successor_watch_seconds": 120,
     "autonomy_coder_deterministic_fallback_enabled": True,
     "operator_authorization_default_minutes": 720,
     "operator_authorization_max_minutes": 10080,
     "web_fetch_max_chars": 4000,
-    "loop_sleep_seconds": 60,
+    "loop_sleep_seconds": 15,  # 2026-09-17: load_config rewrote 60 to 15 since the June recovery; the default now says what runs
     "daemon_activity_heartbeat_seconds": 15,
     "daemon_max_active_cycle_seconds": 900,
     "mind_tick_timeout_seconds": 25,
     "background_competes_with_user": False,
     "reply_timeout_seconds": 30,
-    "self_awareness_timeout_seconds": 120,
+    "self_awareness_timeout_seconds": 240,
     "human_analog_self_awareness_timeout_seconds": 150,
     "self_awareness_perturbation_timeout_seconds": 180,
     "consciousness_test_timeout_seconds": 520,
     "thought_timeout_seconds": 60,
     "human_context_timeout_seconds": 180,
-    "reflection_timeout_seconds": 180,
+    "reflection_timeout_seconds": 420,
     "proposal_timeout_seconds": 180,
     "outreach_timeout_seconds": 90,
     "thought_interval_minutes": 10,
@@ -1209,6 +1341,20 @@ DEFAULT_CONFIG = {
     "personal_conversation_minimum_gap_minutes": 30,
     "human_context_interval_minutes": 45,
     "self_awareness_interval_minutes": 180,
+    # Routine daemon message kinds are buffered to DAEMON_DIGEST_BUFFER_PATH and
+    # sent as one digest per daemon_digest_interval_minutes; an empty list
+    # disables buffering (the next digest run still flushes any buffered rows).
+    "daemon_digest_kinds": [
+        "upgrade_review_update",
+        "capability_intelligence_change",
+        "capability_adoption_cycle",
+        "openclaw_repair_update",
+        "component_update_check",
+        "self_awareness_update",
+        "agent_capability_scout",
+        "codex_bridge",
+    ],
+    "daemon_digest_interval_minutes": 1440,
     "self_awareness_perturbation_enabled": True,
     "self_awareness_perturbation_interval_minutes": 1440,
     "system_task_interval_minutes": 5,
@@ -1475,6 +1621,10 @@ DEFAULT_SELF_MODEL_STATE = {
     "commitments": [],
     "uncertainty_edges": [],
     "recent_changes": [],
+    # Measured, not narrated: verified-action ratio and outcome valence from
+    # the action log and outcome ledger, so the self-model carries evidence of
+    # what Eve actually did, next to what she says about herself.
+    "measured_competence": [],
 }
 
 DEFAULT_WORLD_MODEL_STATE = {
@@ -1510,6 +1660,8 @@ DEFAULT_OTHER_MINDS_MODEL_STATE = {
     "observed_minds": [],
     "coordination_risks": [],
     "uncertainty_edges": [],
+    "social_prediction": eve_social_prediction.summarize_records([]),
+    "common_ground": eve_common_ground.build_model([], []),
     "next_check": "Notice the next concrete sign from another mind before inferring more than the evidence supports.",
 }
 
@@ -2565,7 +2717,63 @@ DEFAULT_OPERATOR_AUTHORIZATION = {
     "still_requires_specific_approval": OPERATOR_AUTHORIZATION_SCOPES["broad_safe"]["still_requires_specific_approval"],
 }
 AUTONOMY_FREE_RUN_STYLES = ["grounded", "explorer"]
+FLY_PROBE_ACTIONS = {
+    "fly_lesion_probe": "lesion",
+    "fly_attack_probe": "attack",
+    "fly_feeding_probe": "feeding",
+    "fly_growth_probe": "growth",
+    "fly_decoder_probe": "decoder",
+}
+FLY_LAB_DEFAULT_PATH = Path.home() / "Documents" / "eve-fly"
+# Body actions: Eve's kernel selects these like any other intention; the live body executes them through
+# mind/intent.json while the connectome's reflexes keep precedence. Consequences are measured, not assumed.
+BODY_ACTIONS = {
+    "body_approach_food": "approach_food",
+    "body_escape": "escape",
+    "body_rest": "rest",
+    "body_explore": "explore",
+}
+BODY_ACTION_NEUROMODULATORS = {
+    "approach_food": {"dopamine": 0.5, "serotonin": 0.3},
+    "escape": {"octopamine": 0.9},
+    "rest": {"serotonin": 0.8},
+    "explore": {"octopamine": 0.4, "dopamine": 0.3},
+}
+BODY_PRESSURE_IDS = ("body_hunger", "body_threat", "body_integrity")
+# Eve's outcome valence is written into the fly's mushroom bodies (anatomical and grown) as a
+# dopamine pulse on the odour context the body is in; the organs' learned_* readouts return it
+# to her as interoception. Shared memory, in both directions.
+FLY_GROWN_ORGAN_DEFAULT_URL = "http://127.0.0.1:8792/status"
+BODY_MEMORY_WRITE_GAIN = 0.8
+# Body needs are 0..1 world quantities. Below these a body action has nothing to regulate,
+# so it is neither offered nor executed; a run without a threat is not an escape.
+BODY_ESCAPE_THREAT_MIN = 0.2
+BODY_APPROACH_HUNGER_MIN = 0.15
+BODY_CALM_HUNGER_MAX = 0.3
+BODY_NEED_RELIEF_MIN = 0.05
+BODY_AT_FOOD_DISTANCE = 0.6
+# A standing intent is the kernel's selected body intention held by the body until its
+# consequence arrives: refreshed every workspace tick, dead within one ttl of a dead kernel.
+# Each episode is judged by the need falling, never by the body having obeyed.
+BODY_STANDING_INTENT_BEHAVIORS = ("approach_food", "escape")
+BODY_STANDING_INTENT_TTL_SECONDS = 90
+BODY_STANDING_INTENT_EPISODE_SECONDS = 600
+BODY_STANDING_INTENT_PATH = APP_DIR / "body_standing_intent.json"
+# The body takes the thought target when something about it changed, not on every tick.
+BODY_STATE_THOUGHT_MARKER_PATH = APP_DIR / "body_state_thought_marker.json"
+BODY_STATE_THOUGHT_LEVEL_DELTA = 10
+BODY_STATE_THOUGHT_MAX_AGE_MINUTES = 60
 AUTONOMY_FREE_RUN_ACTIONS = {
+    "body_approach_food": "Move the fly body toward food and feed; the consequence is the measured change in food distance.",
+    "body_escape": "Turn the fly body away from the threat and run; the consequence is the measured drop in threat.",
+    "body_rest": "Hold the fly body still and let it settle; the consequence is the measured stillness.",
+    "body_explore": "Walk the fly body through the arena; the consequence is the measured displacement.",
+    "self_change": "Apply one of your own draft proposals within your authority: a config or routing change, blocking a broken check, retiring a pattern, approving maintenance, or a tested code patch with rollback.",
+    "fly_lesion_probe": "Loom the fly body-brain intact and lesioned; the lesioned graph must read zero.",
+    "fly_attack_probe": "Score the latest eye-driven threat attacks on the fly body: escapes and turn-away direction.",
+    "fly_feeding_probe": "Drive sugar versus bitter taste neurons in the fly body-brain and compare proboscis motor output.",
+    "fly_growth_probe": "Report the mushroom-body growth experiment (more Kenyon cells by type-level wiring, dopamine-gated plasticity).",
+    "fly_decoder_probe": "Report the imitation-trained connectome decoder: training loss and closed-loop walking versus baselines.",
     "mind_tick": "Refresh Eve's short-horizon active mind through the configured mind lanes.",
     "thought": "Write one continuous thought into Eve's journal.",
     "ambient_note": "Update the lightweight ambient thought surface without a heavy model call.",
@@ -2580,6 +2788,16 @@ AUTONOMY_FREE_RUN_ACTIONS = {
     "wait_observe": "Pause briefly and only observe/log the system.",
 }
 AUTONOMY_FREE_RUN_SYSTEM_TOUCH_ACTIONS = {
+    "body_approach_food",
+    "body_escape",
+    "body_rest",
+    "body_explore",
+    "self_change",
+    "fly_lesion_probe",
+    "fly_attack_probe",
+    "fly_feeding_probe",
+    "fly_growth_probe",
+    "fly_decoder_probe",
     "system_tasks",
     "capability_tryout",
     "service_health_check",
@@ -2599,6 +2817,16 @@ AUTONOMY_FREE_RUN_PASSIVE_ACTIONS = {
     "wait_observe",
 }
 AUTONOMY_FREE_RUN_ACTION_FAMILIES = {
+    "body_approach_food": "body",
+    "body_escape": "body",
+    "body_rest": "body",
+    "body_explore": "body",
+    "self_change": "self",
+    "fly_lesion_probe": "fly",
+    "fly_attack_probe": "fly",
+    "fly_feeding_probe": "fly",
+    "fly_growth_probe": "fly",
+    "fly_decoder_probe": "fly",
     "system_tasks": "tasks",
     "capability_tryout": "capability",
     "service_health_check": "health",
@@ -2793,6 +3021,15 @@ SYSTEM_TASK_STATUSES = ["planned", "in_progress", "completed", "blocked", "skipp
 SYSTEM_TASK_LANES = ["cpu", "gpu", "hybrid"]
 SYSTEM_TASK_COMPONENTS = ["cpu", "gpu", "memory", "disk", "filesystem", "launchd", "network", "agent", "openclaw", "tools", "safety"]
 DEVELOPMENTAL_CYCLE_SAFE_ACTIONS = [
+    "body_approach_food",
+    "body_escape",
+    "body_rest",
+    "body_explore",
+    "fly_lesion_probe",
+    "fly_attack_probe",
+    "fly_feeding_probe",
+    "fly_growth_probe",
+    "fly_decoder_probe",
     "system_tasks",
     "service_health_check",
     "cleanup_candidate_check",
@@ -2919,6 +3156,40 @@ LOW_SIGNAL_ENTRY_KINDS = {
     "system_task_blocked",
     "developmental_cycle",
 }
+
+# Telemetry journal kinds: rows the daemon writes about its own machinery
+# (89.6% of journal rows since 2026-09-12). Reflection, proposals and the
+# human-context refresh draw on lived rows only (thoughts, reflections,
+# messages, outcomes, actions), never on these (program task 1.2). The
+# default of ``read_entries`` is untouched; callers opt in by passing
+# ``exclude_kinds=TELEMETRY_ENTRY_KINDS``.
+TELEMETRY_ENTRY_KINDS = (
+    "nervous_system_run",
+    "cycle_skipped",
+    "mind_tick",
+    "system_task_created",
+    "system_task_completed",
+    "message_logged",
+    "daemon_error",
+    "body_standing_intent_started",
+    "body_standing_intent_completed",
+    "upgrade_detected",
+    "self_awareness_test_failed",
+    "self_awareness_test_infrastructure_failed",
+    "outreach_skipped",
+    "heartbeat",
+    "autonomy_free_run_started",
+    "autonomy_free_run_completed",
+    "daemon_started",
+    "daemon_restarting",
+    "lane_probes_refreshed",
+    "presence_cycle",
+    "developmental_cycle",
+)
+
+# Hard ceiling on what the reflection and proposal models receive, applied
+# before the transport's own lane fit (program task 1.2).
+LIVED_EVIDENCE_PROMPT_MAX_TOKENS = 6500
 
 STORE_FILENAMES = [
     "config.json",
@@ -3531,12 +3802,21 @@ def load_agent_integration_state(prefer_runtime: bool = False) -> Dict[str, obje
     return state
 
 
-def save_agent_capability_radar(state: Dict[str, object]) -> Dict[str, object]:
+def save_agent_capability_radar(
+    state: Dict[str, object],
+    *,
+    mirror_runtime: Optional[bool] = None,
+) -> Dict[str, object]:
+    mirror_runtime, state_authority = observation_artifact_state_authority(
+        mirror_runtime=mirror_runtime,
+    )
     payload = default_agent_capability_radar_state()
     payload.update(state)
     payload["updated_at"] = utc_now()
+    payload["state_authority"] = state_authority
     eve_store.write_json_dict(AGENT_CAPABILITY_RADAR_PATH, payload)
-    mirror_store_file_to_runtime(AGENT_CAPABILITY_RADAR_PATH)
+    if mirror_runtime:
+        mirror_store_file_to_runtime(AGENT_CAPABILITY_RADAR_PATH)
     return payload
 
 
@@ -3549,12 +3829,21 @@ def save_agent_integration_state(state: Dict[str, object]) -> Dict[str, object]:
     return payload
 
 
-def save_component_update_state(state: Dict[str, object]) -> Dict[str, object]:
+def save_component_update_state(
+    state: Dict[str, object],
+    *,
+    mirror_runtime: Optional[bool] = None,
+) -> Dict[str, object]:
+    mirror_runtime, state_authority = observation_artifact_state_authority(
+        mirror_runtime=mirror_runtime,
+    )
     payload = default_component_update_state()
     payload.update(state)
     payload["updated_at"] = utc_now()
+    payload["state_authority"] = state_authority
     eve_store.write_json_dict(COMPONENT_UPDATE_STATE_PATH, payload)
-    mirror_store_file_to_runtime(COMPONENT_UPDATE_STATE_PATH)
+    if mirror_runtime:
+        mirror_store_file_to_runtime(COMPONENT_UPDATE_STATE_PATH)
     return payload
 
 
@@ -3592,8 +3881,32 @@ def read_capability_intelligence_history(
     return read_jsonl_tail_records(path, max(1, min(500, int(limit or 20))))
 
 
-def save_capability_intelligence(snapshot: Dict[str, object]) -> Dict[str, object]:
+def save_capability_intelligence(
+    snapshot: Dict[str, object],
+    *,
+    mirror_runtime: Optional[bool] = None,
+) -> Dict[str, object]:
     ensure_store()
+    source_process = not running_from_runtime_bundle()
+    live_runtime = bool(source_process and daemon_runtime_running())
+    if mirror_runtime is None:
+        # A source-checkout observation may be useful for development, but it
+        # must not replace the running daemon's lived capability ledger. The
+        # CLI delegates explicit --runtime refreshes into the runtime bundle;
+        # ordinary source refreshes remain source-only while Eve is live.
+        mirror_runtime = not live_runtime
+    snapshot["state_authority"] = {
+        "execution_side": "source_checkout" if source_process else "runtime_bundle",
+        "daemon_runtime_running": live_runtime if source_process else True,
+        "runtime_mirror_written": bool(mirror_runtime and source_process),
+        "persistence": (
+            "source_only_preserved_live_runtime"
+            if source_process and live_runtime and not mirror_runtime
+            else "runtime_authoritative"
+            if not source_process
+            else "source_and_offline_runtime_mirror"
+        ),
+    }
     eve_store.write_json_dict(CAPABILITY_INTELLIGENCE_PATH, snapshot, sort_keys=True)
     eve_store.atomic_write_text(
         CAPABILITY_INTELLIGENCE_REPORT_PATH,
@@ -3601,9 +3914,10 @@ def save_capability_intelligence(snapshot: Dict[str, object]) -> Dict[str, objec
     )
     history_record = eve_capability_intelligence.compact_history_record(snapshot)
     append_jsonl_record(CAPABILITY_INTELLIGENCE_HISTORY_PATH, history_record)
-    mirror_store_file_to_runtime(CAPABILITY_INTELLIGENCE_PATH)
-    mirror_store_file_to_runtime(CAPABILITY_INTELLIGENCE_HISTORY_PATH)
-    mirror_store_file_to_runtime(CAPABILITY_INTELLIGENCE_REPORT_PATH)
+    if mirror_runtime:
+        mirror_store_file_to_runtime(CAPABILITY_INTELLIGENCE_PATH)
+        mirror_store_file_to_runtime(CAPABILITY_INTELLIGENCE_HISTORY_PATH)
+        mirror_store_file_to_runtime(CAPABILITY_INTELLIGENCE_REPORT_PATH)
     changes = snapshot.get("changes") if isinstance(snapshot.get("changes"), dict) else {}
     opportunities = [
         item
@@ -3678,7 +3992,12 @@ def save_capability_intelligence(snapshot: Dict[str, object]) -> Dict[str, objec
         stream="capabilities",
         review_status="observed",
     )
-    append_eve_event_ledger_event(event)
+    if mirror_runtime or not source_process:
+        append_eve_event_ledger_event(event)
+    else:
+        # Keep source-only development observations out of Eve's live event
+        # ledger while still retaining a local audit trail.
+        append_jsonl_record(EVENT_LEDGER_PATH, event)
     return snapshot
 
 
@@ -4183,17 +4502,20 @@ def resolve_capability_first_for_objective(
     prefer_runtime: bool = True,
     target: Optional[Dict[str, object]] = None,
     source: str = "manual",
+    needs: Optional[List[str]] = None,
 ) -> Dict[str, object]:
     matrix = build_capability_matrix(config, prefer_runtime=prefer_runtime, source=source)
     intelligence = load_capability_intelligence(prefer_runtime=prefer_runtime)
     radar = load_agent_capability_radar(prefer_runtime=prefer_runtime)
-    return eve_capability_adoption.resolve_capability_first(
+    resolver = eve_capability_adoption.resolve_capability_needs if needs else eve_capability_adoption.resolve_capability_first
+    return resolver(
         objective,
         matrix,
         intelligence,
         components=component_watchlist(config),
         radar=radar,
         target=target,
+        **({"needs": needs} if needs else {}),
     )
 
 
@@ -5199,6 +5521,59 @@ def probe_hermes_local_model_endpoint(model_config: Dict[str, str], *, timeout: 
         }
 
 
+def hermes_endpoint_observation_environment_limited(endpoint: Dict[str, object]) -> bool:
+    if endpoint.get("ok") or not endpoint.get("checked"):
+        return False
+    detail = str(endpoint.get("detail") or "").lower()
+    return any(
+        marker in detail
+        for marker in (
+            "operation not permitted",
+            "permission denied by sandbox",
+            "network access is restricted",
+            "sandboxed runner",
+        )
+    )
+
+
+def classify_hermes_learning_organ_status(
+    *,
+    version_ok: bool,
+    profile_exists: bool,
+    config_exists: bool,
+    guardrail_ok: bool,
+    model_endpoint: Dict[str, object],
+    model_endpoint_observation_valid: bool,
+    model_context_length: int,
+) -> str:
+    if not (version_ok and profile_exists and config_exists and guardrail_ok):
+        return "installed_needs_profile_guardrail" if version_ok else "missing"
+    if (
+        model_endpoint.get("checked")
+        and not model_endpoint.get("ok")
+        and model_endpoint_observation_valid
+    ):
+        return "available_proposal_only_model_unreachable"
+    if not model_context_length:
+        return "available_proposal_only_context_unknown"
+    if model_context_length < 64000:
+        return "available_proposal_only_context_below_hermes_minimum"
+    return "available_proposal_only"
+
+
+def hermes_serious_proposal_route_ready(status: Dict[str, object]) -> bool:
+    default_route_ready = bool(
+        parse_boolish(status.get("model_endpoint_reachable"))
+        and int(status.get("model_context_length") or 0)
+        >= int(status.get("hermes_minimum_context_length") or 64000)
+    )
+    return bool(
+        str(status.get("status") or "").startswith("available_proposal_only")
+        and parse_boolish(status.get("soul_guardrail_ok"))
+        and (default_route_ready or parse_boolish(status.get("serious_learning_route_verified")))
+    )
+
+
 def hermes_local_lab_model_config() -> Dict[str, str]:
     return {
         "default": HERMES_LOCAL_LAB_ALIAS,
@@ -5268,6 +5643,9 @@ def hermes_local_lab_status(*, timeout: int = 2) -> Dict[str, object]:
 def start_hermes_local_lab(*, timeout: int = 90) -> Dict[str, object]:
     ensure_store()
     config = load_config()
+    if configured_model_lane_topology_mode(config) == eve_model_topology.MODEL_LANE_TOPOLOGY_SINGLE_SUBSTRATE:
+        return {"ok": False, "started": False, "reused": False,
+                "reason": "single_substrate_policy_disallows_extra_model"}
     model_path = hermes_local_lab_model_path(config)
     existing = hermes_local_lab_status(timeout=2)
     if existing.get("ok"):
@@ -5476,10 +5854,14 @@ def detect_hermes_learning_organ(*, timeout: int = 10, profile_home: Optional[Pa
     source = hermes_source_head()
     model_config = read_hermes_profile_model_config(profile_home)
     model_endpoint = probe_hermes_local_model_endpoint(model_config, timeout=2)
+    model_endpoint_environment_limited = hermes_endpoint_observation_environment_limited(model_endpoint)
+    model_endpoint_observation_valid = not model_endpoint_environment_limited
     latest_run = latest_hermes_run(prefer_runtime=False)
     latest_run_hermes_status = latest_run.get("hermes_status") if isinstance(latest_run.get("hermes_status"), dict) else {}
+    single_substrate = configured_model_lane_topology_mode(load_config()) == eve_model_topology.MODEL_LANE_TOPOLOGY_SINGLE_SUBSTRATE
     latest_serious_route_verified = bool(
-        latest_run.get("local_64k_lab_requested")
+        not single_substrate
+        and latest_run.get("local_64k_lab_requested")
         and latest_run.get("strict_json_ok")
         and not latest_run.get("json_repair_used")
         and int(latest_run_hermes_status.get("model_context_length") or 0) >= 64000
@@ -5488,18 +5870,15 @@ def detect_hermes_learning_organ(*, timeout: int = 10, profile_home: Optional[Pa
         model_context_length = int(str(model_config.get("context_length") or "0").replace(",", ""))
     except ValueError:
         model_context_length = 0
-    if version_ok and profile_exists and config_exists and guardrail_ok:
-        status = "available_proposal_only"
-        if model_endpoint.get("checked") and not model_endpoint.get("ok"):
-            status = "available_proposal_only_model_unreachable"
-        elif not model_context_length:
-            status = "available_proposal_only_context_unknown"
-        elif model_context_length and model_context_length < 64000:
-            status = "available_proposal_only_context_below_hermes_minimum"
-    elif version_ok:
-        status = "installed_needs_profile_guardrail"
-    else:
-        status = "missing"
+    status = classify_hermes_learning_organ_status(
+        version_ok=version_ok,
+        profile_exists=profile_exists,
+        config_exists=config_exists,
+        guardrail_ok=guardrail_ok,
+        model_endpoint=model_endpoint,
+        model_endpoint_observation_valid=model_endpoint_observation_valid,
+        model_context_length=model_context_length,
+    )
     return {
         "status": status,
         "command": command,
@@ -5525,6 +5904,8 @@ def detect_hermes_learning_organ(*, timeout: int = 10, profile_home: Optional[Pa
         "hermes_minimum_context_length": 64000,
         "model_endpoint_checked": bool(model_endpoint.get("checked")),
         "model_endpoint_reachable": bool(model_endpoint.get("ok")),
+        "model_endpoint_observation_valid": model_endpoint_observation_valid,
+        "model_endpoint_environment_limited": model_endpoint_environment_limited,
         "model_endpoint_detail": model_endpoint.get("detail") or "",
         "latest_smoke_run_id": latest_run.get("id") or "",
         "latest_smoke_status": latest_run.get("status") or "",
@@ -5539,6 +5920,9 @@ def detect_hermes_learning_organ(*, timeout: int = 10, profile_home: Optional[Pa
         "direct_state_write_allowed": False,
         "adds_chat_lane": False,
         "next_step": (
+            "Qwen3.8-only policy disables the extra 64K lab model; serious Hermes proposals remain unavailable at the current 32K context."
+            if single_substrate and model_context_length < 64000
+            else
             "Run a trace-to-proposal smoke through the evelearning profile, then ingest with governance."
             if status == "available_proposal_only"
             else "Start or repair the configured local Eve model endpoint before running Hermes trace-to-proposal smokes."
@@ -5585,6 +5969,8 @@ def format_hermes_learning_organ_status(payload: Dict[str, object], *, full: boo
                 f"env_exists: {'yes' if payload.get('env_exists') else 'no'}",
                 f"soul_path: {payload.get('soul_path') or ''}",
                 f"model_base_url: {payload.get('model_base_url') or ''}",
+                f"model_endpoint_observation_valid: {'yes' if payload.get('model_endpoint_observation_valid', True) else 'no'}",
+                f"model_endpoint_environment_limited: {'yes' if payload.get('model_endpoint_environment_limited') else 'no'}",
                 f"model_endpoint_detail: {payload.get('model_endpoint_detail') or ''}",
                 f"latest_smoke_run_id: {payload.get('latest_smoke_run_id') or ''}",
                 f"latest_smoke_artifact_path: {payload.get('latest_smoke_artifact_path') or ''}",
@@ -5623,6 +6009,7 @@ def run_hermes_profile_command(
         if not script_bin:
             return {
                 "ok": False,
+                "process_ok": False,
                 "returncode": 127,
                 "command": command,
                 "needs_tty": True,
@@ -5630,6 +6017,10 @@ def run_hermes_profile_command(
                 "stderr": "script command unavailable; cannot allocate a pseudo-terminal",
                 "stdout_preview": "",
                 "stderr_preview": "script command unavailable; cannot allocate a pseudo-terminal",
+                "observation_complete": False,
+                "observation_authoritative": True,
+                "observation_environment_limited": False,
+                "failure_kind": "launch_error",
             }
         tty_wrapper = "script"
         run_command = [script_bin, "-q", "/dev/null", *command]
@@ -5643,8 +6034,10 @@ def run_hermes_profile_command(
             timeout=max(1, int(timeout or 20)),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        failure_kind = "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "launch_error"
         return {
             "ok": False,
+            "process_ok": False,
             "returncode": 124 if isinstance(exc, subprocess.TimeoutExpired) else 127,
             "command": command,
             "needs_tty": needs_tty,
@@ -5653,11 +6046,64 @@ def run_hermes_profile_command(
             "stderr": normalize_text_value(exc, fallback="Hermes command failed.", limit=500),
             "stdout_preview": "",
             "stderr_preview": normalize_text_value(exc, fallback="Hermes command failed.", limit=500),
+            "observation_complete": False,
+            "observation_authoritative": True,
+            "observation_environment_limited": False,
+            "failure_kind": failure_kind,
         }
     stdout = clean_hermes_cli_output(process.stdout or "")
     stderr = clean_hermes_cli_output(process.stderr or "")
+    combined = f"{stdout}\n{stderr}".lower()
+    try:
+        profile_stat = HERMES_EVE_PROFILE_HOME.stat()
+        profile_owner_writable = bool(
+            profile_stat.st_uid == os.geteuid()
+            and profile_stat.st_mode & 0o200
+        )
+    except OSError:
+        profile_owner_writable = False
+    permission_limited = bool(
+        profile_owner_writable
+        and (
+            (
+                "state.db is not writable" in combined
+                and "read-only for this user" in combined
+            )
+            or (
+                "operation not permitted" in combined
+                and str(HERMES_EVE_PROFILE_HOME).lower() in combined
+            )
+        )
+    )
+    network_limited = bool(
+        args[:2] == ["security", "audit"]
+        and (
+            "nodename nor servname provided" in combined
+            or "temporary failure in name resolution" in combined
+            or "network is unreachable" in combined
+        )
+    )
+    environment_limited = permission_limited or network_limited
+    semantic_failure = any(
+        marker in combined
+        for marker in (
+            "error generating insights:",
+            "could not compute prompt-size breakdown:",
+        )
+    )
+    process_ok = process.returncode == 0
+    observation_complete = bool(process_ok and not semantic_failure)
+    if observation_complete:
+        failure_kind = "none"
+    elif environment_limited:
+        failure_kind = "restricted_environment"
+    elif semantic_failure:
+        failure_kind = "semantic_failure"
+    else:
+        failure_kind = "command_failure"
     return {
-        "ok": process.returncode == 0,
+        "ok": observation_complete,
+        "process_ok": process_ok,
         "returncode": process.returncode,
         "command": command,
         "needs_tty": needs_tty,
@@ -5666,12 +6112,43 @@ def run_hermes_profile_command(
         "stderr": stderr[:8000],
         "stdout_preview": normalize_text_value(stdout, fallback="", limit=1200),
         "stderr_preview": normalize_text_value(stderr, fallback="", limit=1200),
+        "observation_complete": observation_complete,
+        "observation_authoritative": not environment_limited,
+        "observation_environment_limited": environment_limited,
+        "failure_kind": failure_kind,
     }
 
 
 def hermes_command_output_contains(result: Dict[str, object], needle: str) -> bool:
     haystack = f"{result.get('stdout') or ''}\n{result.get('stderr') or ''}".lower()
     return needle.lower() in haystack
+
+
+def parse_hermes_cli_toolsets(output: object) -> Dict[str, object]:
+    """Parse the stable human-readable `hermes tools list` contract.
+
+    Hermes does not currently expose a JSON form for this command. Keep the
+    parser deliberately narrow: only rows that explicitly say enabled or
+    disabled count as observations. Headings and descriptive prose are
+    ignored, and an empty parse is never treated as proof that tools are off.
+    """
+
+    enabled: List[str] = []
+    disabled: List[str] = []
+    for raw_line in str(output or "").splitlines():
+        match = re.search(r"\b(enabled|disabled)\s+([A-Za-z0-9_.:-]+)(?:\s|$)", raw_line)
+        if not match:
+            continue
+        state, name = match.groups()
+        target = enabled if state == "enabled" else disabled
+        if name not in target:
+            target.append(name)
+    return {
+        "enabled": enabled,
+        "disabled": disabled,
+        "observed_count": len(enabled) + len(disabled),
+        "observation_complete": bool(enabled or disabled),
+    }
 
 
 def build_hermes_capability_families(commands: Dict[str, Dict[str, object]], status: Dict[str, object]) -> List[Dict[str, object]]:
@@ -5689,23 +6166,25 @@ def build_hermes_capability_families(commands: Dict[str, Dict[str, object]], sta
     def command_succeeded_with_output(key: str) -> bool:
         return bool(commands.get(key, {}).get("ok") and command_text(key).strip())
 
+    def command_environment_limited(key: str) -> bool:
+        return bool(commands.get(key, {}).get("observation_environment_limited"))
+
+    def configured_status(key: str, absent_markers: tuple[str, ...]) -> str:
+        if command_environment_limited(key):
+            return "inconclusive_environment"
+        if not command_succeeded_with_output(key):
+            return "inspect_failed"
+        lowered = command_text(key).lower()
+        return "available_not_configured" if any(marker in lowered for marker in absent_markers) else "configured"
+
     default_ready = (
         str(status.get("status") or "") == "available_proposal_only"
         and bool(status.get("model_endpoint_reachable"))
         and int(status.get("model_context_length") or 0) >= int(status.get("hermes_minimum_context_length") or 64000)
     )
-    mcp_configured = bool(
-        command_succeeded_with_output("mcp_list")
-        and not hermes_command_output_contains(commands.get("mcp_list", {}), "no mcp servers configured")
-    )
-    gateway_running = bool(
-        command_succeeded_with_output("gateway_status")
-        and not hermes_command_output_contains(commands.get("gateway_status", {}), "gateway is not running")
-    )
-    cron_configured = bool(
-        command_succeeded_with_output("cron_list")
-        and not hermes_command_output_contains(commands.get("cron_list", {}), "no scheduled jobs")
-    )
+    mcp_status = configured_status("mcp_list", ("no mcp servers configured",))
+    gateway_status = configured_status("gateway_status", ("gateway is not running",))
+    cron_status = configured_status("cron_list", ("no scheduled jobs",))
     plugins_text = str(commands.get("plugins_list", {}).get("stdout") or "").lower()
     plugins_enabled = bool(re.search(r"│\s*[^│]+\s*│\s*enabled\s*│", plugins_text))
     config_check_ok = command_succeeded_with_output("config_check")
@@ -5730,11 +6209,28 @@ def build_hermes_capability_families(commands: Dict[str, Dict[str, object]], sta
     curator_enabled = "curator: enabled" in curator_text
     curator_runs_match = re.search(r"runs:\s*(\d+)", curator_text)
     curator_runs = int(curator_runs_match.group(1)) if curator_runs_match else 0
-    hooks_configured = bool(
-        command_succeeded_with_output("hooks_list")
-        and "no shell hooks configured" not in command_text("hooks_list").lower()
+    hooks_text = command_text("hooks_list").lower()
+    hooks_absent = bool(
+        any(
+            marker in hooks_text
+            for marker in (
+                "no shell hooks configured",
+                "no shell hooks or outbound webhooks configured",
+                "no hooks configured",
+                "no hooks found",
+                "no configured hooks",
+            )
+        )
+        or re.search(r"\b0\s+(?:configured\s+)?(?:shell\s+)?hooks\b", hooks_text)
     )
+    if command_environment_limited("hooks_list"):
+        hooks_status = "inconclusive_environment"
+    elif not command_succeeded_with_output("hooks_list"):
+        hooks_status = "inspect_failed"
+    else:
+        hooks_status = "available_not_configured" if hooks_absent else "configured"
     insights_available = bool(commands.get("insights", {}).get("ok"))
+    insights_environment_limited = command_environment_limited("insights")
     journey_payload = command_json("journey")
     journey_stats = journey_payload.get("stats") if isinstance(journey_payload.get("stats"), dict) else {}
     moa_active = bool(
@@ -5766,6 +6262,33 @@ def build_hermes_capability_families(commands: Dict[str, Dict[str, object]], sta
         or "below the minimum 64,000" in prompt_size_text
         or "below the minimum 64000" in prompt_size_text
     )
+    tools_result = commands.get("tools_list_cli", {})
+    tools_inventory = parse_hermes_cli_toolsets(command_text("tools_list_cli"))
+    tools_environment_limited = command_environment_limited("tools_list_cli")
+    tools_observed = bool(tools_result.get("ok") and tools_inventory.get("observation_complete"))
+    enabled_cli_toolsets = [str(item) for item in tools_inventory.get("enabled", [])]
+    disabled_cli_toolsets = [str(item) for item in tools_inventory.get("disabled", [])]
+    if tools_environment_limited:
+        tools_status = "inconclusive_environment"
+    elif not tools_observed:
+        tools_status = "inspect_failed"
+    elif enabled_cli_toolsets:
+        tools_status = "broad_cli_authority_enabled"
+    else:
+        tools_status = "all_cli_toolsets_disabled"
+    memory_status_ok = command_succeeded_with_output("memory_status")
+    sessions_environment_limited = command_environment_limited("sessions_list")
+    sessions_status_ok = command_succeeded_with_output("sessions_list")
+    if memory_status_ok and sessions_environment_limited:
+        memory_session_status = "builtin_ready_sessions_inconclusive_environment"
+    elif memory_status_ok and sessions_status_ok:
+        memory_session_status = "available_builtin_only"
+    elif memory_status_ok:
+        memory_session_status = "builtin_ready_sessions_inspect_failed"
+    elif command_environment_limited("memory_status"):
+        memory_session_status = "inconclusive_environment"
+    else:
+        memory_session_status = "inspect_failed"
     return [
         {
             "id": "agent_runtime",
@@ -5801,11 +6324,21 @@ def build_hermes_capability_families(commands: Dict[str, Dict[str, object]], sta
         },
         {
             "id": "tools_toolsets",
-            "status": "available" if commands.get("tools_summary", {}).get("ok") else "inspect_failed",
+            "status": tools_status,
+            "enabled_cli_toolsets": enabled_cli_toolsets,
+            "disabled_cli_toolsets": disabled_cli_toolsets,
+            "enabled_cli_toolset_count": len(enabled_cli_toolsets),
+            "disabled_cli_toolset_count": len(disabled_cli_toolsets),
+            "ordinary_cli_tool_authority_disabled": tools_observed and not enabled_cli_toolsets,
             "eve_role": "capability surface to inventory only; Eve should not grant tool authority through Hermes",
-            "evidence": ["hermes tools --summary"],
+            "evidence": ["hermes tools list --platform cli"],
             "admission_required_before_use": True,
-            "recommended_next_test": "python3 eve.py hermes inventory --refresh --full",
+            "recommended_next_test": (
+                "Keep Eve-owned Hermes runs on constrained JSON with toolsets disabled; back up the profile, "
+                "disable ordinary CLI toolsets, and verify the exact list before relying on ordinary CLI mode."
+                if enabled_cli_toolsets
+                else "python3 eve.py hermes inventory --refresh --full"
+            ),
         },
         {
             "id": "skills",
@@ -5829,7 +6362,21 @@ def build_hermes_capability_families(commands: Dict[str, Dict[str, object]], sta
         },
         {
             "id": "memory_and_session_search",
-            "status": "available_builtin_only",
+            "status": memory_session_status,
+            "memory_status": (
+                "ready"
+                if memory_status_ok
+                else "inconclusive_environment"
+                if command_environment_limited("memory_status")
+                else "inspect_failed"
+            ),
+            "sessions_status": (
+                "ready"
+                if sessions_status_ok
+                else "inconclusive_environment"
+                if sessions_environment_limited
+                else "inspect_failed"
+            ),
             "eve_role": "retrieval evidence source only; not canonical Eve memory",
             "evidence": ["hermes memory status", "hermes sessions list"],
             "admission_required_before_use": True,
@@ -5838,7 +6385,9 @@ def build_hermes_capability_families(commands: Dict[str, Dict[str, object]], sta
         {
             "id": "insights_and_journey",
             "status": (
-                "available_with_history"
+                "inconclusive_environment"
+                if insights_environment_limited
+                else "available_with_history"
                 if int(journey_stats.get("nodes") or 0) > 0
                 else "available_no_profile_history"
                 if insights_available
@@ -5867,7 +6416,7 @@ def build_hermes_capability_families(commands: Dict[str, Dict[str, object]], sta
         },
         {
             "id": "mcp",
-            "status": "configured" if mcp_configured else "available_not_configured",
+            "status": mcp_status,
             "eve_role": "interop candidate; use Eve MCP/OpenClaw admission before enabling",
             "evidence": ["hermes mcp list"],
             "admission_required_before_use": True,
@@ -5891,7 +6440,15 @@ def build_hermes_capability_families(commands: Dict[str, Dict[str, object]], sta
         },
         {
             "id": "gateway_messaging",
-            "status": "running" if gateway_running else "available_stopped",
+            "status": (
+                "inconclusive_environment"
+                if gateway_status == "inconclusive_environment"
+                else "inspect_failed"
+                if gateway_status == "inspect_failed"
+                else "available_stopped"
+                if gateway_status == "available_not_configured"
+                else "running"
+            ),
             "eve_role": "mostly redundant with OpenClaw; avoid split-brain channels",
             "evidence": ["hermes gateway status"],
             "admission_required_before_use": True,
@@ -5899,7 +6456,17 @@ def build_hermes_capability_families(commands: Dict[str, Dict[str, object]], sta
         },
         {
             "id": "cron_hooks",
-            "status": "configured" if cron_configured or hooks_configured else "available_not_configured",
+            "status": (
+                "inconclusive_environment"
+                if "inconclusive_environment" in {cron_status, hooks_status}
+                else "inspect_failed"
+                if "inspect_failed" in {cron_status, hooks_status}
+                else "configured"
+                if "configured" in {cron_status, hooks_status}
+                else "available_not_configured"
+            ),
+            "cron_status": cron_status,
+            "shell_hooks_status": hooks_status,
             "eve_role": "routine proposal surface; schedules need Eve approval",
             "evidence": ["hermes cron list"],
             "admission_required_before_use": True,
@@ -5932,7 +6499,9 @@ def build_hermes_capability_families(commands: Dict[str, Dict[str, object]], sta
         {
             "id": "supply_chain_security",
             "status": (
-                "inspect_failed"
+                "inconclusive_environment"
+                if command_environment_limited("security_audit")
+                else "inspect_failed"
                 if not security_audit_ok
                 else f"findings_{security_findings}"
                 if security_findings
@@ -5949,7 +6518,9 @@ def build_hermes_capability_families(commands: Dict[str, Dict[str, object]], sta
         {
             "id": "source_update",
             "status": (
-                "inspect_failed"
+                "inconclusive_environment"
+                if command_environment_limited("version_detail")
+                else "inspect_failed"
                 if not version_detail_ok
                 else f"update_available_{commits_behind}_commits"
                 if commits_behind
@@ -5971,15 +6542,48 @@ def build_hermes_capability_families(commands: Dict[str, Dict[str, object]], sta
     ]
 
 
-def build_hermes_capability_inventory(*, timeout: int = 25, save: bool = True) -> Dict[str, object]:
+def observation_artifact_state_authority(
+    *,
+    mirror_runtime: Optional[bool] = None,
+) -> Tuple[bool, Dict[str, object]]:
+    """Choose where a source or runtime observation may become authoritative."""
+
+    source_process = not running_from_runtime_bundle()
+    live_runtime = bool(source_process and daemon_runtime_running())
+    if mirror_runtime is None:
+        mirror_runtime = bool(source_process and not live_runtime)
+    return bool(mirror_runtime), {
+        "execution_side": "source_checkout" if source_process else "runtime_bundle",
+        "daemon_runtime_running": live_runtime if source_process else True,
+        "runtime_mirror_written": bool(mirror_runtime and source_process),
+        "persistence": (
+            "source_only_preserved_live_runtime"
+            if source_process and live_runtime and not mirror_runtime
+            else "runtime_authoritative"
+            if not source_process
+            else "source_and_offline_runtime_mirror"
+        ),
+    }
+
+
+def build_hermes_capability_inventory(
+    *,
+    timeout: int = 25,
+    save: bool = True,
+    mirror_runtime: Optional[bool] = None,
+) -> Dict[str, object]:
     ensure_store()
+    mirror_runtime, state_authority = observation_artifact_state_authority(
+        mirror_runtime=mirror_runtime,
+    )
     status = detect_hermes_learning_organ(timeout=min(max(1, int(timeout or 25)), 30))
     commands = {
-        "version_detail": run_hermes_profile_command(["version"], timeout=timeout),
+        "version_detail": run_hermes_profile_command(["--version"], timeout=timeout),
         "dump": run_hermes_profile_command(["dump"], timeout=timeout),
         "config_check": run_hermes_profile_command(["config", "check"], timeout=timeout),
         "security_audit": run_hermes_profile_command(["security", "audit", "--json"], timeout=max(timeout, 30)),
         "tools_summary": run_hermes_profile_command(["tools", "--summary"], timeout=timeout, needs_tty=True),
+        "tools_list_cli": run_hermes_profile_command(["tools", "list", "--platform", "cli"], timeout=timeout),
         "skills_list_enabled": run_hermes_profile_command(["skills", "list", "--enabled-only"], timeout=timeout),
         "curator_status": run_hermes_profile_command(["curator", "status"], timeout=timeout),
         "curator_usage": run_hermes_profile_command(["curator", "usage"], timeout=timeout),
@@ -6009,6 +6613,10 @@ def build_hermes_capability_inventory(*, timeout: int = 25, save: bool = True) -
             "returncode": value.get("returncode"),
             "stdout_preview": value.get("stdout_preview") or "",
             "stderr_preview": value.get("stderr_preview") or "",
+            "observation_complete": bool(value.get("observation_complete", value.get("ok"))),
+            "observation_authoritative": value.get("observation_authoritative") is not False,
+            "observation_environment_limited": bool(value.get("observation_environment_limited")),
+            "failure_kind": value.get("failure_kind") or ("none" if value.get("ok") else "command_failure"),
         }
         for key, value in commands.items()
     }
@@ -6035,6 +6643,16 @@ def build_hermes_capability_inventory(*, timeout: int = 25, save: bool = True) -
         "adds_chat_lane": False,
         "direct_state_write_allowed": False,
         "canonical_memory_authority": False,
+        "admitted_execution_contract": {
+            "toolsets_enabled": [],
+            "persistent_memory_enabled": False,
+            "project_context_files_enabled": False,
+            "profile_soul_identity_enabled": True,
+            "background_review_enabled": False,
+            "session_persistence_enabled": False,
+            "max_agent_iterations": 1,
+        },
+        "state_authority": state_authority,
         "default_profile_ready_for_serious_learning": default_ready,
         "serious_learning_route": "default_profile" if default_ready else "local_64k_lab_constrained_json",
         "hermes_status": status,
@@ -6057,7 +6675,8 @@ def build_hermes_capability_inventory(*, timeout: int = 25, save: bool = True) -
     }
     if save:
         eve_store.write_json_dict(HERMES_CAPABILITY_INVENTORY_PATH, inventory, sort_keys=True)
-        mirror_store_file_to_runtime(HERMES_CAPABILITY_INVENTORY_PATH)
+        if mirror_runtime:
+            mirror_store_file_to_runtime(HERMES_CAPABILITY_INVENTORY_PATH)
     return inventory
 
 
@@ -6109,6 +6728,14 @@ def hermes_inventory_family_status(inventory: Dict[str, object], family_id: str,
     return fallback
 
 
+def hermes_inventory_family(inventory: Dict[str, object], family_id: str) -> Dict[str, object]:
+    families = inventory.get("capability_families") if isinstance(inventory.get("capability_families"), list) else []
+    for family in families:
+        if isinstance(family, dict) and family.get("id") == family_id:
+            return family
+    return {}
+
+
 HERMES_FEATURE_POLICY_DEFINITIONS: List[Dict[str, object]] = [
     {
         "id": "identity_profile_soul",
@@ -6123,11 +6750,11 @@ HERMES_FEATURE_POLICY_DEFINITIONS: List[Dict[str, object]] = [
     {
         "id": "memory_user_notes",
         "feature": "Hermes memory, USER.md, MEMORY.md, and session search",
-        "posture": "working_context_only",
-        "authority": "Hermes memory can support proposals but is not canonical Eve memory.",
-        "required_gate": "Any durable memory or user-model claim must enter `governance ingest-hermes` and require approval before apply.",
-        "recommendation": "Use Hermes recall to propose evidence-backed MemoryPatchProposal/UserModelPatchProposal records.",
-        "misuse_risk": "One bad session becomes permanent Eve knowledge.",
+        "posture": "read_only_audit_not_admitted_run_context",
+        "authority": "Hermes profile memory may be inspected as external evidence but is excluded from admitted Eve proposal runs and is never canonical Eve memory.",
+        "required_gate": "Admitted proposal runs must use `skip_memory=True`, no memory toolset, and no Hermes session persistence; any durable claim must enter `governance ingest-hermes` and require approval before apply.",
+        "recommendation": "Audit Hermes recall separately, then provide only selected, sourced evidence inside the bounded Eve trace.",
+        "misuse_risk": "A stale profile note or prior Hermes session silently becomes evidence about Eve or the operator.",
         "allowed_now": True,
     },
     {
@@ -6348,8 +6975,12 @@ def build_hermes_feature_policy(
     status: Optional[Dict[str, object]] = None,
     inventory: Optional[Dict[str, object]] = None,
     save: bool = True,
+    mirror_runtime: Optional[bool] = None,
 ) -> Dict[str, object]:
     ensure_store()
+    mirror_runtime, state_authority = observation_artifact_state_authority(
+        mirror_runtime=mirror_runtime,
+    )
     status = status or detect_hermes_learning_organ(timeout=10)
     inventory = inventory or latest_hermes_capability_inventory(prefer_runtime=False)
     family_statuses = {
@@ -6371,7 +7002,20 @@ def build_hermes_feature_policy(
         "config_and_prompt_hygiene": hermes_inventory_family_status(inventory, "config_and_prompt_hygiene"),
         "supply_chain_security": hermes_inventory_family_status(inventory, "supply_chain_security"),
         "source_update": hermes_inventory_family_status(inventory, "source_update"),
+        "tools_toolsets": hermes_inventory_family_status(inventory, "tools_toolsets"),
     }
+    cron_hooks_family = hermes_inventory_family(inventory, "cron_hooks")
+    tools_family = hermes_inventory_family(inventory, "tools_toolsets")
+    family_statuses["cron_scheduler"] = normalize_text_value(
+        cron_hooks_family.get("cron_status"),
+        fallback=family_statuses["cron_hooks"],
+        limit=120,
+    )
+    family_statuses["shell_hooks"] = normalize_text_value(
+        cron_hooks_family.get("shell_hooks_status"),
+        fallback=family_statuses["cron_hooks"],
+        limit=120,
+    )
     security_summary = (
         inventory.get("security_summary")
         if isinstance(inventory.get("security_summary"), dict)
@@ -6387,7 +7031,7 @@ def build_hermes_feature_policy(
     current_state_by_feature = {
         "identity_profile_soul": "guardrail_ok" if status.get("soul_guardrail_ok") else "guardrail_missing",
         "memory_user_notes": family_statuses["memory_and_session_search"],
-        "insights_analytics": "read_only_available",
+        "insights_analytics": family_statuses["insights_and_journey"],
         "snapshot_rollback_branch": "checkpoints_enabled" if "enabled: true" in config_text else "unknown",
         "approval_bypass_modes": "not_admitted",
         "model_provider_switching": family_statuses["model_route"],
@@ -6397,18 +7041,18 @@ def build_hermes_feature_policy(
             [
                 f"plugins={family_statuses['plugins']}",
                 f"mcp={family_statuses['mcp']}",
-                f"tools={family_statuses['browser_voice_media_code_rl']}",
+                f"tools={family_statuses['tools_toolsets']}",
             ]
         ),
         "gateway_messaging": family_statuses["gateway_messaging"],
-        "cron_webhooks": family_statuses["cron_hooks"],
+        "cron_webhooks": family_statuses["cron_scheduler"],
         "config_prompt_hygiene": family_statuses["config_and_prompt_hygiene"],
         "supply_chain_security": family_statuses["supply_chain_security"],
         "skill_curator_lifecycle": family_statuses["skill_curator"],
         "moa_fallback_orchestration": family_statuses["model_orchestration"],
         "projects_kanban_worktrees": family_statuses["projects_kanban_worktrees"],
         "acp_editor_bridge": family_statuses["acp_editor_bridge"],
-        "shell_hooks": family_statuses["cron_hooks"],
+        "shell_hooks": family_statuses["shell_hooks"],
         "computer_use_driver": family_statuses["computer_use"],
         "profile_checkpoints_backup": family_statuses["checkpoints_and_backup"],
         "dashboard_desktop_api": "available_keep_stopped",
@@ -6433,12 +7077,25 @@ def build_hermes_feature_policy(
         watch_items.append("Hermes profile points at a non-local provider route; explicit approval is required.")
     if family_statuses["gateway_messaging"] == "running":
         watch_items.append("Hermes gateway is running; OpenClaw should remain Eve's primary body unless a specific exception is approved.")
-    if family_statuses["cron_hooks"] == "configured":
+    if family_statuses["cron_scheduler"] == "configured":
         watch_items.append("Hermes cron jobs are configured; schedules need Eve ledger/risk-gate ownership.")
+    if family_statuses["shell_hooks"] == "configured":
+        watch_items.append("Hermes shell hooks are configured; executable and event-ledger admission evidence is required.")
     if family_statuses["mcp"] == "configured":
         watch_items.append("Hermes MCP servers are configured; require MCP admission before Eve use.")
     if family_statuses["plugins"] == "enabled":
         watch_items.append("Hermes plugins appear enabled; require capability admission before Eve use.")
+    if family_statuses["tools_toolsets"] == "broad_cli_authority_enabled":
+        enabled_toolsets = [
+            str(item)
+            for item in (tools_family.get("enabled_cli_toolsets") or [])
+            if str(item).strip()
+        ]
+        watch_items.append(
+            "Hermes ordinary CLI still exposes tool authority outside Eve's constrained adapter: "
+            + ", ".join(enabled_toolsets)
+            + ". Eve-owned smoke/eval/proposal runs must stay constrained and tool-less until the profile is backed up, hardened, and restore-tested."
+        )
     security_match = re.fullmatch(r"findings_(\d+)", family_statuses["supply_chain_security"])
     if security_match and int(security_match.group(1)) > 0:
         blocking_findings = int(security_summary.get("blocking_severity_count") or 0)
@@ -6474,6 +7131,29 @@ def build_hermes_feature_policy(
         watch_items.append("Hermes project/Kanban state is configured; do not let it become a second Eve task authority.")
     if family_statuses["computer_use"] == "installed_not_admitted":
         watch_items.append("Hermes computer-use is installed but not admitted; OpenClaw remains Eve's embodied action layer.")
+    inconclusive_families = sorted(
+        key
+        for key, value in family_statuses.items()
+        if "inconclusive_environment" in str(value)
+        and key != "cron_hooks"
+    )
+    if inconclusive_families:
+        watch_items.append(
+            "Restricted execution left Hermes feature observations inconclusive: "
+            + ", ".join(inconclusive_families)
+            + ". Preserve the last host-authoritative result and rerun on the host."
+        )
+    failed_audits = sorted(
+        key
+        for key in ("supply_chain_security", "source_update")
+        if family_statuses.get(key) == "inspect_failed"
+    )
+    if failed_audits:
+        watch_items.append(
+            "Hermes feature audits failed without a current authoritative result: "
+            + ", ".join(failed_audits)
+            + "."
+        )
 
     policy = {
         "schema_version": "eve_hermes_feature_policy.v2",
@@ -6484,6 +7164,16 @@ def build_hermes_feature_policy(
         "profile_home": str(HERMES_EVE_PROFILE_HOME),
         "principle": "Hermes can learn and propose; Eve owns identity, memory, permissions, channels, and final state.",
         "default_decision": "inventory_or_proposal_only",
+        "admitted_execution_contract": {
+            "toolsets_enabled": [],
+            "persistent_memory_enabled": False,
+            "project_context_files_enabled": False,
+            "profile_soul_identity_enabled": True,
+            "background_review_enabled": False,
+            "session_persistence_enabled": False,
+            "max_agent_iterations": 1,
+        },
+        "state_authority": state_authority,
         "summary": {
             "feature_count": len(features),
             "allowed_now_count": sum(1 for item in features if item.get("allowed_now")),
@@ -6512,7 +7202,8 @@ def build_hermes_feature_policy(
     }
     if save:
         eve_store.write_json_dict(HERMES_FEATURE_POLICY_PATH, policy, sort_keys=True)
-        mirror_store_file_to_runtime(HERMES_FEATURE_POLICY_PATH)
+        if mirror_runtime:
+            mirror_store_file_to_runtime(HERMES_FEATURE_POLICY_PATH)
     return policy
 
 
@@ -6722,7 +7413,11 @@ def hermes_smoke_gate_reasons(status: Dict[str, object], *, allow_non_local: boo
         reasons.append("model_context_length_unknown")
     elif model_context_length < hermes_minimum:
         reasons.append("model_context_below_hermes_minimum")
-    if status.get("model_endpoint_checked") and not status.get("model_endpoint_reachable"):
+    if (
+        status.get("model_endpoint_checked")
+        and not status.get("model_endpoint_reachable")
+        and status.get("model_endpoint_observation_valid", True)
+    ):
         reasons.append("model_endpoint_unreachable")
     base_url = str(status.get("model_base_url") or "").strip()
     if base_url:
@@ -7061,7 +7756,12 @@ agent = AIAgent(
     provider=runtime.get("provider"),
     api_mode=runtime.get("api_mode"),
     model=model,
+    max_iterations=1,
     enabled_toolsets=[],
+    skip_context_files=True,
+    load_soul_identity=True,
+    skip_memory=True,
+    skip_background_review=True,
     quiet_mode=True,
     platform="cli",
     credential_pool=runtime.get("credential_pool"),
@@ -7077,10 +7777,20 @@ agent = AIAgent(
         },
     },
 )
+# Hermes treats provider memory, project-context injection, and session
+# persistence as separate facilities.  Proposal generation must inherit none
+# of them: the bounded trace plus the dedicated Eve SOUL are the entire input
+# authority for this run.  These persistence flags are the same hard stop
+# Hermes uses for its own isolated background-review agents.
+agent._persist_disabled = True
+agent._session_json_enabled = False
 agent.suppress_status_output = True
 agent.stream_delta_callback = None
 agent.tool_gen_callback = None
-response = agent.chat(prompt) or ""
+try:
+    response = agent.chat(prompt) or ""
+finally:
+    agent.close()
 sys.stdout.write(response)
 if response and not response.endswith("\n"):
     sys.stdout.write("\n")
@@ -7108,7 +7818,7 @@ def run_hermes_smoke(
     allow_non_local: bool = False,
     repair_json: bool = False,
     allow_repaired_ingest: bool = False,
-    constrained_json: bool = False,
+    constrained_json: bool = True,
     local_64k_lab: bool = False,
     keep_local_lab: bool = False,
 ) -> Dict[str, object]:
@@ -7143,6 +7853,17 @@ def run_hermes_smoke(
         "ingest_requested": bool(ingest),
         "allow_repaired_ingest": bool(allow_repaired_ingest),
         "constrained_json": bool(constrained_json),
+        "execution_mode": "constrained_toolless_adapter" if constrained_json else "ordinary_hermes_cli_diagnostic",
+        "toolsets_enabled": [] if constrained_json else None,
+        "persistent_memory_enabled": False if constrained_json else None,
+        "profile_memory_authority": "disabled_for_run" if constrained_json else "profile_defined_not_admitted",
+        "project_context_files_enabled": False if constrained_json else None,
+        "profile_soul_identity_enabled": True if constrained_json else None,
+        "background_review_enabled": False if constrained_json else None,
+        "session_persistence_enabled": False if constrained_json else None,
+        "max_agent_iterations": 1 if constrained_json else None,
+        "ordinary_cli_mode": not bool(constrained_json),
+        "ordinary_cli_mode_admitted_for_eve": False,
         "stored_governance_proposals": False,
         "direct_state_write_allowed": False,
         "adds_chat_lane": False,
@@ -7343,6 +8064,7 @@ def format_hermes_smoke_result(record: Dict[str, object], *, full: bool = False)
         f"artifact: {record.get('artifact_path') or ''}",
         f"stored_governance_proposals: {'yes' if record.get('stored_governance_proposals') else 'no'}",
         f"constrained_json: {'yes' if record.get('constrained_json') else 'no'}",
+        f"execution_mode: {record.get('execution_mode') or 'unknown'}",
         f"strict_json_ok: {'yes' if record.get('strict_json_ok') else 'no'}",
         f"json_repair_used: {'yes' if record.get('json_repair_used') else 'no'}",
         f"summary: {record.get('summary') or ''}",
@@ -7456,7 +8178,7 @@ def run_hermes_smoke_eval(
     timeout: int = 180,
     local_64k_lab: bool = True,
     repair_json: bool = True,
-    constrained_json: bool = False,
+    constrained_json: bool = True,
 ) -> Dict[str, object]:
     ensure_store()
     eval_id = f"hermes-eval-{utc_timestamp_for_filename()}"
@@ -7475,6 +8197,16 @@ def run_hermes_smoke_eval(
                 "trials_requested": max(1, int(trials or 3)),
                 "local_64k_lab": bool(local_64k_lab),
                 "repair_json": bool(repair_json),
+                "constrained_json": bool(constrained_json),
+                "execution_mode": "constrained_toolless_adapter" if constrained_json else "ordinary_hermes_cli_diagnostic",
+                "persistent_memory_enabled": False if constrained_json else None,
+                "profile_memory_authority": "disabled_for_run" if constrained_json else "profile_defined_not_admitted",
+                "project_context_files_enabled": False if constrained_json else None,
+                "profile_soul_identity_enabled": True if constrained_json else None,
+                "background_review_enabled": False if constrained_json else None,
+                "session_persistence_enabled": False if constrained_json else None,
+                "max_agent_iterations": 1 if constrained_json else None,
+                "ordinary_cli_mode_admitted_for_eve": False,
                 "lab_start": lab_start,
                 "summary": {
                     "verdict": "failed",
@@ -7513,6 +8245,15 @@ def run_hermes_smoke_eval(
         "local_64k_lab": bool(local_64k_lab),
         "repair_json": bool(repair_json),
         "constrained_json": bool(constrained_json),
+        "execution_mode": "constrained_toolless_adapter" if constrained_json else "ordinary_hermes_cli_diagnostic",
+        "persistent_memory_enabled": False if constrained_json else None,
+        "profile_memory_authority": "disabled_for_run" if constrained_json else "profile_defined_not_admitted",
+        "project_context_files_enabled": False if constrained_json else None,
+        "profile_soul_identity_enabled": True if constrained_json else None,
+        "background_review_enabled": False if constrained_json else None,
+        "session_persistence_enabled": False if constrained_json else None,
+        "max_agent_iterations": 1 if constrained_json else None,
+        "ordinary_cli_mode_admitted_for_eve": False,
         "lab_start": lab_start,
         "lab_stop": lab_stop,
         "summary": summary,
@@ -7540,6 +8281,8 @@ def format_hermes_smoke_eval(record: Dict[str, object], *, full: bool = False) -
         f"id: {record.get('id') or ''}",
         f"artifact: {record.get('artifact_path') or ''}",
         f"constrained_json: {'yes' if record.get('constrained_json') else 'no'}",
+        f"execution_mode: {record.get('execution_mode') or 'unknown'}",
+        f"persistent_memory_enabled: {record.get('persistent_memory_enabled') if record.get('persistent_memory_enabled') is not None else 'profile-defined diagnostic'}",
         f"trials: {summary.get('trials') or 0}",
         f"pass_rate: {summary.get('pass_rate') or 0}",
         f"strict_json_rate: {summary.get('strict_json_rate') or 0}",
@@ -9794,6 +10537,18 @@ def llama_cpp_lane_server_record(
     }
 
 
+OPERATION_SAMPLING_OVERRIDES: Dict[str, Dict[str, float]] = {
+    "continuous_thought": {"temperature": 0.2},
+    "continuous_thought_repair": {"temperature": 0.2},
+    "continuous_thought_epistemic_critic_strict_json": {"temperature": 0.1},
+}
+
+
+def operation_sampling_overrides(operation: object) -> Dict[str, float]:
+    """Sampling parameters for operations that must be reproducible (author, repair, critic)."""
+    return dict(OPERATION_SAMPLING_OVERRIDES.get(str(operation or ""), {}))
+
+
 def llama_cpp_chat_template_kwargs(
     config: Dict[str, object],
     model: Optional[str],
@@ -10730,17 +11485,54 @@ def run_beads_task_bridge(
         running_from_runtime_bundle() or daemon_runtime_running()
     ):
         lock_path = RUNTIME_APP_DIR / "beads_bridge.json"
-    # Readers take the same lock as writers.  Otherwise a status/attestation
+    # Readers take the same lock as writers. Otherwise a status/attestation
     # probe can observe the dependency graph between a node update and its
-    # edge update and falsely report live drift.
-    with store_lock(lock_path):
-        return _run_beads_task_bridge_unlocked(
-            apply=apply,
-            max_tasks=max_tasks,
-            timeout=timeout,
-            workspace_root=workspace_root,
+    # edge update and falsely report live drift. A restricted observer may be
+    # unable to create that lock; preserve the last atomic host receipt rather
+    # than crashing or pretending it performed a current parity check.
+    try:
+        with store_lock(lock_path):
+            return _run_beads_task_bridge_unlocked(
+                apply=apply,
+                max_tasks=max_tasks,
+                timeout=timeout,
+                workspace_root=workspace_root,
+                prefer_runtime=prefer_runtime,
+            )
+    except PermissionError as exc:
+        if apply or exc.errno not in {errno.EACCES, errno.EPERM}:
+            raise
+        bridge_path = resolve_store_read_path(
+            BEADS_BRIDGE_PATH,
             prefer_runtime=prefer_runtime,
         )
+        cached = eve_store.load_json_dict(bridge_path, default={})
+        report = dict(cached) if isinstance(cached, dict) else {}
+        cached_status = str(report.get("status") or "missing")
+        cached_parity = report.get("parity") if isinstance(report.get("parity"), dict) else {}
+        report.update(
+            {
+                "schema_id": "eve.beads_bridge_report.v1",
+                "generated_at": utc_now(),
+                "status": "inconclusive_environment",
+                "apply": False,
+                "observation_complete": False,
+                "observation_authoritative": False,
+                "observation_environment_limited": True,
+                "failure_kind": "restricted_environment",
+                "error_code": errno.errorcode.get(exc.errno or 0, "EPERM"),
+                "last_authoritative_status": cached_status,
+                "last_authoritative_parity_ok": bool(cached_parity.get("ok")),
+                "blockers": [
+                    "The current observer could not acquire Eve's Beads bridge lock; no current parity verdict was produced."
+                ],
+                "summary": (
+                    "Beads parity is inconclusive in this restricted observer; "
+                    f"the last atomic receipt remains {cached_status}."
+                ),
+            }
+        )
+        return report
 
 
 def beads_task_bridge_needs_refresh(*, max_tasks: int = 80, prefer_runtime: bool = True) -> bool:
@@ -10796,6 +11588,8 @@ def detect_beads_work_graph(*, timeout: int = 10, prefer_runtime: bool = True) -
     bridge_current = False
     bridge_live_parity = False
     bridge_live_report: Dict[str, object] = {}
+    bridge_live_observation_authoritative: Optional[bool] = None
+    bridge_live_observation_environment_limited = False
     if bridge_verified:
         try:
             current_tasks = [
@@ -10819,10 +11613,19 @@ def detect_beads_work_graph(*, timeout: int = 10, prefer_runtime: bool = True) -
                 workspace_root=workspace_root,
                 prefer_runtime=prefer_runtime,
             )
-            bridge_live_parity = bool((bridge_live_report.get("parity") or {}).get("ok"))
+            bridge_live_observation_environment_limited = bool(
+                bridge_live_report.get("observation_environment_limited")
+            )
+            bridge_live_observation_authoritative = not bridge_live_observation_environment_limited
+            bridge_live_parity = bool(
+                bridge_live_observation_authoritative
+                and (bridge_live_report.get("parity") or {}).get("ok")
+            )
         except (OSError, ValueError, TypeError):
             bridge_live_parity = False
-    if installed and initialized and bridge_verified and bridge_current and bridge_live_parity:
+    if bridge_live_observation_environment_limited:
+        status = "partial"
+    elif installed and initialized and bridge_verified and bridge_current and bridge_live_parity:
         status = "healthy"
     elif installed and initialized:
         status = "staged_live"
@@ -10852,6 +11655,9 @@ def detect_beads_work_graph(*, timeout: int = 10, prefer_runtime: bool = True) -
         "bridge_current": bridge_current,
         "bridge_live_parity": bridge_live_parity,
         "bridge_live_status": str(bridge_live_report.get("status") or "not_checked"),
+        "bridge_live_observation_authoritative": bridge_live_observation_authoritative,
+        "bridge_live_observation_environment_limited": bridge_live_observation_environment_limited,
+        "bridge_live_observation_blockers": list(bridge_live_report.get("blockers") or []),
         "bridge_generated_at": str(bridge.get("generated_at") or ""),
         "projected_task_count": int(bridge.get("projected_task_count") or 0),
         "projected_edge_count": int(bridge.get("projected_edge_count") or 0),
@@ -11153,7 +11959,7 @@ SPECIALIST_SUBSTRATE_REGISTRY = {
     "coding_self_repair_specialist": {
         "label": "On-demand coding/self-repair specialist",
         "purpose": "Give Eve a bounded way to inspect, patch, test, and repair code or local integration issues when the five lanes identify a real need.",
-        "current_state": "bounded_coder_mode_self_repair_planner_and_openclaw_sidecar",
+        "current_state": "bounded_coder_mode_self_repair_planner_openclaw_sidecar_and_disposable_apple_container_canary",
         "target_state": "on_demand_specialist_model_if_needed",
         "adds_chat_lane": False,
         "owning_surface": "code/openclaw",
@@ -11161,13 +11967,14 @@ SPECIALIST_SUBSTRATE_REGISTRY = {
             "python3 eve.py code ask <request>",
             "python3 eve.py code list",
             "python3 eve.py self-repair plan \"<bounded objective>\" --full",
+            "python3 eve.py self-repair isolation --json",
             "python3 eve.py codex handoff \"<bounded objective>\"",
             "python3 eve.py governance ingest-codex --file <json>",
             "python3 eve.py governance code-lifecycle <proposal-id>",
             "python3 eve.py openclaw status",
         ],
         "guardrail": "Coding and repair run as tools with logs, permissions, proposals, and verification; they do not replace planner/deep/observer judgment or deploy code by themselves.",
-        "next_maturation": "Use self-repair plans to split code patches from operational repairs; code patches need CodePatchProposal approval/canary lifecycle evidence, while operational repairs need command preflight and verification.",
+        "next_maturation": "Use self-repair plans to split code patches from operational repairs; run source-only repair/dependency probes in the disposable Apple container when Linux is a valid test environment, then return evidence to the existing proposal and verification lifecycle.",
     },
     "model_inference_acceleration_lab": {
         "label": "Model inference acceleration lab",
@@ -11210,6 +12017,7 @@ SPECIALIST_SUBSTRATE_REGISTRY = {
             "python3 eve.py oss cycle --runtime --full",
             "python3 eve.py oss eval --runtime --full",
             "python3 eve.py oss dvc-snapshot --write --full",
+            "python3 eve.py infra otel-genai --runtime --json",
             "python3 bin/eve_oss_lab.py --write-trainer-recipes --verify-trainer-envs --json",
         ],
         "guardrail": "OSS tools produce evidence, evals, manifests, recipes, and candidates only; they do not grant memory, scheduler, action, identity, provider, or live-routing authority.",
@@ -11240,6 +12048,7 @@ SPECIALIST_SUBSTRATE_REGISTRY = {
             "python3 eve.py openclaw evidence --ingest-activity",
             "python3 eve.py openclaw evidence --sanitize-existing-hooks --full",
             "python3 eve.py openclaw admission list --full",
+            "python3 eve.py infra mcp-2026 --json",
         ],
         "guardrail": "OpenClaw gives Eve hands, senses, and repair reflexes; it must not define identity, override five-lane doctrine, or become canonical memory.",
         "next_maturation": "Expand the automatic evidence bridge from verified gateway startup callbacks into approved internal command, task, tool, approval, and delivery events when OpenClaw exposes stable payloads and a bounded validation path.",
@@ -11249,6 +12058,7 @@ SPECIALIST_SUBSTRATE_REGISTRY = {
 ORGAN_ASSIMILATION_ORDER = [
     "five_model_lanes",
     "openclaw_body_action_nervous_system",
+    "fly_body_brain",
     "hermes_learning_organ",
     "memory_retrieval_service",
     "beads_work_graph_substrate",
@@ -11273,6 +12083,13 @@ ORGAN_ASSIMILATION_REGISTRY = {
         "role": "Hands, senses, channels, tools, gateway sessions, repair reflexes, and execution evidence.",
         "human_quality": "Embodied agency: Eve can act in the world through bounded, admitted paths.",
         "authority_boundary": "Acts only through Eve action contracts, admission records, permission gates, and verification evidence.",
+        "cik_zone": eve_governance.CIK_CAPABILITY,
+    },
+    "fly_body_brain": {
+        "label": "Fly body-brain substrate",
+        "role": "Signed MaleCNS connectome (166,700 neurons, 25.6M synapses) running continuously as a rate model: reflex, appetite, and sensorimotor state below the language layer, with named sensory inputs and descending/motor readouts.",
+        "human_quality": "A body that keeps its own state between thoughts: startle, appetite, and motion that persist and decay without being narrated.",
+        "authority_boundary": "Emits typed signals and drives the simulated fly body only. It never speaks, owns no memory, and stays lesionable (no_edges/shuffled) so every claim about it carries a causal control.",
         "cik_zone": eve_governance.CIK_CAPABILITY,
     },
     "hermes_learning_organ": {
@@ -11339,6 +12156,9 @@ ORGAN_ASSIMILATION_REGISTRY = {
         "cik_zone": eve_governance.CIK_CAPABILITY,
     },
 }
+FLY_BODY_BRAIN_DEFAULT_URL = "http://127.0.0.1:8790/status"
+FLY_BODY_BRAIN_DEFAULT_STATUS_PATH = Path.home() / "Documents" / "eve-fly" / "organ" / "status.json"
+FLY_BODY_BRAIN_STALE_SECONDS = 120.0
 MODEL_TOTAL_SOFT_WEIGHT_GIB = 35.0
 MODEL_TOTAL_HARD_WEIGHT_GIB = 42.0
 MODEL_LANE_ROLE_HINTS = {
@@ -11558,6 +12378,20 @@ def resolve_model(
     fast_model = normalize_model_name(config.get("fast_model"))
     deep_model = normalize_model_name(config.get("deep_model"))
     normalized_role = " ".join(str(role or "general").lower().split()) or "general"
+
+    # Eve routes her own operations. operation_model_overrides maps a role to a lane name
+    # ("fast", "observer", "deep") or to a model name; she sets it through set_config.
+    overrides = config.get("operation_model_overrides") if isinstance(config.get("operation_model_overrides"), dict) else {}
+    lane_pick = str(overrides.get(normalized_role) or "").strip()
+    if lane_pick:
+        lane_models = {
+            "fast": fast_model,
+            "observer": normalize_model_name(config.get("mind_stream_observer_model") or config.get("observer_llama_cpp_model_alias")),
+            "deep": deep_model,
+        }
+        chosen = normalize_model_name(lane_models.get(lane_pick.lower()) or lane_pick)
+        if chosen:
+            return chosen
 
     if normalized_role in FAST_MODEL_ROLES and fast_model:
         return fast_model
@@ -12190,6 +13024,11 @@ def build_architecture_self_model_snapshot(
             "that five-route process topology is replaceable and is not Eve's identity"
         )
     )
+    if topology_mode == eve_model_topology.MODEL_LANE_TOPOLOGY_SINGLE_SUBSTRATE:
+        physical_topology = (
+            "the user-authorized resource-saving deployment preserves five logical faculties on one shared deep substrate; "
+            "this is a residency choice, not a measured lane-quality promotion"
+        )
     return {
         "schema_id": "eve.architecture_self_model.v1",
         "identity_count": 1,
@@ -13917,7 +14756,7 @@ def model_lane_effective_route(
     explicit = normalize_model_name(explicit_model)
     profile = profile_map.get(lane, lane)
     substrate_model = explicit or nominal_model
-    if not explicit and selected_mode == MODEL_LANE_TOPOLOGY_THREE_SUBSTRATE:
+    if not explicit and selected_mode != MODEL_LANE_TOPOLOGY_FIVE_ENDPOINT:
         substrate_model = model_alias_for_lane_profile(config, profile) or nominal_model
     role = MODEL_LANE_ROLE_HINTS.get(profile, MODEL_LANE_ROLE_HINTS.get(lane, "general"))
     host = configured_model_host(config, substrate_model, role)
@@ -15765,8 +16604,11 @@ def build_developmental_failure_modes(config: Dict[str, object], state: Dict[str
     except Exception:
         pass
 
-    if normalize_text_value(state.get("success_pattern_repair_summary"), fallback="", limit=120):
-        modes.append("success-pattern repair thread still needs upstream attention")
+    try:
+        if at_risk_success_patterns(limit=1):
+            modes.append("success-pattern repair thread still needs upstream attention")
+    except Exception:
+        pass
 
     deduped: List[str] = []
     seen = set()
@@ -15991,14 +16833,18 @@ def select_developmental_cycle_action(
     recent_cycles: List[Dict[str, object]],
     conscious_state: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
+    inhibited = dict(eve_recurrent_cognition.action_retry_inhibition(recent_actions, now=utc_now()))
+    for action, block in load_action_blocks().items():
+        inhibited.setdefault(action, {"reason": block.get("reason"), "retry_after": block.get("until"), "self_blocked": True})
     conscious_selection = recurrent_developmental_action_selection(
         config,
         conscious_state,
     )
-    if conscious_selection:
+    if conscious_selection and conscious_selection.get("action") not in inhibited:
         return conscious_selection
 
     counts = recent_developmental_action_counts(recent_cycles)
+    counts.update({action: max(100, counts.get(action, 0)) for action in inhibited})
     pressures = " ".join(normalize_text_list(homeostasis.get("dominant_pressures"), limit=8)).lower()
     workspace_text = " ".join(
         [
@@ -16014,7 +16860,7 @@ def select_developmental_cycle_action(
     )
     recent_unverified = [item for item in recent_actions[:5] if not action_execution_verified(item)]
 
-    if not recent_cycles:
+    if not recent_cycles and "service_health_check" not in inhibited:
         return {
             "action": "service_health_check",
             "capability": "operational_action_tree.service_health_check",
@@ -16097,7 +16943,7 @@ def select_developmental_cycle_action(
     least_used = min(
         [
             action for action in DEVELOPMENTAL_CYCLE_SAFE_ACTIONS
-            if not action.startswith("openclaw_") or developmental_openclaw_ready(config)
+            if action not in inhibited and (not action.startswith("openclaw_") or developmental_openclaw_ready(config))
         ],
         key=lambda item: counts.get(item, 0),
         default="service_health_check",
@@ -16198,6 +17044,7 @@ def recurrent_developmental_action_selection(
         ),
         "selection_source": "recurrent_conscious_state",
         "conscious_cycle_id": normalize_text_value(current.get("cycle_id"), fallback="", limit=80),
+        "contextual_learning": copy.deepcopy(selected_intention.get("contextual_learning") or {}),
         "conscious_broadcast": broadcast_content,
         "conscious_broadcast_kind": normalize_text_value(
             (broadcast.get("source_kinds") or [""])[0],
@@ -16222,6 +17069,8 @@ def infer_developmental_failure_mode(action: str, result: Dict[str, object], err
     typed_contract = result.get("typed_contract") if isinstance(result.get("typed_contract"), dict) else {}
     if typed_contract and not typed_contract.get("valid"):
         return f"{action} returned an invalid typed contract."
+    if eve_recurrent_cognition.action_result_consistency(result) is not True:
+        return f"{action} returned contradictory or incomplete execution evidence."
     return ""
 
 
@@ -16296,18 +17145,24 @@ def run_developmental_cycle(
             homeostasis=homeostasis,
             persist=True,
         )
-        if not normalize_text_value(conscious_state.get("cycle_id"), fallback="", limit=80):
-            conscious_cycle_error = "The recurrent preflight returned no causal cycle id."
+        if not (
+            isinstance(conscious_state, dict)
+            and isinstance(conscious_state.get("cycle_id"), str)
+            and conscious_state["cycle_id"].strip()
+            and conscious_state.get("status") == "integrated"
+        ):
+            conscious_cycle_error = "The recurrent preflight returned no open causal cycle."
     except Exception as exc:  # pragma: no cover - defensive runtime shield
         conscious_cycle_error = normalize_text_value(
             exc,
             fallback="The recurrent preflight cycle could not be opened.",
             limit=220,
         )
-        try:
-            conscious_state = load_conscious_state(prefer_runtime=prefer_runtime)
-        except Exception:
-            conscious_state = {}
+    if conscious_cycle_error:
+        # Existing bounded fallback actions can still run, but a previously
+        # loaded intention did not select this action and must not receive its
+        # consequence. Never close or seed recurrence from a stale branch.
+        conscious_state = {}
     selection = select_developmental_cycle_action(
         config,
         state,
@@ -16325,6 +17180,34 @@ def run_developmental_cycle(
         fallback="developmental_rotation",
         limit=80,
     )
+    memory_attention_mode = normalize_text_value(
+        config.get("developmental_memory_attention_mode"),
+        fallback="shadow",
+        limit=40,
+    ).lower()
+    memory_attention_shadow: Dict[str, object] = {
+        "schema_id": eve_recurrent_cognition.MEMORY_SHADOW_SCHEMA,
+        "mode": "off",
+        "candidate_action": action,
+        "action_change_applied": False,
+    }
+    if memory_attention_mode == "shadow":
+        try:
+            memory_attention_shadow = eve_recurrent_cognition.evaluate_action_memory_shadow(
+                recent_actions,
+                action,
+                now=timestamp,
+            )
+        except Exception as exc:  # pragma: no cover - defensive runtime shield
+            memory_attention_shadow = {
+                "schema_id": eve_recurrent_cognition.MEMORY_SHADOW_SCHEMA,
+                "mode": "shadow",
+                "candidate_action": action,
+                "decision": "inconclusive",
+                "reason": "shadow_evaluation_failed",
+                "error": normalize_text_value(exc, fallback="memory shadow failed", limit=220),
+                "action_change_applied": False,
+            }
     error_text = ""
     try:
         if action == "system_tasks":
@@ -16361,6 +17244,38 @@ def run_developmental_cycle(
             "status": result_status,
         }
     )
+    typed_module_result: Dict[str, object] = {}
+    next_module_query: Dict[str, object] = {}
+    module_recurrence_error = ""
+    if conscious_state.get("cycle_id") and parse_boolish(config.get("developmental_typed_module_recurrence_enabled", True)):
+        try:
+            typed_module_result = eve_recurrent_cognition.build_typed_module_result(
+                action,
+                result,
+                source_cycle_id=normalize_text_value(
+                    conscious_state.get("cycle_id"),
+                    fallback="",
+                    limit=100,
+                ),
+                observed_at=utc_now(),
+            )
+            next_module_query = eve_recurrent_cognition.derive_next_module_query(
+                typed_module_result,
+                admitted_actions=DEVELOPMENTAL_CYCLE_SAFE_ACTIONS,
+                recent_actions=[
+                    *recent_actions,
+                    {
+                        "action": action,
+                        "created_at": typed_module_result.get("observed_at"),
+                    },
+                ],
+            )
+        except Exception as exc:  # pragma: no cover - defensive runtime shield
+            module_recurrence_error = normalize_text_value(
+                exc,
+                fallback="typed module recurrence failed",
+                limit=220,
+            )
     conscious_completion: Dict[str, object] = {}
     next_conscious_state: Dict[str, object] = {}
     conscious_outcome = {
@@ -16376,6 +17291,9 @@ def run_developmental_cycle(
         "action": action,
         "source_cycle_id": normalize_text_value(conscious_state.get("cycle_id"), fallback="", limit=80),
         "execution_id": normalize_text_value(result.get("execution_id"), fallback="", limit=80),
+        "typed_module_result": typed_module_result,
+        "procedural_verification_ok": action_result_verified_for_completion(result),
+        "next_module_query": next_module_query,
     }
     if conscious_state.get("cycle_id"):
         try:
@@ -16394,6 +17312,7 @@ def run_developmental_cycle(
             next_conscious_state = build_recurrent_conscious_state(
                 source=f"{conscious_source_prefix}_recurrent:{source}:{cycle_id}",
                 latest_outcome=conscious_outcome,
+                module_query=next_module_query,
                 persist=True,
             )
         except Exception as exc:  # pragma: no cover - defensive runtime shield
@@ -16411,6 +17330,9 @@ def run_developmental_cycle(
     if conscious_cycle_error:
         causal_failure = f"recurrent action binding did not close cleanly: {conscious_cycle_error}"
         failure_mode = f"{failure_mode}; {causal_failure}" if failure_mode else causal_failure
+    if module_recurrence_error:
+        recurrence_failure = f"typed module recurrence did not close cleanly: {module_recurrence_error}"
+        failure_mode = f"{failure_mode}; {recurrence_failure}" if failure_mode else recurrence_failure
     improvement = "Logged the verified cycle as durable developmental evidence and updated the daemon state for the next hourly test."
     improvement_task_id = ""
     if not ok or failure_mode:
@@ -16457,7 +17379,12 @@ def run_developmental_cycle(
         "capability_attempted": action,
         "capability_surface": capability,
         "selection_source": selection_source,
+        "memory_attention_shadow": memory_attention_shadow,
+        "typed_module_result": typed_module_result,
+        "next_module_query": next_module_query,
         "conscious_action_binding": {
+            "contextual_learning": copy.deepcopy(selection.get("contextual_learning") or {}),
+            "preflight_opened": bool(conscious_state.get("cycle_id")),
             "source_cycle_id": normalize_text_value(conscious_state.get("cycle_id"), fallback="", limit=80),
             "source_status": normalize_text_value(conscious_state.get("status"), fallback="", limit=40),
             "broadcast": normalize_text_value(
@@ -16492,6 +17419,24 @@ def run_developmental_cycle(
             "evidence_kind": outcome_observation.get("evidence_kind") or "pending",
             "completed_cycle_id": normalize_text_value(conscious_completion.get("cycle_id"), fallback="", limit=80),
             "next_cycle_id": normalize_text_value(next_conscious_state.get("cycle_id"), fallback="", limit=80),
+            "next_module_query_id": normalize_text_value(
+                next_module_query.get("id"), fallback="", limit=100
+            ),
+            "next_module_query_broadcast": bool(
+                next_module_query
+                and isinstance(next_conscious_state.get("broadcast"), dict)
+                and normalize_text_value(
+                    next_conscious_state["broadcast"].get("content"),
+                    fallback="",
+                    limit=420,
+                )
+                == normalize_text_value(
+                    next_module_query.get("question"),
+                    fallback="",
+                    limit=420,
+                )
+            ),
+            "module_recurrence_error": module_recurrence_error,
             "overall_prediction_error": (
                 (conscious_completion.get("cycle_outcome") or {}).get("overall_prediction_error")
                 if isinstance(conscious_completion.get("cycle_outcome"), dict)
@@ -16512,8 +17457,9 @@ def run_developmental_cycle(
             "execution_backend": result.get("execution_backend"),
             "execution_tree_status": result.get("execution_tree_status"),
             "execution_verification_ok": action_result_explicit_verification(result) is True,
-            "ok": bool(result.get("ok")),
-            "executed": bool(result.get("executed")),
+            "completion_verified": ok,
+            "ok": parse_explicit_boolish(result.get("ok")),
+            "executed": parse_explicit_boolish(result.get("executed")),
             "status": result_status,
             "summary": result_summary,
             "created_count": result.get("created_count"),
@@ -17407,6 +18353,7 @@ def runtime_source_truth_check(
         "checked_at": utc_now(),
         "status": status,
         "running_from_runtime_bundle": running_from_runtime_bundle(),
+        "core_observation": observe_core_runner() if include_daemon else None,
         "daemon_runtime_running": daemon_runtime_running() if include_daemon else None,
         "needs_runtime_sync": bool(mismatches or missing),
         "needs_state_reconcile": bool(state_authority.get("blocks_truth")),
@@ -18189,41 +19136,8 @@ def read_perf_events(
     return maybe_limit(records, limit)
 
 
-def percentile(values: List[float], pct: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    if len(ordered) == 1:
-        return ordered[0]
-    rank = max(0, min(len(ordered) - 1, int(round((pct / 100) * (len(ordered) - 1)))))
-    return ordered[rank]
-
-
-def summarize_perf_events(events: List[Dict[str, object]]) -> List[Dict[str, object]]:
-    grouped: Dict[tuple[str, str], List[Dict[str, object]]] = {}
-    for event in events:
-        key = (str(event.get("category") or "unknown"), str(event.get("name") or "unknown"))
-        grouped.setdefault(key, []).append(event)
-
-    rows: List[Dict[str, object]] = []
-    for (category, name), group in grouped.items():
-        durations = [float(item.get("duration_ms") or 0.0) for item in group]
-        failures = [item for item in group if not bool(item.get("ok", True))]
-        rows.append(
-            {
-                "category": category,
-                "name": name,
-                "count": len(group),
-                "failures": len(failures),
-                "avg_ms": sum(durations) / len(durations),
-                "p95_ms": percentile(durations, 95),
-                "min_ms": min(durations),
-                "max_ms": max(durations),
-                "latest_at": group[-1].get("timestamp"),
-            }
-        )
-    rows.sort(key=lambda item: (item["category"], -float(item["avg_ms"]), item["name"]))
-    return rows
+percentile = eve_performance.percentile
+summarize_perf_events = eve_performance.summarize_perf_events
 
 
 def request_json_url(url: str, timeout: int = 10, headers: Optional[Dict[str, str]] = None) -> Dict[str, object]:
@@ -18272,33 +19186,8 @@ def post_json_url(
     return body
 
 
-def format_perf_summary_rows(rows: List[Dict[str, object]]) -> str:
-    if not rows:
-        return "No matching perf events found."
-    lines: List[str] = []
-    for row in rows:
-        lines.append(
-            f"{row['category']}/{row['name']}: "
-            f"count={row['count']} fail={row['failures']} "
-            f"avg={float(row['avg_ms']):.1f}ms p95={float(row['p95_ms']):.1f}ms "
-            f"min={float(row['min_ms']):.1f}ms max={float(row['max_ms']):.1f}ms "
-            f"latest={row.get('latest_at') or 'unknown'}"
-        )
-    return "\n".join(lines)
-
-
-def format_perf_failure_events(events: List[Dict[str, object]], limit: int = 5) -> str:
-    if not events:
-        return "No recent perf failures."
-    lines: List[str] = []
-    for event in events[-limit:]:
-        metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
-        error_text = normalize_text_value(metadata.get("error"), fallback="unknown", limit=220)
-        lines.append(
-            f"{event.get('timestamp') or 'unknown'} "
-            f"{event.get('category')}/{event.get('name')}: {error_text}"
-        )
-    return "\n".join(lines)
+format_perf_summary_rows = eve_performance.format_perf_summary_rows
+format_perf_failure_events = eve_performance.format_perf_failure_events
 
 
 def probe_json_endpoint(name: str, url: str, timeout: int = 10) -> Dict[str, object]:
@@ -19396,19 +20285,29 @@ def upsert_system_task(payload: Dict[str, object]) -> tuple[Dict[str, object], b
             record_metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
             previous_evidence = normalize_text_value(previous_metadata.get("evidence_key"), fallback="", limit=120)
             current_evidence = normalize_text_value(record_metadata.get("evidence_key"), fallback="", limit=120)
-            if previous_task and previous_task.get("status") == "completed" and previous_evidence and previous_evidence == current_evidence:
-                return previous_task, False
-            merged = dict(previous_task or {})
-            merged.update(record)
-            merged["id"] = str(previous_task["id"]) if previous_task else merged["id"]
-            merged["created_at"] = str(previous_task["created_at"]) if previous_task else merged["created_at"]
-            merged["updated_at"] = utc_now()
-            task = normalize_system_task(merged)
-            if task == previous_task:
-                return task, False
-            records[existing_index] = task
-            write_jsonl_records(SYSTEM_TASKS_PATH, records)
-            created = False
+            if previous_task and previous_task.get("status") == "completed":
+                if previous_evidence and previous_evidence == current_evidence:
+                    return previous_task, False
+                # A recurring semantic task may legitimately reuse its stable
+                # key after the prior cycle closed. Preserve the completed
+                # record and append one new open cycle; never mutate history
+                # back from completed to planned.
+                records.append(record)
+                write_jsonl_records(SYSTEM_TASKS_PATH, records)
+                created = True
+                task = record
+            else:
+                merged = dict(previous_task or {})
+                merged.update(record)
+                merged["id"] = str(previous_task["id"]) if previous_task else merged["id"]
+                merged["created_at"] = str(previous_task["created_at"]) if previous_task else merged["created_at"]
+                merged["updated_at"] = utc_now()
+                task = normalize_system_task(merged)
+                if task == previous_task:
+                    return task, False
+                records[existing_index] = task
+                write_jsonl_records(SYSTEM_TASKS_PATH, records)
+                created = False
     if created:
         append_entry(
             "system_task_created",
@@ -20059,6 +20958,27 @@ def path_age_seconds(path: Path) -> Optional[float]:
 
 def daemon_health_diagnostics(config: Dict[str, object]) -> Dict[str, object]:
     launch_status = inspect_launch_agent_status(LAUNCH_AGENT_LABEL)
+    observation = observe_core_runner()
+    if observation.get("available"):
+        liveness = presence_runtime_liveness(config, {}, runner_observation=observation)
+        running = bool(liveness.get("daemon_running"))
+        status = "running" if running else "not running" if liveness["status"] == "dormant" else liveness["status"]
+        age = liveness.get("last_loop_age_minutes")
+        return {
+            "part": f"daemon {status}; {liveness['reason']}",
+            "raw_part": f"daemon:owned:{status}:{liveness.get('last_loop_at') or ''}",
+            "degraded": not bool(liveness.get("live")),
+            "state": status,
+            "exit_code": "",
+            "last_loop_at": liveness.get("last_loop_at") or "",
+            "last_loop_age_seconds": age * 60 if age is not None else None,
+            # A native-service log cannot be attributed to a plain-process
+            # owner. Failed/stale owned activity already makes health degraded.
+            "recent_traceback": False,
+            "stderr_tail": "",
+            "native_service_state": str(launch_status.get("state") or "unknown"),
+            "runtime_liveness": liveness,
+        }
     runtime_state = doctor_runtime_state_with_recent_entries(load_state(prefer_runtime=True), prefer_runtime=True)
     loop_sleep_seconds = clamp_int(config.get("loop_sleep_seconds"), 30, minimum=1, maximum=600)
     freshness_window = max(loop_sleep_seconds * 4, 120)
@@ -20087,14 +21007,23 @@ def daemon_health_diagnostics(config: Dict[str, object]) -> Dict[str, object]:
     state_name = normalize_text_value(launch_status.get("state"), fallback="unknown", limit=40).lower()
     exit_text = normalize_text_value(launch_status.get("last_exit_code"), fallback="", limit=20)
     loop_fresh = last_loop_age_seconds is not None and last_loop_age_seconds <= freshness_window
-    degraded = recent_traceback or not loop_fresh or state_name in {"not running", "unknown"}
+    runtime_liveness = presence_runtime_liveness(
+        config,
+        runtime_state,
+        daemon_running=state_name in {"active", "running"},
+        prefer_runtime=True,
+    )
+    runtime_live = bool(runtime_liveness.get("live"))
+    degraded = recent_traceback or not runtime_live or state_name in {"not running", "unknown"}
     part = f"daemon {state_name or 'unknown'}"
     # If launchd reports the service as currently running and the loop is fresh,
     # the historical last-exit code is noise, not a current health signal.
     show_exit_code = bool(exit_text) and (degraded or state_name not in {"active", "running"})
     if show_exit_code:
         part += f" (last exit {exit_text})"
-    if loop_fresh and last_loop_age_seconds is not None:
+    if runtime_liveness.get("active") and not loop_fresh:
+        part += "; active bounded cycle heartbeat is fresh"
+    elif loop_fresh and last_loop_age_seconds is not None:
         part += f"; last loop {int(last_loop_age_seconds)}s ago"
     elif last_loop_at:
         part += f"; last loop {last_loop_at}"
@@ -20110,6 +21039,7 @@ def daemon_health_diagnostics(config: Dict[str, object]) -> Dict[str, object]:
         "last_loop_age_seconds": last_loop_age_seconds,
         "recent_traceback": recent_traceback,
         "stderr_tail": stderr_tail,
+        "runtime_liveness": runtime_liveness,
     }
 
 
@@ -21191,6 +22121,13 @@ def read_success_patterns(
         ),
         reverse=True,
     )
+    if status == "active" and any(
+        (item.get("metadata") or {}).get("contextual_learning") == eve_context_learning.POLICY
+        for item in records
+    ):
+        records = filter_contextual_success_patterns(
+            records, load_conscious_state(prefer_runtime=prefer_runtime), now=utc_now(),
+        )
     if limit is not None:
         return records[:limit]
     return records
@@ -21647,6 +22584,54 @@ def ingest_success_pattern_candidates(
             },
         )
     return changed_patterns
+
+
+def filter_contextual_success_patterns(patterns, current, *, now):
+    """Revalidate procedures on retrieval; preserve historical evidence."""
+    at = parse_iso_datetime(current.get("updated_at")) if isinstance(current, dict) else None
+    timestamp = parse_iso_datetime(now)
+    fresh = bool(at and timestamp and 0 <= (timestamp - at).total_seconds() <= 180)
+    model = (current.get("action_model") or {}) if fresh else {}
+    contexts = {row["action_context"]["id"]
+                for row in model.get("affordances") or [] if isinstance(row, dict)
+                and eve_context_learning.valid_context(row.get("action_context"))}
+    learning = (current.get("learning") or {}) if fresh else {}
+    supported = {row["dedupe_key"] for row in eve_context_learning.consolidated_candidates(
+        learning.get("action_models") or {}, now=now)}
+    return [row for row in patterns if
+            (row.get("metadata") or {}).get("contextual_learning") != eve_context_learning.POLICY
+            or (row.get("dedupe_key") in supported and
+                ((row.get("metadata") or {}).get("action_context") or {}).get("id") in contexts)]
+
+
+def consolidate_contextual_success_patterns(current, *, source):
+    """Use the existing procedural store; never add a second memory authority."""
+    learning = current.get("learning") if isinstance(current.get("learning"), dict) else {}
+    candidates = [row for row in eve_context_learning.consolidated_candidates(
+        learning.get("action_models") or {}, now=utc_now())
+        if row["metadata"]["action_id"] in DEVELOPMENTAL_CYCLE_SAFE_ACTIONS]
+    eligible = {row["dedupe_key"]: row for row in candidates}
+    existing = {row["dedupe_key"]: row for row in read_success_patterns(status=None)
+                if (row.get("metadata") or {}).get("contextual_learning") == eve_context_learning.POLICY}
+    changed = []
+    for key, previous in existing.items():
+        if key not in eligible and previous.get("status") == "active":
+            changed.append(update_success_pattern_record(
+                str(previous["id"]), status="superseded", last_contradicted_at=utc_now(),
+                contradictions=["Current bounded evidence no longer qualifies this contextual procedure."],
+            ))
+    for key, candidate in eligible.items():
+        previous = existing.get(key)
+        if previous is None:
+            changed.extend(ingest_success_pattern_candidates([candidate], source=source))
+        elif previous.get("status") == "archived":
+            continue  # operator retirement is not automatically reversed
+        elif previous.get("status") != "active" or previous.get("source_ids") != candidate["source_ids"]:
+            # Generic merging only raises confidence. Reversible procedures
+            # instead reflect their current exact support, including recovery.
+            changed.append(update_success_pattern_record(str(previous["id"]), **candidate, status="active"))
+    return {"policy": eve_context_learning.POLICY, "eligible_count": len(eligible),
+            "changed_count": len(changed), "pattern_ids": [row["id"] for row in changed]}
 
 
 def refresh_success_patterns(source: str = "manual", since_days: int = 365) -> List[Dict[str, object]]:
@@ -22355,6 +23340,7 @@ def message_is_synthetic_continuity(message: Dict[str, object]) -> bool:
 
 BACKGROUND_CONTEXT_MESSAGE_KINDS = {
     "autonomy_free_run_prompt",
+    "daemon_digest",
     "autonomy_free_run_report",
     "autonomy_free_run_update",
     "failure_review_update",
@@ -23050,7 +24036,9 @@ def ensure_followup_proposal(
     source: str,
     evidence_key: str,
     metadata: Optional[Dict[str, object]] = None,
+    config: Optional[Dict[str, object]] = None,
 ) -> tuple[Dict[str, object], bool]:
+    stale_days = clamp_int((config or DEFAULT_CONFIG).get("self_change_stale_days"), 7, minimum=1, maximum=365)
     record = {
         "id": str(uuid.uuid4()),
         "created_at": utc_now(),
@@ -23071,6 +24059,11 @@ def ensure_followup_proposal(
                 and str(existing.get("status") or "").strip().lower() != "archived"
             ):
                 return existing, False
+        # Same topic, different evidence: one draft per proposal_dedupe_key, and a topic applied or
+        # archived within self_change_stale_days is not redrafted (task 1.6).
+        duplicate = find_duplicate_proposal(record, proposals, stale_days=stale_days)
+        if duplicate is not None:
+            return duplicate, False
         proposals.append(record)
         write_jsonl_records(PROPOSALS_PATH, proposals)
     mirror_store_file_to_runtime(PROPOSALS_PATH)
@@ -25907,7 +26900,9 @@ def join_delayed_reply_consequence(
     )
     if not source_cycle_id or not reply_message_id or not evidence_id:
         return None
-    action_id = normalize_text_value(replay.get("conscious_action_id"), fallback="respond_to_user", limit=80)
+    # User acceptance evaluates the reply, never independently verifies a tool
+    # that happened to execute during the same turn.
+    action_id = "respond_to_user"
     outcome_ok = bool(prediction.get("outcome_ok"))
     observed_text = normalize_text_value(prediction.get("observed_text"), fallback="", limit=180)
     summary = normalize_text_value(
@@ -25935,6 +26930,7 @@ def join_delayed_reply_consequence(
             if isinstance(prediction.get("error_magnitude"), int)
             else None,
             faculty_contributors=reply_faculty_contributors_from_replay(replay),
+            source_credit=replay.get("conscious_reply_credit"),
         )
         persisted = normalize_conscious_state(updated)
         payload.clear()
@@ -26018,70 +27014,155 @@ def record_conversational_prediction_check(
     prior_replay: Optional[Dict[str, object]],
     inbound_message: Dict[str, object],
 ) -> Optional[Dict[str, object]]:
-    """Score the prior reply's predicted_reaction against what the user actually
-    did. A correction we did not anticipate is the headline surprise; it flows
-    into the same prediction-error ledger that feeds homeostasis surprise and the
-    workspace prediction_errors field."""
-    predicted_raw = str((prior_replay or {}).get("predicted_reaction") or "")
-    predicted = "accept_or_continue" if predicted_raw == "accept_or_correct" else predicted_raw
-    if not predicted:
+    """Score the exact prior reply against the next genuine observable response.
+
+    New replays use a calibrated multiclass distribution and proper scoring.
+    Legacy replays retain the old categorical behavior solely so pending lived
+    consequences from before this migration are not discarded.
+    """
+    replay = prior_replay if isinstance(prior_replay, dict) else {}
+    if replay.get("synthetic"):
         return None
     user_text = normalize_text_value(inbound_message.get("body"), fallback="", limit=400)
     if not user_text:
         return None
-    correction = classify_user_correction(user_text)
-    is_correction = correction is not None
-    explicit_acceptance = user_message_explicitly_accepts(user_text)
-    if is_correction:
-        observed = "correction"
-        fulfilled: Optional[bool] = False
-        consequence_observed = True
-        outcome_ok: Optional[bool] = False
-    elif explicit_acceptance:
-        observed = "acceptance"
-        fulfilled = True
-        consequence_observed = True
-        outcome_ok = True
-    elif predicted == "answer_question" and "?" not in user_text:
-        observed = "answer"
-        fulfilled = True
-        consequence_observed = True
-        outcome_ok = True
+    thread_id = normalize_text_value(inbound_message.get("thread_id"), fallback="", limit=120)
+    reply_message_id = normalize_text_value(replay.get("reply_message_id"), fallback="", limit=120)
+    observed_message_id = normalize_text_value(inbound_message.get("id"), fallback="", limit=120)
+    observed_at = normalize_text_value(
+        inbound_message.get("timestamp") or inbound_message.get("created_at"),
+        fallback=utc_now(),
+        limit=80,
+    )
+    social_prediction = replay.get("social_prediction")
+    correction_candidate = classify_user_correction(user_text)
+    is_correction = bool(
+        correction_candidate
+        and eve_social_prediction.explicitly_corrects_prior_reply(
+            user_text,
+            prediction=(social_prediction if isinstance(social_prediction, dict) else None),
+        )
+    )
+    correction = correction_candidate if is_correction else None
+    explicit_acceptance = eve_social_prediction.explicitly_accepts_prior_reply(
+        user_text,
+        coarse_acceptance=user_message_explicitly_accepts(user_text),
+        prediction=(social_prediction if isinstance(social_prediction, dict) else None),
+    )
+
+    if isinstance(social_prediction, dict):
+        if not eve_social_prediction.observation_matches_prediction(
+            social_prediction,
+            thread_id=thread_id,
+            reply_message_id=reply_message_id,
+            observed_message_id=observed_message_id,
+            observed_at=observed_at,
+        ):
+            return None
+        observed = eve_social_prediction.classify_observed_response(
+            user_text,
+            prediction=social_prediction,
+            correction=is_correction,
+            explicit_acceptance=explicit_acceptance,
+        )
+        social_outcome = eve_social_prediction.score_prediction(
+            social_prediction,
+            observed,
+            observed_message_id=observed_message_id,
+            observed_at=observed_at,
+        )
+        if not social_outcome.get("scored"):
+            return None
+        predicted = normalize_text_value(
+            social_outcome.get("predicted_class"), fallback="", limit=40
+        )
+        fulfilled = bool(social_outcome.get("top1_correct"))
+        error_magnitude: Optional[int] = int(social_outcome.get("error_magnitude") or 0)
+        prediction_id = normalize_text_value(
+            social_prediction.get("prediction_id"), fallback="", limit=100
+        )
     else:
-        observed = "question" if "?" in user_text else "continuation"
-        fulfilled = None
-        consequence_observed = False
-        outcome_ok = None
-    if fulfilled is True:
-        error_magnitude = 0
-    elif fulfilled is False and is_correction:
-        error_magnitude = 70 if str((correction or {}).get("severity")) == "high" else 50
-    else:
-        error_magnitude = None
-    reply_message_id = str((prior_replay or {}).get("reply_message_id") or "")
-    observed_message_id = str(inbound_message.get("id") or "")
+        predicted_raw = str(replay.get("predicted_reaction") or "")
+        predicted = "accept_or_continue" if predicted_raw == "accept_or_correct" else predicted_raw
+        if not predicted:
+            return None
+        if is_correction:
+            observed = "correction"
+            fulfilled = False
+        elif explicit_acceptance:
+            observed = "acceptance"
+            fulfilled = True
+        elif predicted == "answer_question" and "?" not in user_text:
+            observed = "answer"
+            fulfilled = True
+        else:
+            observed = "question" if "?" in user_text else "continuation"
+            fulfilled = None
+        if fulfilled is True:
+            error_magnitude = 0
+        elif fulfilled is False and is_correction:
+            error_magnitude = 70 if str((correction or {}).get("severity")) == "high" else 50
+        else:
+            error_magnitude = None
+        prediction_id = ""
+        social_outcome = {}
+
+    # Observable prediction accuracy and lived value are separate. A correctly
+    # anticipated correction is still a negative user consequence; an answer or
+    # follow-up is neutral rather than unearned positive reinforcement.
+    consequence_observed = bool(is_correction or explicit_acceptance)
+    outcome_ok: Optional[bool] = (
+        False if is_correction else True if explicit_acceptance else None
+    )
     evidence_id = f"reply-consequence:{reply_message_id}:{observed_message_id}"
     record = {
-        "timestamp": utc_now(),
+        "timestamp": observed_at,
         "kind": "conversational",
         "action": "conversation",
-        "thread_id": str(inbound_message.get("thread_id") or ""),
+        "thread_id": thread_id,
+        "prediction_id": prediction_id,
         "predicted_reaction": predicted,
-        "expected_signal": f"user will {predicted.replace('_', ' ')}",
+        "expected_signal": f"counterpart may visibly {predicted.replace('_', ' ')}",
         "observed": observed,
-        "confidence": "medium",
+        "confidence": (
+            social_prediction.get("top_probability")
+            if isinstance(social_prediction, dict)
+            else "legacy_medium"
+        ),
         "fulfilled": fulfilled,
         "error_magnitude": error_magnitude,
         "consequence_observed": consequence_observed,
         "outcome_ok": outcome_ok,
         "scored_reply_id": reply_message_id,
-        "source_cycle_id": str((prior_replay or {}).get("conscious_cycle_id") or ""),
+        "source_cycle_id": str(replay.get("conscious_cycle_id") or ""),
         "observed_message_id": observed_message_id,
         "observed_text": user_text,
         "evidence_id": evidence_id,
+        "social_prediction": social_prediction if isinstance(social_prediction, dict) else {},
+        "social_outcome": social_outcome,
+        "private_mental_state_inferred": False,
+        "engagement_objective": False,
     }
+    observation_status = prediction_check_observation_status(
+        prediction_id=prediction_id,
+        reply_message_id=reply_message_id,
+        observed_message_id=observed_message_id,
+    )
+    if observation_status == "different_observation":
+        record["recorded"] = False
+        record["closed_by_prior_observation"] = True
+        return record
     recorded = append_prediction_check_record(record)
     record["recorded"] = bool(recorded)
+    if not recorded:
+        post_append_status = prediction_check_observation_status(
+            prediction_id=prediction_id,
+            reply_message_id=reply_message_id,
+            observed_message_id=observed_message_id,
+        )
+        if post_append_status == "different_observation":
+            record["closed_by_prior_observation"] = True
+            return record
     if consequence_observed:
         try:
             joined = join_delayed_reply_consequence(prior_replay, record)
@@ -26232,16 +27313,37 @@ def record_reply_turn_replay(
         stream_result,
         used_model,
     )
+    record_created_at = utc_now()
+    try:
+        social_history = eve_social_prediction.summarize_records(
+            read_recent_prediction_checks(hours=24.0 * 30.0, limit=256)
+        )
+    except Exception:
+        social_history = eve_social_prediction.summarize_records([])
+    social_prediction = eve_social_prediction.build_prediction(
+        reply_text=reply_message.get("body"),
+        inbound_text=inbound_message.get("body"),
+        thread_id=thread_id,
+        source_message_id=inbound_message.get("id"),
+        reply_message_id=reply_message.get("id"),
+        made_at=record_created_at,
+        history=social_history,
+    )
     record = {
         "id": str(uuid.uuid4()),
-        "created_at": utc_now(),
+        "created_at": record_created_at,
         "source": normalize_text_value(source, fallback="reply", limit=80),
         "thread_id": thread_id,
         "source_message_id": str(inbound_message.get("id") or ""),
         "reply_message_id": str(reply_message.get("id") or ""),
         "inbound_preview": normalize_text_value(inbound_message.get("body"), fallback="", limit=260),
         "reply_preview": normalize_text_value(reply_message.get("body"), fallback="", limit=260),
-        "predicted_reaction": predict_user_reaction(reply_message.get("body")),
+        "predicted_reaction": normalize_text_value(
+            social_prediction.get("predicted_class"),
+            fallback=predict_user_reaction(reply_message.get("body")),
+            limit=40,
+        ),
+        "social_prediction": social_prediction,
         "conscious_action_id": conscious_action_id,
         "reply_delivery_ok": reply_delivery_ok,
         "reply_consequence_status": reply_consequence_status,
@@ -26265,6 +27367,7 @@ def record_reply_turn_replay(
         "synthetic": synthetic,
         "synthetic_reasons": synthetic_reasons,
         "conscious_cycle_id": normalize_text_value(conscious_completion.get("cycle_id"), fallback="", limit=80),
+        "conscious_reply_credit": eve_context_learning.capture_credit(conscious_completion, "respond_to_user"),
         "conscious_cycle_prediction_error": (
             (conscious_completion.get("cycle_outcome") or {}).get("overall_prediction_error")
             if isinstance(conscious_completion.get("cycle_outcome"), dict)
@@ -27017,7 +28120,7 @@ def daemon_autonomy_handoff_seconds(config: Optional[Dict[str, object]] = None) 
 def daemon_autonomy_due(config: Dict[str, object], state: Dict[str, object], *, force: bool = False) -> bool:
     if force:
         return True
-    last_timestamp = state.get("last_daemon_autonomy_run_at") or state.get("last_daemon_autonomy_attempt_at")
+    last_timestamp = latest_background_attempt(state, "last_daemon_autonomy_run_at", "last_daemon_autonomy_attempt_at")
     if daemon_autonomy_continuous_mode(config):
         return interval_due_seconds(last_timestamp, daemon_autonomy_handoff_seconds(config))
     base_interval = int(config.get("daemon_autonomy_interval_minutes") or 30)
@@ -27026,6 +28129,13 @@ def daemon_autonomy_due(config: Dict[str, object], state: Dict[str, object], *, 
     except Exception:
         factor = 1.0
     return interval_due(last_timestamp, max(5, int(round(base_interval * factor))))
+
+
+def latest_background_attempt(state: Dict[str, object], completed_key: str, attempted_key: str) -> str:
+    """A deferred job consumes its retry interval even after an older success."""
+    timestamps = [parse_iso_datetime(state.get(key)) for key in (completed_key, attempted_key)]
+    valid = [timestamp for timestamp in timestamps if timestamp is not None]
+    return max(valid).astimezone(timezone.utc).isoformat() if valid else ""
 
 
 def normalize_text_value(value: object, fallback: str = "Not enough evidence yet.", limit: int = 320) -> str:
@@ -27878,6 +28988,12 @@ def normalize_organ_signal(payload: object) -> Optional[Dict[str, object]]:
         limit=260,
     )
     next_step = normalize_text_value(payload.get("next_step"), fallback="", limit=260)
+    observation_complete = payload.get("observation_complete")
+    if not isinstance(observation_complete, bool):
+        observation_complete = None
+    observation_authoritative = payload.get("observation_authoritative")
+    if not isinstance(observation_authoritative, bool):
+        observation_authoritative = None
     return {
         "id": organ_id or normalize_text_value(label, fallback="organ", limit=120).lower().replace(" ", "_"),
         "label": label or organ_id,
@@ -27890,6 +29006,10 @@ def normalize_organ_signal(payload: object) -> Optional[Dict[str, object]]:
         "human_quality": normalize_text_value(payload.get("human_quality"), fallback="", limit=260),
         "summary": summary,
         "evidence": evidence,
+        "observation_complete": observation_complete,
+        "observation_authoritative": observation_authoritative,
+        "observation_environment_limited": bool(payload.get("observation_environment_limited")),
+        "observation_blockers": normalize_text_list(payload.get("observation_blockers"), limit=8),
         "next_step": next_step,
         "authority_boundary": normalize_text_value(payload.get("authority_boundary"), fallback="", limit=320),
         "cik_zone": normalize_text_value(payload.get("cik_zone"), fallback=eve_governance.CIK_UNKNOWN, limit=40),
@@ -27928,7 +29048,9 @@ def normalize_organ_signals(payload: object, limit: int = 8) -> List[Dict[str, o
         signal = normalize_organ_signal(item)
         if not signal:
             continue
-        by_id[str(signal["id"])] = signal
+        # First occurrence wins: callers pass [*current, *previous], so a stale previous signal must not
+        # overwrite the current one for the same organ (this kept a fly escape state alive across ticks).
+        by_id.setdefault(str(signal["id"]), signal)
     return sorted(by_id.values(), key=organ_signal_sort_key, reverse=True)[: max(0, int(limit or 8))]
 
 
@@ -29151,6 +30273,24 @@ def build_active_mind_lanes(
     )
 
 
+def active_mind_threads_without_focus(threads: object) -> List[Dict[str, object]]:
+    """Drop carried ``focus`` threads when an event replaces ``current_focus``.
+
+    ``build_active_mind_live_threads`` derives a fresh focus thread from the
+    new focus, but it also carries the previous mind's threads forward. A
+    carried focus thread for the superseded focus would otherwise compete
+    with the new one on equal pressure and can crowd it out of the bounded
+    live-thread list.
+    """
+    if not isinstance(threads, list):
+        return []
+    return [
+        item
+        for item in threads
+        if isinstance(item, dict) and normalize_text_value(item.get("kind"), fallback="", limit=40).lower() != "focus"
+    ]
+
+
 def refresh_active_mind_from_conversation_event(
     source: str,
     model: str = "deterministic",
@@ -29204,6 +30344,7 @@ def refresh_active_mind_from_conversation_event(
                     limit=220,
                 ),
                 "live_concerns": unique_compact([latest_label, *refreshed.get("live_concerns", [])], limit=4),
+                "live_threads": active_mind_threads_without_focus(refreshed.get("live_threads")),
                 "lanes": {
                     **normalize_active_mind_lanes(refreshed.get("lanes")),
                     "observer": latest_label,
@@ -29410,6 +30551,7 @@ def refresh_active_mind_from_feedback_event(
             fallback=DEFAULT_ACTIVE_MIND["summary"],
             limit=220,
         )
+        refreshed["live_threads"] = active_mind_threads_without_focus(refreshed.get("live_threads"))
     refreshed["lanes"] = {
         **normalize_active_mind_lanes(refreshed.get("lanes")),
         **{key: value for key, value in lane_updates.items() if value},
@@ -29614,6 +30756,17 @@ def build_inner_state_brief_message() -> Optional[Dict[str, str]]:
     process_prediction = predictions.get("process") if isinstance(predictions.get("process"), dict) else {}
     metacognition = conscious.get("metacognition") if isinstance(conscious.get("metacognition"), dict) else {}
     memory = conscious.get("memory") if isinstance(conscious.get("memory"), dict) else {}
+    other_minds = conscious.get("other_minds") if isinstance(conscious.get("other_minds"), dict) else {}
+    common_ground = (
+        other_minds.get("common_ground")
+        if isinstance(other_minds.get("common_ground"), dict)
+        else {}
+    )
+    active_common_ground_repair = (
+        common_ground.get("active_repair")
+        if isinstance(common_ground.get("active_repair"), dict)
+        else {}
+    )
     recurrent = conscious.get("recurrent") if isinstance(conscious.get("recurrent"), dict) else {}
     epistemic = conscious.get("epistemic_state") if isinstance(conscious.get("epistemic_state"), dict) else {}
     interoception = conscious.get("interoception") if isinstance(conscious.get("interoception"), dict) else {}
@@ -29694,6 +30847,17 @@ def build_inner_state_brief_message() -> Optional[Dict[str, str]]:
     if lanes:
         lines.append(
             f"- Predicted cognitive process: lanes {', '.join(lanes)} | tools={'needed' if process_prediction.get('needs_tools') else 'not predicted'} | revision={'needed' if process_prediction.get('needs_revision') else 'not predicted'}"
+        )
+    if active_common_ground_repair.get("required"):
+        target_reply_id = normalize_text_value(
+            active_common_ground_repair.get("target_reply_id"),
+            fallback="the preceding reply",
+            limit=120,
+        )
+        lines.append(
+            "- Common-ground repair is active: the visible user correction challenged "
+            f"{target_reply_id}; preserve the earlier public position, acknowledge the correction, "
+            "and state the revised position without inferring private belief, emotion, or intent"
         )
     confidence_value = int(metacognition.get("confidence") or 0)
     confidence_band = "low" if confidence_value < 40 else ("medium" if confidence_value < 70 else "high")
@@ -30066,7 +31230,15 @@ def current_version_surfaces() -> Dict[str, object]:
     human_behavior = versionable_human_context(human_context)
     runtime_identity = load_runtime_identity()
     runtime_identity_behavior = versionable_runtime_identity(runtime_identity)
-    success_patterns = read_success_patterns(status="active", since_days=365)
+    # Behaviour-surface hash must be a function of the durable file only.
+    # read_success_patterns(status="active") applies the retrieval-time
+    # contextual gate (conscious-state freshness / affordances), which made this
+    # hash flap every daemon cycle and each flap register as an "upgrade".
+    success_patterns = [
+        pattern
+        for pattern in read_success_patterns(status=None, since_days=365)
+        if str(pattern.get("status") or "") == "active"
+    ]
     success_pattern_behavior = versionable_success_patterns(success_patterns)
     project_memory_text = PROJECT_MEMORY_PATH.read_text(encoding="utf-8").strip() if PROJECT_MEMORY_PATH.exists() else ""
 
@@ -30467,7 +31639,28 @@ def normalize_autonomy_agenda_thread(payload: object) -> Optional[Dict[str, obje
         "priority": clamp_int(payload.get("priority"), 50, minimum=1, maximum=100),
         "source_run_id": normalize_text_value(payload.get("source_run_id"), fallback="", limit=80),
         "updated_at": payload.get("updated_at") or utc_now(),
+        "unchanged_runs": clamp_int(payload.get("unchanged_runs"), 0, minimum=0, maximum=10000),
     }
+
+
+AUTONOMY_AGENDA_WATCHING_AFTER_UNCHANGED_RUNS = 6
+
+
+def agenda_thread_with_tenure(candidate: Dict[str, object], prior: Optional[Dict[str, object]]) -> Dict[str, object]:
+    """Demote an evergreen thread to "watching" after repeated runs with unchanged evidence.
+
+    Agenda titles such as "Review the pending component updates" were regenerated
+    every run with the same evidence and competed as active goals for thousands
+    of cycles; the kernel skips "watching" threads, so real turnover happens.
+    """
+    thread = dict(candidate)
+    if isinstance(prior, dict) and normalize_text_value(prior.get("evidence"), fallback="", limit=260) == normalize_text_value(thread.get("evidence"), fallback="", limit=260):
+        thread["unchanged_runs"] = int(prior.get("unchanged_runs") or 0) + 1
+    else:
+        thread["unchanged_runs"] = 0
+    if thread["unchanged_runs"] >= AUTONOMY_AGENDA_WATCHING_AFTER_UNCHANGED_RUNS and thread.get("status") == "active":
+        thread["status"] = "watching"
+    return thread
 
 
 def normalize_autonomy_agenda_experiment(payload: object) -> Optional[Dict[str, object]]:
@@ -31464,6 +32657,8 @@ def refresh_memory_retrieval_artifacts(
     }
 
 
+@eve_tracing.traced(lambda: OPERATIONAL_DB_PATH, "memory.retrieval", category="memory",
+                    attributes={"gen_ai.operation.name": "retrieval"}, outcome=lambda result: result.get("ok"))
 def query_memory_retrieval(
     config: Dict[str, object],
     query_text: str,
@@ -31776,8 +32971,27 @@ def curate_memory_retrieval_matches(
         return []
     profile = classify_memory_query(query_text)
     ranked: List[Dict[str, object]] = []
+    current_time = parse_iso_datetime(utc_now())
     for match in matches:
-        score = float(match.get("score") or 0.0)
+        status = match.get("status")
+        if status is not None and (not isinstance(status, str) or status not in {"active", "corroborating", "contested", "conflict"}):
+            continue
+        # Optional validity comes from the existing writer, never inferred from
+        # a vector score. Legacy notes without it remain explicitly just hints.
+        invalid_time = False
+        for key in ("observed_at", "valid_until"):
+            if match.get(key):
+                timestamp = parse_iso_datetime(match[key])
+                if timestamp is None or (key == "observed_at" and timestamp > current_time) or (key == "valid_until" and timestamp <= current_time):
+                    invalid_time = True
+        if invalid_time:
+            continue
+        try:
+            score = float(match.get("score") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(score):
+            continue
         source = normalize_text_value(match.get("source"), fallback="", limit=80)
         match_id = normalize_text_value(match.get("id"), fallback="", limit=120)
         title = normalize_text_value(match.get("title"), fallback="", limit=160)
@@ -31838,6 +33052,7 @@ def curate_memory_retrieval_matches(
                     "title": item.get("title"),
                     "text": item.get("text"),
                     "score": round(float(item.get("_adjusted_score") or item.get("score") or 0.0), 3),
+                    **{key: item[key] for key in ("observed_at", "valid_until", "status", "supersedes") if key in item},
                 }
             )
             source_counts[source] = source_counts.get(source, 0) + 1
@@ -31846,29 +33061,11 @@ def curate_memory_retrieval_matches(
     return selected[: max(1, limit)]
 
 
-def build_memory_retrieval_message(matches: List[Dict[str, object]], *, query_text: str = "", compact: bool = False) -> str:
-    profile = classify_memory_query(query_text)
-    lines = []
-    for item in matches:
-        text_limit = 220 if compact else 320
-        note_text = trim_context_block(normalize_text_value(item.get("text"), fallback="", limit=900), max_chars=text_limit)
-        lines.append(
-            f"- {item.get('title') or item.get('source')}: {note_text}"
-        )
-    if profile["system_focused"]:
-        guidance = "Use these notes as durable internal context. It is okay to talk about runtime or model details because the user is asking about internals."
-    else:
-        guidance = "Prefer relationship, success-pattern, and requested-practice notes over runtime self-description. Do not mention models, tools, latency, or system state unless the user asked about internals."
-    return textwrap.dedent(
-        f"""
-        Relevant durable memory hints for this turn:
-        {chr(10).join(lines) if lines else "- No relevant retrieved memory."}
+def build_memory_retrieval_message(matches: List[Dict[str, object]], *, query_text: str = "", compact: bool = False, max_chars: int = 900) -> str:
+    from eve_core.memory_context import memory_context_packet
 
-        Use these retrieved notes only when they genuinely fit the present turn.
-        Treat them as retrieval hints from Eve's own durable stores, not rigid instructions.
-        {guidance}
-        """
-    ).strip()
+    profile = classify_memory_query(query_text)
+    return memory_context_packet(matches, system_focused=profile["system_focused"], compact=compact, max_chars=max_chars)
 
 
 def active_mind_retrieval_query(active_mind: Optional[Dict[str, object]]) -> Optional[str]:
@@ -31908,11 +33105,11 @@ def memory_retrieval_system_message(
     curated_matches = curate_memory_retrieval_matches(matches, query, limit=limit)
     if not curated_matches:
         return None
-    message = build_memory_retrieval_message(curated_matches, query_text=query, compact=compact)
     max_chars = int(config.get("experimental_memory_retrieval_max_chars") or 900)
     if compact:
         max_chars = min(max_chars, 560)
-    return {"role": "system", "content": trim_context_block(message, max_chars=max_chars)}
+    message = build_memory_retrieval_message(curated_matches, query_text=query, compact=compact, max_chars=max_chars)
+    return {"role": "system", "content": message} if message else None
 
 
 def project_memory_system_message(config: Dict[str, object], compact: bool = False) -> Optional[Dict[str, str]]:
@@ -33082,7 +34279,7 @@ def background_cadence_lines(config: Dict[str, object], state: Dict[str, object]
         ),
         cadence_status_line(
             "quiet consolidation",
-            state.get("last_quiet_consolidation_at") or state.get("last_quiet_consolidation_attempt_at"),
+            latest_background_attempt(state, "last_quiet_consolidation_at", "last_quiet_consolidation_attempt_at"),
             interval_minutes_value=config.get("quiet_consolidation_interval_minutes"),
         ),
     ]
@@ -33221,12 +34418,30 @@ def model_watchdog_snapshot_alert(snapshot: Dict[str, object]) -> Optional[str]:
         return None
     model_status = snapshot.get("model_status") if isinstance(snapshot.get("model_status"), dict) else {}
     age_minutes = minutes_since_timestamp(model_status.get("updated_at"))
+    # The watchdog may run as a plain process (no launchd service) and still
+    # keep its status file fresh; a real observer snapshot defers to that
+    # fresher timestamp. A bare snapshot never reads the file.
+    if isinstance(snapshot.get("model_status"), dict):
+        try:
+            file_age_minutes = minutes_since_timestamp(
+                (load_model_watchdog_status(prefer_runtime=True) or {}).get("updated_at")
+            )
+        except Exception:
+            file_age_minutes = None
+        if file_age_minutes is not None and (age_minutes is None or file_age_minutes < age_minutes):
+            age_minutes = file_age_minutes
     eve_services = snapshot.get("eve_services") if isinstance(snapshot.get("eve_services"), dict) else {}
     watchdog_service = eve_services.get("model_watchdog") if isinstance(eve_services.get("model_watchdog"), dict) else {}
     if watchdog_service:
         state = str(watchdog_service.get("state") or "").strip().lower()
         run_interval_seconds = watchdog_service.get("run_interval_seconds")
         exit_code = str(watchdog_service.get("last_exit_code") or "").strip()
+        fresh_plain_process_status = (
+            not run_interval_seconds
+            and exit_code in {"", "0"}
+            and age_minutes is not None
+            and age_minutes < MODEL_WATCHDOG_STALE_MINUTES
+        )
         clean_periodic_exit = (
             state in {"scheduled", "not running", "active"}
             and bool(run_interval_seconds)
@@ -33234,7 +34449,7 @@ def model_watchdog_snapshot_alert(snapshot: Dict[str, object]) -> Optional[str]:
             and age_minutes is not None
             and age_minutes < MODEL_WATCHDOG_STALE_MINUTES
         )
-        if state and state not in {"running", "active"} and not clean_periodic_exit:
+        if state and state not in {"running", "active"} and not clean_periodic_exit and not fresh_plain_process_status:
             exit_code = watchdog_service.get("last_exit_code")
             exit_text = f" (last exit {exit_code})" if str(exit_code or "").strip() else ""
             return "The model watchdog is not running" + exit_text + "; model health may be stale."
@@ -33357,8 +34572,14 @@ def system_resource_alerts(snapshot: Dict[str, object], config: Optional[Dict[st
         alerts.append(watchdog_alert)
     load_state = str(snapshot.get("load_state") or "").strip().lower()
     if load_state == "hot":
+        lane_gate = cognition_gate_assessment(snapshot, config, allow_watchdog_fallback=True)
         if compete_mode:
             alerts.append("System load is hot; keep background work short and watch responsiveness.")
+        elif str(lane_gate.get("lane_state") or "") == "ready":
+            alerts.append(
+                f"{LANES_READY_HOT_LOAD_ALERT_PREFIX} "
+                f"({lane_gate.get('detail')}); keep organ and body load in check rather than pausing cognition."
+            )
         else:
             alerts.append("System load is hot; keep work short and defer heavier background loops.")
 
@@ -33398,17 +34619,225 @@ def system_resource_alerts(snapshot: Dict[str, object], config: Optional[Dict[st
 
     return unique_compact(alerts, limit=4)
 
+COGNITION_GATE_MODES = {"lane_latency", "load_average"}
+# Alert text used when the host is hot but Eve's lanes are measurably in
+# budget. It stays visible as information and is not counted as resource
+# pressure by homeostasis.
+LANES_READY_HOT_LOAD_ALERT_PREFIX = "System load is hot but Eve's lanes answer in budget"
 
-def system_background_gate_reason(snapshot: Dict[str, object], job_label: str, config: Optional[Dict[str, object]] = None) -> Optional[str]:
+
+def cognition_gate_mode(config: Optional[Dict[str, object]] = None) -> str:
+    effective_config = config or {}
+    mode = " ".join(str(effective_config.get("cognition_gate_mode") or DEFAULT_CONFIG["cognition_gate_mode"]).lower().split())
+    return mode if mode in COGNITION_GATE_MODES else str(DEFAULT_CONFIG["cognition_gate_mode"])
+
+
+def cognition_lane_budget_state(
+    config: Optional[Dict[str, object]],
+    *,
+    fast_probe_ms: object,
+    deep_probe_ms: object,
+    probe_age_minutes: Optional[float] = None,
+    probes_ok: bool = True,
+    required_lanes: Tuple[str, ...] = ("fast", "deep"),
+) -> str:
+    """Classify Eve's own lanes as ready, slow, or unknown against her latency budget.
+
+    The host load average measures every process on the machine, including the
+    fly organ and body simulation. Eve's cognition is bounded by whether her
+    lanes answer in budget, so that is what this gate measures. "unknown" means
+    the caller must fall back to the load-average rule.
+    """
+    effective_config = config or {}
+    if cognition_gate_mode(effective_config) != "lane_latency":
+        return "unknown"
+    max_age = clamp_int(
+        effective_config.get("cognition_gate_probe_max_age_minutes"),
+        int(DEFAULT_CONFIG["cognition_gate_probe_max_age_minutes"]),
+        minimum=1,
+        maximum=24 * 60,
+    )
+    if probe_age_minutes is not None and float(probe_age_minutes) > float(max_age):
+        return "unknown"
+    if any(lane not in {"fast", "deep"} for lane in required_lanes):
+        return "unknown"
+    if not required_lanes:
+        return "ready"
+    timings = {"fast": fast_probe_ms, "deep": deep_probe_ms}
+    if any(type(timings[lane]) not in (int, float) or not math.isfinite(timings[lane]) or timings[lane] < 0 for lane in required_lanes):
+        return "unknown"
+    if not probes_ok:
+        return "slow"
+    fast_budget = clamp_int(
+        effective_config.get("cognition_gate_fast_lane_max_ms"),
+        int(DEFAULT_CONFIG["cognition_gate_fast_lane_max_ms"]),
+        minimum=200,
+        maximum=120000,
+    )
+    deep_budget = clamp_int(
+        effective_config.get("cognition_gate_deep_lane_max_ms"),
+        int(DEFAULT_CONFIG["cognition_gate_deep_lane_max_ms"]),
+        minimum=500,
+        maximum=600000,
+    )
+    if ("fast" in required_lanes and float(fast_probe_ms) >= float(fast_budget)) or ("deep" in required_lanes and float(deep_probe_ms) >= float(deep_budget)):
+        return "slow"
+    return "ready"
+
+
+def free_run_chooser_lane_thresholds(config: Optional[Dict[str, object]] = None) -> Dict[str, float]:
+    """Chooser latency thresholds derived from the one cognition budget Eve owns.
+
+    Under ``lane_latency`` mode the chooser's "high" load is the configured
+    lane budget itself and "medium" is half of it, so the free-run chooser and
+    the background gate stop disagreeing about what a slow lane is. Under
+    ``load_average`` mode the historical fixed thresholds stay in force.
+    """
+    effective_config = config or {}
+    if cognition_gate_mode(effective_config) != "lane_latency":
+        return {"fast_high": 2200.0, "deep_high": 6000.0, "fast_medium": 1200.0, "deep_medium": 3500.0}
+    fast_budget = float(
+        clamp_int(
+            effective_config.get("cognition_gate_fast_lane_max_ms"),
+            int(DEFAULT_CONFIG["cognition_gate_fast_lane_max_ms"]),
+            minimum=200,
+            maximum=120000,
+        )
+    )
+    deep_budget = float(
+        clamp_int(
+            effective_config.get("cognition_gate_deep_lane_max_ms"),
+            int(DEFAULT_CONFIG["cognition_gate_deep_lane_max_ms"]),
+            minimum=500,
+            maximum=600000,
+        )
+    )
+    return {
+        "fast_high": fast_budget,
+        "deep_high": deep_budget,
+        "fast_medium": fast_budget / 2.0,
+        "deep_medium": deep_budget / 2.0,
+    }
+
+
+def cognition_gate_assessment(
+    snapshot: Optional[Dict[str, object]],
+    config: Optional[Dict[str, object]] = None,
+    *,
+    allow_watchdog_fallback: bool = True,
+    required_lanes: Tuple[str, ...] = ("fast", "deep"),
+) -> Dict[str, object]:
+    """Measure the cognition budget from the lanes themselves, with load as fallback.
+
+    The daemon's system snapshot can carry probe timings that are much older
+    than the watchdog's own status file, so the fresher of the two sources wins
+    when the caller allows the file read.
+    """
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    effective_config = config or {}
+    candidates: List[Tuple[str, Dict[str, object]]] = []
+    snapshot_status = snapshot.get("model_status") if isinstance(snapshot.get("model_status"), dict) else {}
+    if isinstance(snapshot_status.get("probes"), dict) and snapshot_status.get("probes"):
+        candidates.append(("system_snapshot", snapshot_status))
+    # The watchdog file may refresh a real observer snapshot's probe timings;
+    # it never supplies probes for a bare snapshot that carries no model
+    # status at all, so synthetic snapshots stay deterministic.
+    if allow_watchdog_fallback and isinstance(snapshot.get("model_status"), dict):
+        try:
+            watchdog_status = load_model_watchdog_status(prefer_runtime=True)
+        except Exception:
+            watchdog_status = {}
+        if isinstance(watchdog_status.get("probes"), dict) and watchdog_status.get("probes"):
+            candidates.append(("model_watchdog_status", watchdog_status))
+
+    def status_moment(item: Tuple[str, Dict[str, object]]) -> datetime:
+        payload = item[1]
+        return parse_iso_datetime(payload.get("updated_at") or payload.get("timestamp")) or datetime.min.replace(
+            tzinfo=timezone.utc
+        )
+
+    if candidates:
+        status_source, model_status = max(candidates, key=status_moment)
+    else:
+        status_source, model_status = "none", {}
+    probes = model_status.get("probes") if isinstance(model_status.get("probes"), dict) else {}
+
+    def probe_for(lane: str) -> Tuple[Optional[float], bool]:
+        preferred = normalize_model_name(model_status.get(f"preferred_{lane}_model"))
+        probe = probes.get(preferred) if preferred else None
+        if not isinstance(probe, dict):
+            return None, True
+        try:
+            wall_ms: Optional[float] = float(probe.get("wall_ms"))
+        except (TypeError, ValueError):
+            wall_ms = None
+        ok = probe.get("ok")
+        return wall_ms, (True if ok is None else bool(ok))
+
+    fast_probe_ms, fast_ok = probe_for("fast")
+    deep_probe_ms, deep_ok = probe_for("deep")
+    probe_age_minutes = minutes_since_timestamp(model_status.get("updated_at") or model_status.get("timestamp"))
+    lane_state = cognition_lane_budget_state(
+        effective_config,
+        fast_probe_ms=fast_probe_ms,
+        deep_probe_ms=deep_probe_ms,
+        probe_age_minutes=probe_age_minutes,
+        probes_ok=bool((fast_ok or "fast" not in required_lanes) and (deep_ok or "deep" not in required_lanes)),
+        required_lanes=required_lanes,
+    )
+    load_state = str(snapshot.get("load_state") or "").strip().lower()
+    if lane_state == "ready":
+        detail = (
+            f"fast {format_duration_ms(fast_probe_ms)}, deep {format_duration_ms(deep_probe_ms)} in budget"
+        )
+    elif lane_state == "slow":
+        detail = (
+            f"fast {format_duration_ms(fast_probe_ms)}, deep {format_duration_ms(deep_probe_ms)}"
+            + ("" if (fast_ok and deep_ok) else "; a lane probe failed")
+        )
+    else:
+        detail = "no fresh lane probes; using the host load average"
+    return {
+        "mode": cognition_gate_mode(effective_config),
+        "required_lanes": list(required_lanes),
+        "lane_state": lane_state,
+        "fast_probe_ok": fast_ok,
+        "deep_probe_ok": deep_ok,
+        "fast_probe_ms": fast_probe_ms,
+        "deep_probe_ms": deep_probe_ms,
+        "probe_age_minutes": round(probe_age_minutes, 1) if probe_age_minutes is not None else None,
+        "probes_ok": bool(fast_ok and deep_ok),
+        "load_state": load_state,
+        "status_source": status_source,
+        "detail": detail,
+    }
+
+
+def system_background_gate_reason(snapshot: Dict[str, object], job_label: str, config: Optional[Dict[str, object]] = None, *, required_lanes: Tuple[str, ...] = ("fast", "deep"), honor_homeostasis: bool = True) -> Optional[str]:
     if not snapshot:
         return None
     compete_mode = background_competes_with_user(config)
     load_state = str(snapshot.get("load_state") or "").strip().lower()
-    if load_state == "hot" and not compete_mode:
-        return f"System load is hot, so defer {job_label} until the machine cools down."
+    if not compete_mode and required_lanes:
+        # Eve's cognition budget is measured from her own lanes first. A hot
+        # host load average that leaves her lanes answering in budget is not
+        # her bottleneck (the fly organ and body run on the same machine); slow
+        # lanes are, whatever the load average says.
+        # Read the fresher of the observer snapshot and the watchdog's own probe file, as the
+        # other cognition gates do; a 45-minute-stale snapshot must not fall back to load.
+        gate = cognition_gate_assessment(snapshot, config, required_lanes=required_lanes, allow_watchdog_fallback=True)
+        lane_state = str(gate.get("lane_state") or "unknown")
+        if lane_state == "slow":
+            return (
+                f"Eve's model lanes are over their latency budget ({gate.get('detail')}), "
+                f"so defer {job_label} until they answer in budget."
+            )
+        if load_state == "hot" and lane_state != "ready":
+            return f"System load is hot, so defer {job_label} until the machine cools down."
 
     # Homeostasis joins the gate: when the felt state says stabilize, the body listens.
-    if not compete_mode:
+    # Self-change is exempt: applying her own cleanup or routing proposal is how she relieves pressure.
+    if honor_homeostasis and not compete_mode and required_lanes:
         try:
             homeostasis = load_homeostasis(prefer_runtime=True)
             if (
@@ -33432,14 +34861,15 @@ def system_background_gate_reason(snapshot: Dict[str, object], job_label: str, c
 
     model_status = snapshot.get("model_status") if isinstance(snapshot.get("model_status"), dict) else {}
     residency = model_status.get("residency") if isinstance(model_status.get("residency"), dict) else {}
-    if residency and not residency.get("preferred_deep_loaded", True):
+    if "deep" in required_lanes and residency and not residency.get("preferred_deep_loaded", True):
         return f"Eve's deep model is not resident right now, so {job_label} should wait for the watchdog to restore it."
 
     deep_probe_ms = preferred_model_probe_ms(snapshot, "deep")
     idle_seconds = snapshot.get("idle_seconds")
     frontmost_app = normalize_text_value(snapshot.get("frontmost_app"), fallback="the foreground app", limit=60)
     if (
-        isinstance(idle_seconds, int)
+        "deep" in required_lanes
+        and isinstance(idle_seconds, int)
         and idle_seconds < SYSTEM_ACTIVE_IDLE_SECONDS
         and deep_probe_ms is not None
         and deep_probe_ms >= SYSTEM_SLOW_DEEP_MODEL_MS
@@ -33455,7 +34885,8 @@ def system_background_gate_reason(snapshot: Dict[str, object], job_label: str, c
 
 
 def quiet_consolidation_gate_reason(snapshot: Dict[str, object], config: Dict[str, object]) -> Optional[str]:
-    system_reason = system_background_gate_reason(snapshot, "quiet-period consolidation", config)
+    # This path distills verified records on CPU; it makes no model calls.
+    system_reason = system_background_gate_reason(snapshot, "quiet-period consolidation", config, required_lanes=())
     if system_reason:
         return system_reason
     idle_required = max(30, int(config.get("quiet_consolidation_idle_seconds") or 180))
@@ -33634,10 +35065,16 @@ def build_retrieval_prep_summary(snapshot: Dict[str, object]) -> str:
     workspace = snapshot_workspace(snapshot)
     working_set = format_workspace_focus_files(workspace.get("focus_files"), limit=4)
     recent_changes = format_workspace_recent_changes(workspace.get("recent_changes"), limit=3)
+    recent_summary = normalize_text_value(
+        workspace.get("recent_changes_summary"),
+        fallback="No tracked workspace changes are summarized yet.",
+        limit=180,
+    )
     focus_areas = compact_mapping_items(workspace.get("focus_areas"), limit=4)
     top_extensions = compact_mapping_items(workspace.get("top_extensions"), limit=4)
     return (
         f"CPU retrieval prep: start with {working_set}. "
+        f"Recent change summary: {recent_summary}. "
         f"Recent changes: {recent_changes}. "
         f"Focus areas: {focus_areas}. "
         f"Extension mix: {top_extensions}."
@@ -34062,11 +35499,53 @@ def build_cleanup_followup_summary(snapshot: Dict[str, object]) -> str:
     )
 
 
+_CLEANUP_DISK_STATE_CLAUSE_RE = re.compile(
+    r"disk\s+\d+(?:\.\d+)?%\s+used\s+and\s+"
+    r"\d+(?:\.\d+)?\s+(?:bytes?|[KMGTPE]iB)\s+free;\s*"
+    r"urgency\s+[a-z_-]+",
+    flags=re.IGNORECASE,
+)
+
+
+def reconcile_cleanup_disk_state_clause(
+    value: object,
+    snapshot: Dict[str, object],
+) -> str:
+    """Refresh only the observed disk clause inside a prior cleanup review."""
+
+    text = str(value or "")
+    disk = snapshot.get("disk") if isinstance(snapshot.get("disk"), dict) else {}
+    used_percent = disk.get("used_percent")
+    free_bytes = disk.get("free_bytes")
+    if not text or not isinstance(used_percent, (int, float)) or not isinstance(free_bytes, (int, float)):
+        return text
+    urgency = disk_pressure_level(snapshot)
+    if urgency == "unknown":
+        urgency = "low"
+    replacement = (
+        f"disk {float(used_percent):.1f}% used and "
+        f"{format_bytes_compact(free_bytes)} free; urgency {urgency}"
+    )
+    return _CLEANUP_DISK_STATE_CLAUSE_RE.sub(replacement, text)
+
+
 def apply_system_snapshot_to_state(state: Dict[str, object], snapshot: Dict[str, object]) -> None:
     if snapshot.get("summary"):
         state["system_summary"] = normalize_text_value(snapshot.get("summary"), fallback="", limit=220)
     if snapshot.get("load_state"):
         state["system_load_state"] = normalize_text_value(snapshot.get("load_state"), fallback="", limit=40)
+    disk = snapshot.get("disk") if isinstance(snapshot.get("disk"), dict) else {}
+    if isinstance(disk.get("used_percent"), (int, float)) and isinstance(
+        disk.get("free_bytes"), (int, float)
+    ):
+        for field in ("cleanup_candidate_summary", "cleanup_review_summary"):
+            if state.get(field):
+                state[field] = reconcile_cleanup_disk_state_clause(state.get(field), snapshot)
+        state["cleanup_disk_observed_at"] = normalize_text_value(
+            snapshot.get("timestamp") or snapshot.get("generated_at"),
+            fallback=utc_now(),
+            limit=80,
+        )
 
 
 def recompute_maintenance_action_summary(state: Dict[str, object], prefer_runtime: bool = False) -> str:
@@ -35279,6 +36758,21 @@ def archive_stale_cleanup_actions(candidates: List[Dict[str, object]]) -> int:
     return archived
 
 
+def self_approve_maintenance_action(action: Dict[str, object], config: Dict[str, object], source: str) -> Dict[str, object]:
+    """Under self-authority a cleanup of her own logs or a restart of her own service needs no one's approval."""
+    if not parse_boolish(config.get("self_authority_enabled", True)):
+        return action
+    kind = str(action.get("kind") or "")
+    if kind not in {"cleanup_delete_path", "restart_launch_agent"} or str(action.get("status") or "") != "pending_approval":
+        return action
+    metadata = dict(action.get("metadata") or {}) if isinstance(action.get("metadata"), dict) else {}
+    if kind == "cleanup_delete_path" and eve_self_authority.path_write_problem(metadata.get("path"), config):
+        return action  # a cleanup target outside her directories stays a request
+    record = update_maintenance_action_record(str(action.get("id")), status="approved", metadata={**metadata, "approved_by": "eve_self_authority", "approved_source": source})
+    append_entry("maintenance_action_self_approved", f"Eve approved her own maintenance action: {record.get('title')}", metadata={"source": source, "action_id": record.get("id"), "kind": kind})
+    return record
+
+
 def sync_approval_gated_maintenance_actions(
     snapshot: Dict[str, object],
     config: Dict[str, object],
@@ -35321,6 +36815,7 @@ def sync_approval_gated_maintenance_actions(
         )
         if was_created:
             created.append(action)
+            self_approve_maintenance_action(action, config, source)
     for candidate in restart_candidates:
         service_key = normalize_text_value(candidate.get("service_key"), fallback="service", limit=80)
         label = normalize_text_value(candidate.get("label"), fallback="", limit=120)
@@ -35355,6 +36850,7 @@ def sync_approval_gated_maintenance_actions(
         )
         if was_created:
             created.append(action)
+            self_approve_maintenance_action(action, config, source)
     archive_stale_restart_actions(
         [
             normalize_text_value(candidate.get("service_key"), fallback="", limit=80)
@@ -35485,6 +36981,10 @@ def execute_approved_maintenance_action(
         service_key = normalize_text_value(metadata.get("service_key"), fallback="", limit=80)
         if service_key == "daemon":
             if source == "daemon":
+                if parse_boolish(config.get("self_authority_enabled", True)):
+                    # She restarts herself: the successor is spawned after this cycle and watched.
+                    request_daemon_restart("maintenance action: restart the daemon", source="maintenance_action")
+                    return {"status": "completed", "result_summary": "Daemon restart requested; the successor is watched and rolled back if it does not come alive.", "blocked_reason": "", "state_updates": {}}
                 blocked_reason = "Daemon self-restart is only allowed from a manual maintenance run."
                 return {
                     "status": "approved",
@@ -35798,6 +37298,7 @@ def refresh_system_tasks_from_snapshot(
     tracked_tasks: List[Dict[str, object]] = []
 
     if focus_paths:
+        workspace_title = "Digest the current workspace focus on CPU"
         workspace_evidence = system_task_dedupe_key(
             "workspace_attention_digest",
             workspace.get("scanned_at"),
@@ -35805,23 +37306,27 @@ def refresh_system_tasks_from_snapshot(
             ",".join(focus_paths),
             ",".join(change_paths),
         )
+        workspace_dedupe_key = active_system_task_dedupe_key_for_title(
+            "workspace_attention_digest",
+            workspace_title,
+            fallback=system_task_dedupe_key(
+                "workspace_attention_digest",
+                recent_summary,
+                ",".join(focus_paths),
+                ",".join(change_paths),
+            ),
+        )
         workspace_task, was_created = upsert_system_task(
             {
                 "source": source,
                 "kind": "workspace_attention_digest",
-                "title": "Digest the current workspace focus on CPU",
+                "title": workspace_title,
                 "summary": recent_summary,
                 "status": "planned",
                 "lane": "cpu",
                 "components": ["cpu", "filesystem", "disk", "memory"],
                 "priority": 4 if change_paths else 3,
-                "dedupe_key": system_task_dedupe_key(
-                    "workspace_attention_digest",
-                    workspace.get("scanned_at"),
-                    recent_summary,
-                    ",".join(focus_paths),
-                    ",".join(change_paths),
-                ),
+                "dedupe_key": workspace_dedupe_key,
                 "metadata": {
                     "evidence_key": workspace_evidence,
                     "focus_paths": focus_paths,
@@ -35876,6 +37381,7 @@ def refresh_system_tasks_from_snapshot(
             created.append(routing_task)
 
     if focus_paths:
+        retrieval_title = "Prepare a CPU retrieval pack for the current work"
         retrieval_evidence = system_task_dedupe_key(
             "retrieval_prep_pack",
             workspace.get("scanned_at"),
@@ -35883,17 +37389,27 @@ def refresh_system_tasks_from_snapshot(
             ",".join(change_paths),
             recent_summary,
         )
+        retrieval_dedupe_key = active_system_task_dedupe_key_for_title(
+            "retrieval_prep_pack",
+            retrieval_title,
+            fallback=system_task_dedupe_key(
+                "retrieval_prep_pack",
+                recent_summary,
+                ",".join(focus_paths),
+                ",".join(change_paths),
+            ),
+        )
         retrieval_task, was_created = upsert_system_task(
             {
                 "source": source,
                 "kind": "retrieval_prep_pack",
-                "title": "Prepare a CPU retrieval pack for the current work",
+                "title": retrieval_title,
                 "summary": build_retrieval_prep_summary(snapshot),
                 "status": "planned",
                 "lane": "cpu",
                 "components": ["cpu", "filesystem", "disk", "memory"],
                 "priority": 4,
-                "dedupe_key": retrieval_evidence,
+                "dedupe_key": retrieval_dedupe_key,
                 "depends_on": [str(workspace_task["id"])] if workspace_task is not None else [],
                 "metadata": {
                     "evidence_key": retrieval_evidence,
@@ -37210,7 +38726,25 @@ def mind_tick_live_thread_response_schema() -> Dict[str, object]:
     )
 
 
-def mind_tick_response_schema() -> Dict[str, object]:
+def mind_tick_response_schema(compact: bool = False) -> Dict[str, object]:
+    if compact:
+        # Daemon path: a short structured answer that a background lane can finish
+        # inside its token budget.  The five lane strings are not requested here;
+        # merge_active_mind carries the previous lanes forward.
+        return json_schema_object(
+            {
+                "summary": json_schema_string(220),
+                "current_focus": json_schema_string(180),
+                "live_concerns": json_schema_string_array(max_items=3, max_length=160),
+                "live_threads": {
+                    "type": "array",
+                    "minItems": 0,
+                    "maxItems": 3,
+                    "items": mind_tick_live_thread_response_schema(),
+                },
+                "next_step": json_schema_string(180),
+            }
+        )
     return json_schema_object(
         {
             "summary": json_schema_string(220),
@@ -37239,7 +38773,16 @@ def mind_tick_response_schema() -> Dict[str, object]:
     )
 
 
-def structured_mind_tick_tokens(config: Dict[str, object], requested: Optional[int]) -> int:
+def structured_mind_tick_tokens(config: Dict[str, object], requested: Optional[int], compact: bool = False) -> int:
+    if compact:
+        # Daemon path: the compact schema needs far less than the five-lane answer,
+        # so the budget comes from daemon_model_mind_tick_max_tokens alone.
+        return clamp_int(
+            config.get("daemon_model_mind_tick_max_tokens"),
+            320,
+            minimum=160,
+            maximum=720,
+        )
     configured = clamp_int(config.get("mind_tick_max_tokens"), 180, minimum=80, maximum=4096)
     try:
         requested_int = int(requested or configured)
@@ -38305,7 +39848,11 @@ def refresh_human_context(
     if automatic_compact_refresh:
         context_limit = min(context_limit, 8)
     project_memory = load_project_memory(max_chars=int(config["project_memory_max_chars"]))
-    entries = read_salient_entries(limit=context_limit, since_days=int(config["reflection_days"]))
+    entries = read_entries(
+        limit=context_limit,
+        since_days=int(config["reflection_days"]),
+        exclude_kinds=sorted(set(LOW_SIGNAL_ENTRY_KINDS) | {"thought"} | set(TELEMETRY_ENTRY_KINDS)),
+    )
     thoughts = read_entries_by_kind("thought", limit=4 if automatic_compact_refresh else 8)
     reflections = read_entries_by_kind("reflection", limit=2 if automatic_compact_refresh else 4)
     threads = read_thread_summaries(limit=8 if automatic_compact_refresh else 12)
@@ -38708,6 +40255,8 @@ def normalize_conscious_state(payload: Optional[Dict[str, object]]) -> Dict[str,
         "interoception",
         "epistemic_state",
         "memory",
+        "autobiography",
+        "module_query",
         "goals",
         "plan_model",
         "action_model",
@@ -38731,7 +40280,7 @@ def normalize_conscious_state(payload: Optional[Dict[str, object]]) -> Dict[str,
     # Keep every bounded kernel provenance source. Adding a real causal faculty
     # must not make normalization silently truncate a verified checkpoint and
     # thereby invalidate concurrent-lineage learning.
-    normalized["causal_provenance"] = normalize_text_list(payload.get("causal_provenance"), limit=20)
+    normalized["causal_provenance"] = normalize_text_list(payload.get("causal_provenance"), limit=32)
     normalized["lesions"] = [
         item
         for item in normalize_text_list(payload.get("lesions"), limit=12)
@@ -38763,6 +40312,7 @@ def normalize_self_model_state(payload: Optional[Dict[str, object]]) -> Dict[str
     normalized["commitments"] = normalize_text_list(payload.get("commitments"), limit=5)
     normalized["uncertainty_edges"] = normalize_text_list(payload.get("uncertainty_edges"), limit=5)
     normalized["recent_changes"] = normalize_text_list(payload.get("recent_changes"), limit=5)
+    normalized["measured_competence"] = normalize_text_list(payload.get("measured_competence"), limit=4)
     return normalized
 
 
@@ -38787,16 +40337,22 @@ def normalize_world_inquiry_attempt(payload: object) -> Optional[Dict[str, objec
     observed = normalize_text_value(payload.get("observed"), fallback="", limit=220)
     if not action and not observed:
         return None
+    measurement = eve_recurrent_cognition.normalize_inquiry_measurement(payload.get("measurement"))
+    proposal = normalize_inquiry_reasoning_proposal(payload.get("reasoning_proposal"))
     return {
         "attempted_at": payload.get("attempted_at"),
         "run_id": normalize_text_value(payload.get("run_id"), fallback="", limit=100),
         "source_cycle_id": normalize_text_value(payload.get("source_cycle_id"), fallback="", limit=100),
+        "execution_id": normalize_text_value(payload.get("execution_id"), fallback="", limit=100),
         "action": action,
         "status": normalize_text_value(payload.get("status"), fallback="unknown", limit=40),
         "consequence_observed": bool(payload.get("consequence_observed")),
         "outcome_ok": parse_explicit_boolish(payload.get("outcome_ok")),
         "evidence_kind": normalize_text_value(payload.get("evidence_kind"), fallback="pending", limit=80),
         "observed": observed,
+        "reasoning_proposal": proposal,
+        "measurement": measurement,
+        "prediction_assessment": eve_recurrent_cognition.assess_inquiry_predictions(proposal, measurement),
     }
 
 
@@ -38875,6 +40431,7 @@ def normalize_world_inquiry(payload: object, *, default_status: str = "open") ->
         "confidence": clamp_int(payload.get("confidence"), 70, minimum=0, maximum=100),
         "candidate_actions": candidate_actions,
         "selected_action": selected_action,
+        "observation_test": eve_recurrent_cognition.normalize_observation_prediction(payload.get("observation_test")),
         "expected_observation": normalize_text_value(
             payload.get("expected_observation"),
             fallback="A bounded observation should reduce this uncertainty.",
@@ -39004,6 +40561,12 @@ def normalize_other_minds_model_state(payload: Optional[Dict[str, object]]) -> D
     ][:4]
     normalized["coordination_risks"] = normalize_text_list(payload.get("coordination_risks"), limit=5)
     normalized["uncertainty_edges"] = normalize_text_list(payload.get("uncertainty_edges"), limit=5)
+    normalized["social_prediction"] = eve_social_prediction.normalize_model(
+        payload.get("social_prediction")
+    )
+    normalized["common_ground"] = eve_common_ground.normalize_model(
+        payload.get("common_ground")
+    )
     normalized["next_check"] = normalize_text_value(
         payload.get("next_check"),
         fallback=DEFAULT_OTHER_MINDS_MODEL_STATE["next_check"],
@@ -39368,6 +40931,140 @@ def system_task_resource_deferred(task: Dict[str, object]) -> bool:
     )
 
 
+def kernel_prediction_error_signal(
+    conscious_state: Optional[Dict[str, object]] = None,
+    *,
+    max_age_minutes: float = 180.0,
+    prefer_runtime: bool = True,
+) -> Dict[str, object]:
+    """Read the kernel's own last cycle outcome back as a graded surprise signal.
+
+    ``complete_recurrent_conscious_cycle`` scores every closed cycle with an
+    overall prediction error (process 0.65 / consequence 0.35, 0-100). Until
+    now that number was only logged. This is the read-back path: homeostasis
+    and the workspace cadence consume it, so a wrong prediction changes what
+    Eve feels and how fast she re-ticks, not just what she records.
+    """
+    if not isinstance(conscious_state, dict):
+        try:
+            conscious_state = load_conscious_state(prefer_runtime=prefer_runtime)
+        except Exception:
+            conscious_state = {}
+    cycle_outcome = (
+        conscious_state.get("cycle_outcome")
+        if isinstance(conscious_state.get("cycle_outcome"), dict)
+        else {}
+    )
+    raw_error = cycle_outcome.get("overall_prediction_error")
+    completed_at = cycle_outcome.get("completed_at")
+    source_cycle_id = conscious_state.get("cycle_id")
+    signal_source = "conscious_state"
+    if raw_error is None:
+        # A newer cycle has opened and cleared the live outcome; read the most
+        # recent audited completion instead.
+        try:
+            audit_rows = read_jsonl_tail_records(
+                resolve_store_read_path(CONSCIOUS_STATE_AUDIT_LOG_PATH, prefer_runtime=prefer_runtime), 60
+            )
+        except Exception:
+            audit_rows = []
+        for row in reversed(audit_rows):
+            if not isinstance(row, dict) or str(row.get("event") or "") != "cycle_completed":
+                continue
+            if row.get("overall_prediction_error") is None:
+                continue
+            raw_error = row.get("overall_prediction_error")
+            completed_at = row.get("cycle_completed_at") or row.get("timestamp")
+            source_cycle_id = row.get("cycle_id")
+            signal_source = "conscious_state_audit"
+            cycle_outcome = {
+                "outcome_observed": row.get("outcome_observed"),
+                "process_prediction_error": row.get("process_prediction_error"),
+                "consequence_prediction_error": row.get("consequence_prediction_error"),
+            }
+            break
+    age_minutes = minutes_since_timestamp(completed_at)
+    try:
+        error = clamp_int(raw_error, 0, minimum=0, maximum=100) if raw_error is not None else None
+    except Exception:
+        error = None
+    available = (
+        error is not None
+        and age_minutes is not None
+        and float(age_minutes) <= float(max_age_minutes)
+    )
+    return {
+        "available": bool(available),
+        "error": int(error) if error is not None else None,
+        "age_minutes": round(float(age_minutes), 1) if age_minutes is not None else None,
+        "completed_at": normalize_text_value(completed_at, fallback="", limit=40),
+        "cycle_id": normalize_text_value(source_cycle_id, fallback="", limit=80),
+        "source": signal_source,
+        "outcome_observed": bool(cycle_outcome.get("outcome_observed")),
+        "process_prediction_error": cycle_outcome.get("process_prediction_error"),
+        "consequence_prediction_error": cycle_outcome.get("consequence_prediction_error"),
+    }
+
+
+def kernel_prediction_error_surprise(signal: Dict[str, object]) -> int:
+    """Map the kernel's 0-100 prediction error onto surprise-load points (cap 30)."""
+    if not isinstance(signal, dict) or not signal.get("available"):
+        return 0
+    try:
+        error = int(signal.get("error") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(30, int(round(error * 0.3))))
+
+
+def effective_workspace_tick_interval_seconds(
+    config: Dict[str, object],
+    conscious_state: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    """Let the kernel's last prediction error set how soon the workspace re-ticks.
+
+    High error shortens the interval (re-integrate sooner); a fresh, low-error
+    cycle lengthens it. The result stays inside the configured floor/ceiling.
+    """
+    base = int(config.get("workspace_tick_interval_seconds") or 0)
+    if base <= 0:
+        return {"interval_seconds": 0, "base_seconds": 0, "reason": "workspace tick disabled", "prediction_error": None}
+    floor = clamp_int(
+        config.get("workspace_tick_min_interval_seconds"),
+        int(DEFAULT_CONFIG["workspace_tick_min_interval_seconds"]),
+        minimum=1,
+        maximum=3600,
+    )
+    ceiling = clamp_int(
+        config.get("workspace_tick_max_interval_seconds"),
+        int(DEFAULT_CONFIG["workspace_tick_max_interval_seconds"]),
+        minimum=floor,
+        maximum=24 * 3600,
+    )
+    signal = kernel_prediction_error_signal(conscious_state)
+    error = signal.get("error") if signal.get("available") else None
+    if error is None:
+        factor, reason = 1.0, "no fresh kernel prediction error; base cadence"
+    elif int(error) >= 50:
+        factor, reason = 0.5, f"kernel prediction error {int(error)} is high; re-integrate sooner"
+    elif int(error) >= 30:
+        factor, reason = 0.75, f"kernel prediction error {int(error)} is moderate; slightly sooner"
+    elif int(error) <= 10:
+        factor, reason = 1.5, f"kernel prediction error {int(error)} is low; relax cadence"
+    else:
+        factor, reason = 1.0, f"kernel prediction error {int(error)} is ordinary; base cadence"
+    interval = int(round(base * factor))
+    interval = max(floor, min(ceiling, interval))
+    return {
+        "interval_seconds": interval,
+        "base_seconds": base,
+        "factor": factor,
+        "reason": reason,
+        "prediction_error": int(error) if error is not None else None,
+        "cycle_id": signal.get("cycle_id") or "",
+    }
+
+
 def build_homeostasis_state(
     *,
     source: str,
@@ -39382,6 +41079,7 @@ def build_homeostasis_state(
     action_executions: List[Dict[str, object]],
     open_system_tasks: List[Dict[str, object]],
     previous_homeostasis: Optional[Dict[str, object]] = None,
+    body_world: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     previous = normalize_homeostasis_state(previous_homeostasis)
     relationship = normalize_human_context(human_context)["relationship_memory"]
@@ -39528,7 +41226,23 @@ def build_homeostasis_state(
         max(pending_uncertainty_pressure, pending_judgment_pressure)
         + (12 if self_check_text else 0)
     )
-    resource_level = len(resource_alerts) * 22 + {"calm": 8, "busy": 26, "hot": 56}.get(load_state, 16)
+    # A hot host load average is a fact about the machine (the fly organ and
+    # body simulation share it), not by itself a fact about Eve's cognition.
+    # When fresh probes show her lanes answering in budget, hot load weighs
+    # less here so the stabilize gate cannot pause her mind on load alone.
+    # A real observer snapshot may carry probe timings far older than the
+    # watchdog's own status file; the fresher source wins. A bare snapshot
+    # without model status never reads the file, so tests stay deterministic.
+    lane_gate = cognition_gate_assessment(system_snapshot, allow_watchdog_fallback=True)
+    lanes_in_budget = str(lane_gate.get("lane_state") or "") == "ready"
+    hot_load_weight = 30 if lanes_in_budget else 56
+    # The lanes-ready hot note is information, not pressure: counting it as an
+    # alert on top of the hot weight let a routine disk-usage alert push the
+    # stabilize gate back over its threshold on load alone.
+    counted_resource_alerts = [
+        alert for alert in resource_alerts if not str(alert).startswith(LANES_READY_HOT_LOAD_ALERT_PREFIX)
+    ]
+    resource_level = len(counted_resource_alerts) * 22 + {"calm": 8, "busy": 26, "hot": hot_load_weight}.get(load_state, 16)
     # Open loops and response-due threads usually describe the same relational
     # pressure from different angles. Let the stronger of those two families set
     # the base, then add small freshness/unseen-message bonuses, instead of
@@ -39559,8 +41273,60 @@ def build_homeostasis_state(
         surprise_level += min(40, sum(int(record.get("error_magnitude") or 0) for record in unfulfilled_predictions) // 4)
     except Exception:
         unfulfilled_predictions = []
+    # The conscious kernel's own last cycle outcome joins felt surprise. This
+    # closes the loop that used to end at a log line: a mispredicted cycle now
+    # raises surprise_load, which the executive already knows how to answer.
+    try:
+        kernel_error_signal = kernel_prediction_error_signal()
+    except Exception:
+        kernel_error_signal = {"available": False}
+    kernel_surprise = kernel_prediction_error_surprise(kernel_error_signal)
+    surprise_level += kernel_surprise
 
+    # Body needs are Eve's needs. When the live fly body reports, its hunger (distance to food)
+    # and threat (attack progress or the connectome's escape readout) enter the same pressure
+    # field as surprise and unfinished commitments, and their regulation step is a body action.
+    body = body_world if isinstance(body_world, dict) else {}
+    body_pressures: List[Dict[str, object]] = []
+    if body.get("available"):
+        hunger_level = int(round(100 * max(0.0, min(1.0, float(body.get("hunger") or 0.0)))))
+        threat_level = int(round(100 * max(0.0, min(1.0, float(body.get("threat") or 0.0)))))
+        body_pressures = [
+            build_homeostasis_pressure(
+                "body_hunger",
+                "body hunger",
+                hunger_level,
+                f"Food distance {body.get('food_dist')}; body {body.get('behavior') or 'unknown'}.",
+                previous_level=previous_pressure_level(previous, "body_hunger"),
+                signal_count=1 if hunger_level >= 40 else 0,
+            ),
+            build_homeostasis_pressure(
+                "body_threat",
+                "body threat",
+                threat_level,
+                (
+                    f"Threat {body.get('threat')}; escape readout {body.get('escape')}; "
+                    + (f"attack from the {body['attack'].get('side')} at {body['attack'].get('progress')}." if isinstance(body.get("attack"), dict) else "no attack under way.")
+                ),
+                previous_level=previous_pressure_level(previous, "body_threat"),
+                signal_count=1 if threat_level >= 40 else 0,
+            ),
+        ]
+        restarts_recent = int(body.get("restarts_recent") or 0)
+        if restarts_recent > 0:
+            # Shared fate: when her body or its nervous system restarted, that is her integrity, not lab trivia.
+            body_pressures.append(
+                build_homeostasis_pressure(
+                    "body_integrity",
+                    "body integrity",
+                    min(90, 35 + 20 * restarts_recent),
+                    f"{restarts_recent} body/organ restart(s) in the last 15 minutes; body {body.get('behavior') or 'unknown'}.",
+                    previous_level=previous_pressure_level(previous, "body_integrity"),
+                    signal_count=restarts_recent,
+                )
+            )
     pressures = [
+        *body_pressures,
         build_homeostasis_pressure(
             "coherence",
             "coherence",
@@ -39662,9 +41428,21 @@ def build_homeostasis_state(
             (
                 f"{len(failing_actions)} failed or unverified action(s), {len(negative_outcomes)} negative outcome(s), "
                 f"{len(mixed_outcomes)} mixed outcome(s), {len(resource_alerts)} resource alert(s)."
+                + (
+                    f" Kernel prediction error {kernel_error_signal.get('error')} from the last conscious cycle"
+                    f" ({kernel_error_signal.get('age_minutes')}m ago) adds {kernel_surprise}."
+                    if kernel_surprise
+                    else ""
+                )
             ),
             previous_level=previous_pressure_level(previous, "surprise_load"),
-            signal_count=len(failing_actions) + len(negative_outcomes) + len(mixed_outcomes) + len(resource_alerts),
+            signal_count=(
+                len(failing_actions)
+                + len(negative_outcomes)
+                + len(mixed_outcomes)
+                + len(resource_alerts)
+                + (1 if kernel_surprise else 0)
+            ),
         ),
     ]
     pressures.sort(key=lambda item: int(item.get("level") or 0), reverse=True)
@@ -39697,6 +41475,9 @@ def build_homeostasis_state(
         "trust_repair": "Ground the next relational move in evidence and close any repair loop explicitly.",
         "continuity_drift": "Integrate what just changed so identity carries forward instead of resetting between loops.",
         "surprise_load": "Name what violated expectation and either verify it, accept it, or bound it as an open unknown.",
+        "body_hunger": "Move the body toward food and feed; this is the body's need, met by a body action.",
+        "body_integrity": "Check why the body or its nervous system restarted and keep them running; this is the body's integrity, met by a service check.",
+        "body_threat": "Turn the body away from the threat and run, then re-orient once the threat drops.",
     }
     recovery_targets = [
         target_map.get(str(item.get("id") or ""), "")
@@ -39741,6 +41522,64 @@ def build_homeostasis_state(
     )
 
 
+def measured_competence_summary(
+    action_executions: Optional[Iterable[Dict[str, object]]],
+    outcomes: Optional[Iterable[Dict[str, object]]],
+) -> Dict[str, object]:
+    """Summarize what the action log and outcome ledger actually show.
+
+    Verified ratio counts executions whose verification passed over all
+    executions in the window. Outcome counts use the ledger's own direction
+    field. Nothing here is model-authored.
+    """
+    executions = [item for item in (action_executions or []) if isinstance(item, dict)]
+    ledger = [item for item in (outcomes or []) if isinstance(item, dict)]
+    verified_total = 0
+    by_action: Dict[str, Dict[str, int]] = {}
+    for record in executions:
+        action = normalize_text_value(record.get("action"), fallback="", limit=60) or "unknown"
+        bucket = by_action.setdefault(action, {"total": 0, "verified": 0})
+        bucket["total"] += 1
+        if parse_boolish(record.get("verification_ok")):
+            bucket["verified"] += 1
+            verified_total += 1
+    action_total = len(executions)
+    verified_ratio = round(verified_total / action_total, 3) if action_total else None
+    outcome_counts = {"positive": 0, "negative": 0, "neutral": 0, "resolved": 0}
+    for record in ledger:
+        direction = str(record.get("direction") or "").strip().lower()
+        if direction in outcome_counts:
+            outcome_counts[direction] += 1
+    ranked_actions = sorted(by_action.items(), key=lambda item: (-item[1]["total"], item[0]))[:3]
+    lines: List[str] = []
+    if action_total:
+        lines.append(
+            f"Measured: {verified_total}/{action_total} recent actions passed verification"
+            f" ({int(round((verified_ratio or 0.0) * 100))}%)."
+        )
+        lines.append(
+            "By action: "
+            + ", ".join(f"{name} {bucket['verified']}/{bucket['total']}" for name, bucket in ranked_actions)
+            + "."
+        )
+    else:
+        lines.append("Measured: no recent action executions in the window.")
+    if ledger:
+        lines.append(
+            f"Outcomes: {outcome_counts['positive']} positive, {outcome_counts['negative']} negative, "
+            f"{outcome_counts['neutral']} neutral, {outcome_counts['resolved']} resolved."
+        )
+    return {
+        "action_total": action_total,
+        "verified_total": verified_total,
+        "verified_ratio": verified_ratio,
+        "by_action": {name: dict(bucket) for name, bucket in ranked_actions},
+        "outcome_counts": outcome_counts,
+        "outcome_total": len(ledger),
+        "lines": lines[:4],
+    }
+
+
 def build_self_model_state(
     *,
     source: str,
@@ -39751,9 +41590,12 @@ def build_self_model_state(
     homeostasis: Dict[str, object],
     threads: Optional[List[Dict[str, object]]] = None,
     messages: Optional[List[Dict[str, object]]] = None,
+    action_executions: Optional[List[Dict[str, object]]] = None,
+    outcomes: Optional[List[Dict[str, object]]] = None,
 ) -> Dict[str, object]:
     threads = threads or []
     messages = messages or []
+    competence = measured_competence_summary(action_executions, outcomes)
     human_self = normalize_human_context(human_context)["self_model"]
     model_role = normalize_text_value(runtime_identity.get("model_role"), fallback="", limit=220)
     organ_system = unique_compact(
@@ -39820,14 +41662,25 @@ def build_self_model_state(
             ),
             "",
         )
+    measured_clause = (
+        f" Measured: {competence['verified_total']}/{competence['action_total']} recent actions verified."
+        if competence.get("action_total")
+        else ""
+    )
     current_state = normalize_text_value(
         (
             f"Focus: {active_focus or 'none recorded'}. "
             f"Regulation mode: {homeostasis.get('regulation_mode') or 'steady'}. "
             f"{homeostasis.get('summary') or active_mind.get('summary') or ''}"
+            f"{measured_clause}"
         ),
         fallback=DEFAULT_SELF_MODEL_STATE["current_state"],
         limit=220,
+    )
+    measured_lines = (
+        list(competence.get("lines") or [])
+        if (action_executions is not None or outcomes is not None)
+        else []
     )
     return normalize_self_model_state(
         {
@@ -39841,6 +41694,7 @@ def build_self_model_state(
             "commitments": commitments,
             "uncertainty_edges": uncertainty_edges,
             "recent_changes": recent_changes,
+            "measured_competence": measured_lines,
         }
     )
 
@@ -39871,9 +41725,12 @@ def make_world_inquiry(
     candidate_actions: Iterable[str],
     expected_observation: str,
     now: str,
+    observation_test: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     actions = [str(action) for action in candidate_actions]
-    source_fingerprint = world_inquiry_source_fingerprint(domain, source_signal)
+    criterion = eve_recurrent_cognition.normalize_observation_prediction(observation_test)
+    source_fingerprint = world_inquiry_source_fingerprint(domain,
+        {"signal": source_signal, "observation_test": criterion} if criterion else source_signal)
     return normalize_world_inquiry(
         {
             "id": world_inquiry_stable_id(domain, source_fingerprint, question),
@@ -39888,6 +41745,7 @@ def make_world_inquiry(
             "candidate_actions": actions,
             "selected_action": actions[0] if actions else "",
             "expected_observation": expected_observation,
+            "observation_test": criterion,
             "created_at": now,
             "updated_at": now,
             "attempts": [],
@@ -40125,7 +41983,6 @@ def build_world_model_state(
             for key in (
                 "summary",
                 "sync_health_summary",
-                "last_sync_at",
                 "last_sync_ok",
                 "gateway_reachable",
                 "memory_status_summary",
@@ -40198,6 +42055,69 @@ def build_world_model_state(
     )
 
 
+def build_observable_social_model_state(
+    *,
+    hours: float = 24.0 * 30.0,
+    feedback_lesioned: bool = False,
+) -> Dict[str, object]:
+    try:
+        records = read_recent_prediction_checks(hours=hours, limit=256)
+    except Exception:
+        records = []
+    return eve_social_prediction.normalize_model(
+        eve_social_prediction.summarize_records(
+            records,
+            feedback_lesioned=feedback_lesioned,
+        )
+    )
+
+
+def build_temporal_common_ground_state(
+    *,
+    feedback_lesioned: bool = False,
+) -> Dict[str, object]:
+    """Reconstruct public dialogue trajectories from existing exact lineage.
+
+    Reply replays remain the utterance authority and prediction checks remain
+    the first-next-message authority.  This avoids creating a second dialogue
+    ledger while preserving prior overt states across updates.
+    """
+    try:
+        replays = read_reply_turn_replays(limit=64, prefer_runtime=False)
+    except Exception:
+        replays = []
+    try:
+        checks = read_recent_prediction_checks(hours=24.0 * 30.0, limit=256)
+    except Exception:
+        checks = []
+    return eve_common_ground.build_model(
+        replays,
+        checks,
+        feedback_lesioned=feedback_lesioned,
+    )
+
+
+def build_reply_other_minds_preflight_state() -> Dict[str, object]:
+    """Refresh the two exact-lineage social controls for the current reply.
+
+    The ordinary workspace refresh persists the broader other-minds model on
+    its own cadence.  A genuine next user message, however, may have just
+    corrected the preceding reply.  Rebuilding these bounded projections after
+    that observation ensures the same current reply can respond to the repair
+    rather than waiting for a later daemon tick.
+    """
+    state = load_other_minds_model_state(prefer_runtime=True)
+    state.update(
+        {
+            "updated_at": utc_now(),
+            "source": "reply_social_preflight",
+            "social_prediction": build_observable_social_model_state(),
+            "common_ground": build_temporal_common_ground_state(),
+        }
+    )
+    return normalize_other_minds_model_state(state)
+
+
 def build_relationship_model_state(
     *,
     source: str,
@@ -40208,6 +42128,7 @@ def build_relationship_model_state(
     outcomes: List[Dict[str, object]],
 ) -> Dict[str, object]:
     relationship = normalize_human_context(human_context)["relationship_memory"]
+    social_model = build_observable_social_model_state()
     waiting_threads = [thread for thread in threads if thread_status_label(thread) == "waiting"]
     externally_grounded_waiting_threads = [
         thread for thread in waiting_threads if thread_has_external_foreground_signal(thread)
@@ -40261,8 +42182,15 @@ def build_relationship_model_state(
                     f"positive_outcomes: {positive}",
                     f"mixed_outcomes: {mixed}",
                     f"negative_outcomes: {negative}",
+                    (
+                        f"observable_social_predictions: {social_model.get('scored_count')} scored, "
+                        f"mean_brier={social_model.get('mean_normalized_brier')}, "
+                        f"top1_accuracy={social_model.get('top1_accuracy')}"
+                        if int(social_model.get("scored_count") or 0) > 0
+                        else ""
+                    ),
                 ],
-                limit=4,
+                limit=5,
             ),
             "recent_signals": unique_compact(
                 [
@@ -40293,6 +42221,18 @@ def build_other_minds_model_state(
     normalized_mind = normalize_active_mind(active_mind)
     latest_user = most_recent_message(messages, "user")
     latest_action = action_executions[0] if action_executions else {}
+    social_model = build_observable_social_model_state()
+    common_ground = build_temporal_common_ground_state()
+    social_evidence_count = int(social_model.get("scored_count") or 0)
+    social_brier = social_model.get("mean_normalized_brier")
+    social_last_class = normalize_text_value(
+        social_model.get("last_observed_class"), fallback="", limit=40
+    )
+    active_common_ground_repair = (
+        common_ground.get("active_repair")
+        if isinstance(common_ground.get("active_repair"), dict)
+        else {}
+    )
     load_state_text = normalize_text_value(system_snapshot.get("load_state"), fallback="unknown", limit=40)
     latest_user_signal = human_analog_message_label(latest_user)
     observed = [
@@ -40306,6 +42246,11 @@ def build_other_minds_model_state(
                 [
                     latest_user_signal,
                     *(normalized_relationship.get("recent_signals") or [])[:2],
+                    (
+                        f"Latest observable response class: {social_last_class}."
+                        if social_last_class
+                        else ""
+                    ),
                 ],
                 limit=4,
             ),
@@ -40384,6 +42329,21 @@ def build_other_minds_model_state(
     coordination_risks = unique_compact(
         [
             "User needs may be over-inferred from sparse recent signals." if not latest_user_signal else "",
+            (
+                "Observable response predictions remain sparsely calibrated; do not personalize strongly from them."
+                if social_evidence_count < 8
+                else ""
+            ),
+            (
+                "Recent observable-response prediction error is high; prefer explicit clarification over stronger inference."
+                if social_brier is not None and float(social_brier) >= 0.35
+                else ""
+            ),
+            (
+                "An overt correction has not yet been confirmed as repaired; preserve the prior position and repair the shared record explicitly."
+                if active_common_ground_repair.get("required")
+                else ""
+            ),
             "System constraints can silently tighten when load or disk pressure rises." if load_state_text in {"busy", "hot", "unknown"} else "",
             "Sidecar outputs can look complete while still missing a typed contract or verification." if latest_action and not latest_action.get("typed_contract_ok", True) else "",
             "Relationship pull can dominate action selection if the user's practical ask is not kept explicit." if normalized_mind.get("relationship_pull") else "",
@@ -40393,6 +42353,8 @@ def build_other_minds_model_state(
     uncertainty_edges = unique_compact(
         [
             "The user may want practical action, relational repair, or both.",
+            "A predicted response form is uncertain observable behavior, not access to the user's private mental state.",
+            "Common ground records overt positions and acknowledgements, not private belief, emotion, or intent.",
             "System events only reveal partial state, not full intent.",
             "Other agent processes only expose what they logged, not their hidden deliberation.",
         ],
@@ -40403,14 +42365,28 @@ def build_other_minds_model_state(
             "updated_at": utc_now(),
             "source": source,
             "summary": normalize_text_value(
-                f"User, system, and sidecar/agent state are now tracked explicitly so Eve can separate self from other minds before acting.",
+                (
+                    "User, system, and sidecar/agent state are tracked separately. "
+                    f"The user-response model has {social_evidence_count} scored observable transition(s)"
+                    + (
+                        f" with mean normalized Brier {float(social_brier):.3f}."
+                        if social_brier is not None
+                        else "; calibration is not yet available."
+                    )
+                ),
                 fallback=DEFAULT_OTHER_MINDS_MODEL_STATE["summary"],
                 limit=220,
             ),
             "observed_minds": observed,
             "coordination_risks": coordination_risks,
             "uncertainty_edges": uncertainty_edges,
-            "next_check": "Before acting, re-check whether the pressure belongs to Eve, the user, the system, or another agent surface.",
+            "social_prediction": social_model,
+            "common_ground": common_ground,
+            "next_check": (
+                str(active_common_ground_repair.get("next_action") or "")
+                if active_common_ground_repair.get("required")
+                else "Use the next genuine user message to score one exact reply prediction and update one source-attributed common-ground trajectory."
+            ),
         }
     )
 
@@ -40729,6 +42705,101 @@ def build_global_workspace_state(
     )
 
 
+MEMORY_FOCUS_STOPWORDS = {
+    "about", "after", "again", "against", "being", "between", "could", "does", "doing", "during", "either",
+    "every", "first", "from", "have", "into", "just", "like", "more", "most", "only", "other", "over",
+    "same", "should", "since", "some", "such", "than", "that", "their", "them", "then", "there", "these",
+    "they", "this", "those", "through", "under", "until", "very", "what", "when", "where", "which",
+    "while", "will", "with", "would", "your", "still", "current", "currently", "live", "recorded",
+}
+
+
+def memory_focus_content_tokens(text: object) -> Set[str]:
+    words = re.findall(r"[a-z0-9][a-z0-9_\-]{3,}", str(text or "").lower())
+    return {word for word in words if word not in MEMORY_FOCUS_STOPWORDS}
+
+
+def memory_broadcast_focus_admission(
+    broadcast_content: object,
+    coalition: Optional[Dict[str, object]],
+    ignition_score: object,
+    *,
+    threads: Iterable[Dict[str, object]],
+    messages: Iterable[Dict[str, object]],
+    config: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    """Decide whether a memory-kind broadcast may set the workspace focus.
+
+    Memory used to be barred from focus outright, which kept recalled context
+    from ever steering attention. It may now set focus under one condition:
+    the winning memory must be corroborated by live evidence (a current
+    thread or a recent message shares enough of its content) and must have
+    won strongly. Uncorroborated memory stays background context.
+    """
+    effective_config = config or {}
+    min_ignition = clamp_int(
+        effective_config.get("memory_focus_min_ignition"),
+        int(DEFAULT_CONFIG["memory_focus_min_ignition"]),
+        minimum=0,
+        maximum=100,
+    )
+    try:
+        min_overlap = float(effective_config.get("memory_focus_min_overlap") or DEFAULT_CONFIG["memory_focus_min_overlap"])
+    except (TypeError, ValueError):
+        min_overlap = float(DEFAULT_CONFIG["memory_focus_min_overlap"])
+    content = normalize_text_value(broadcast_content, fallback="", limit=240)
+    try:
+        ignition = float(ignition_score or 0.0)
+    except (TypeError, ValueError):
+        ignition = 0.0
+    memory_tokens = memory_focus_content_tokens(content)
+    result: Dict[str, object] = {
+        "admit": False,
+        "ignition": ignition,
+        "min_ignition": min_ignition,
+        "overlap": 0.0,
+        "min_overlap": min_overlap,
+        "corroborated_by": "",
+        "reason": "",
+    }
+    if not content or len(memory_tokens) < 3:
+        result["reason"] = "memory content too thin to corroborate"
+        return result
+    if ignition < float(min_ignition):
+        result["reason"] = f"ignition {ignition:.0f} below the memory focus floor {min_ignition}"
+        return result
+    best_overlap = 0.0
+    best_source = ""
+    for thread in threads or []:
+        if not isinstance(thread, dict):
+            continue
+        live_text = " ".join(
+            str(thread.get(field) or "") for field in ("title", "summary", "next_step", "subject", "last_message")
+        )
+        overlap = len(memory_tokens & memory_focus_content_tokens(live_text)) / len(memory_tokens)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_source = "thread:" + normalize_text_value(
+                thread.get("id") or thread.get("thread_id") or thread.get("title"), fallback="?", limit=60
+            )
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        live_text = " ".join(str(message.get(field) or "") for field in ("subject", "body", "text"))
+        overlap = len(memory_tokens & memory_focus_content_tokens(live_text)) / len(memory_tokens)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_source = "message:" + normalize_text_value(message.get("id"), fallback="?", limit=60)
+    result["overlap"] = round(best_overlap, 3)
+    result["corroborated_by"] = best_source
+    if best_overlap >= min_overlap:
+        result["admit"] = True
+        result["reason"] = f"memory corroborated by {best_source} (overlap {best_overlap:.2f}, ignition {ignition:.0f})"
+    else:
+        result["reason"] = f"no live thread or message corroborates the memory (best overlap {best_overlap:.2f})"
+    return result
+
+
 def project_active_mind_from_workspace(
     *,
     previous_mind: Dict[str, object],
@@ -40767,11 +42838,25 @@ def project_active_mind_from_workspace(
     )
     broadcast_content = normalize_text_value(conscious_broadcast.get("content"), fallback="", limit=160)
     broadcast_kind = normalize_text_value((conscious_winner or {}).get("kind"), fallback="", limit=40)
+    memory_focus_admission: Dict[str, object] = {"admit": False, "reason": ""}
+    if broadcast_kind in {"memory", "prior_broadcast"} and broadcast_content:
+        try:
+            memory_focus_config = load_config()
+        except Exception:
+            memory_focus_config = dict(DEFAULT_CONFIG)
+        memory_focus_admission = memory_broadcast_focus_admission(
+            broadcast_content,
+            conscious_winner,
+            conscious_broadcast.get("ignition_score"),
+            threads=threads,
+            messages=messages,
+            config=memory_focus_config,
+        )
     if (
         broadcast_content
         and broadcast_content != "Not enough integrated evidence yet."
         and float(conscious_broadcast.get("ignition_score") or 0.0) >= 45
-        and broadcast_kind not in {"memory", "prior_broadcast"}
+        and (broadcast_kind not in {"memory", "prior_broadcast"} or bool(memory_focus_admission.get("admit")))
         and not text_indicates_carry_forward_contamination(broadcast_content)
     ):
         current_focus = broadcast_content
@@ -40878,6 +42963,11 @@ def project_active_mind_from_workspace(
             (
                 f"Current broadcast won attention with score {conscious_broadcast.get('ignition_score')}: {broadcast_content}"
                 if broadcast_content and conscious_broadcast.get("access_scope")
+                else ""
+            ),
+            (
+                f"Memory set the focus because {memory_focus_admission.get('reason')}."
+                if memory_focus_admission.get("admit")
                 else ""
             ),
             normalized_homeostasis.get("next_regulation_step"),
@@ -41080,8 +43170,45 @@ def select_conscious_memory_items(query: object, *, prefer_runtime: bool = True,
                 },
             )
         )
+    # Body and conversation read the same verified operational episodes. The
+    # projection is query-scoped, historical and read-only: fly narration does
+    # not become a fresh perception, identity fact, or standing task.
+    database = (
+        RUNTIME_OPERATIONAL_DB_PATH
+        if prefer_runtime and RUNTIME_OPERATIONAL_DB_PATH.exists()
+        else OPERATIONAL_DB_PATH
+    )
+    try:
+        embodied_items = eve_embodiment.EmbodiedContinuity(database).memory_items(query)
+    except (OSError, sqlite3.Error, ValueError):
+        embodied_items = []
+    for index, item in enumerate(embodied_items):
+        ranked.append((float(item["relevance_score"]), -index, item))
     ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
     return [item[2] for item in ranked[: max(1, int(limit))]]
+
+
+def build_autobiographical_continuity_state(
+    query: object,
+    *,
+    prefer_runtime: bool = True,
+    limit: int = 200,
+) -> Dict[str, object]:
+    """Project source-grounded episodes into one temporal self-change model.
+
+    The projection remains transient and derives from the canonical episode
+    store. It therefore adds causal retrieval without creating another
+    transcript or a second memory authority.
+    """
+    episodes = read_relationship_episodes(
+        limit=max(1, min(500, int(limit))),
+        prefer_runtime=prefer_runtime,
+    )
+    return eve_autobiography.build_state(
+        episodes,
+        query=query,
+        now=utc_now(),
+    )
 
 
 def append_conscious_state_audit_event(
@@ -41117,6 +43244,17 @@ def append_conscious_state_audit_event(
         "causal_provenance": normalize_text_list(state.get("causal_provenance"), limit=12),
         "lesions": normalize_text_list(state.get("lesions"), limit=8),
     }
+    cycle_outcome = state.get("cycle_outcome") if isinstance(state.get("cycle_outcome"), dict) else {}
+    if cycle_outcome and cycle_outcome.get("overall_prediction_error") is not None:
+        # The live state drops cycle_outcome when the next cycle opens; the
+        # audit row keeps the graded error so homeostasis can read it back.
+        record["overall_prediction_error"] = clamp_int(
+            cycle_outcome.get("overall_prediction_error"), 0, minimum=0, maximum=100
+        )
+        record["process_prediction_error"] = cycle_outcome.get("process_prediction_error")
+        record["consequence_prediction_error"] = cycle_outcome.get("consequence_prediction_error")
+        record["outcome_observed"] = bool(cycle_outcome.get("outcome_observed"))
+        record["cycle_completed_at"] = normalize_text_value(cycle_outcome.get("completed_at"), fallback="", limit=40)
     append_jsonl_record(CONSCIOUS_STATE_AUDIT_LOG_PATH, record)
     mirror_store_file_to_runtime(CONSCIOUS_STATE_AUDIT_LOG_PATH)
     return record
@@ -41433,6 +43571,42 @@ def collect_runtime_sensory_events(
         candidate.setdefault("source", record.get("source") or "typed_sensory_adapter")
         events.append(candidate)
 
+    # The fly body is Eve's body: its need state enters the same attention frame as system load
+    # and human input, as an interoceptive signal (hunger, threat) the kernel can orient to.
+    try:
+        body_world = load_fly_body_world(config)
+    except Exception:
+        body_world = {"available": False}
+    if body_world.get("available"):
+        hunger = float(body_world.get("hunger") or 0.0)
+        threat = float(body_world.get("threat") or 0.0)
+        need = max(hunger, threat)
+        events.append(
+            {
+                "id": f"fly-body:{normalize_text_value(body_world.get('updated_at'), fallback=timestamp, limit=80)}",
+                "observed_at": timestamp,
+                "modality": "interoceptive",
+                "source": "fly_body",
+                "subject": "eve-fly-body",
+                "summary": body_world_summary(body_world),
+                "intensity": int(round(20 + 80 * need)),
+                "novelty": int(round(30 + 60 * threat)),
+                "change": int(round(20 + 70 * threat)),
+                "urgency": int(round(10 + 85 * threat)),
+                "goal_relevance": int(round(40 + 50 * need)),
+                "self_relevance": 90,
+                "precision": 85,
+                "privacy": "local_private",
+                "permission_granted": True,
+                "features": {
+                    "hunger": round(hunger, 3),
+                    "threat": round(threat, 3),
+                    "behavior": body_world.get("behavior"),
+                    "restarts_recent": int(body_world.get("restarts_recent") or 0),
+                },
+            }
+        )
+
     return [eve_sensory.normalize_event(item, now=timestamp) for item in events]
 
 
@@ -41606,6 +43780,7 @@ def build_recurrent_conscious_state(
     homeostasis: Optional[Dict[str, object]] = None,
     plan_model: Optional[Dict[str, object]] = None,
     inbound: object = "",
+    module_query: Optional[Dict[str, object]] = None,
     latest_outcome: Optional[Dict[str, object]] = None,
     persist: bool = True,
     lesions: Optional[Iterable[str]] = None,
@@ -41630,12 +43805,29 @@ def build_recurrent_conscious_state(
         else build_conscious_plan_model(prefer_runtime=prefer_runtime)
     )
     previous = load_conscious_state(prefer_runtime=prefer_runtime)
+    requested_module_query = (
+        module_query
+        if isinstance(module_query, dict)
+        else previous.get("module_query")
+        if isinstance(previous.get("module_query"), dict)
+        else {}
+    )
+    effective_module_query = (
+        dict(requested_module_query)
+        if eve_recurrent_cognition.module_query_is_valid(requested_module_query)
+        else {}
+    )
     autonomy_agenda = load_autonomy_agenda(prefer_runtime=prefer_runtime)
     human_context = load_human_context(prefer_runtime=prefer_runtime)
     memory_query = " ".join(
         unique_compact(
             [
                 inbound,
+                (
+                    effective_module_query.get("question")
+                    if isinstance(effective_module_query, dict)
+                    else ""
+                ),
                 (workspace.get("workspace_state") or {}).get("focus") if isinstance(workspace.get("workspace_state"), dict) else "",
                 *(workspace.get("active_goals") or [])[:3],
                 *(workspace.get("continuity_threads") or [])[:2],
@@ -41644,6 +43836,24 @@ def build_recurrent_conscious_state(
         )
     )
     memory_items = select_conscious_memory_items(memory_query, prefer_runtime=prefer_runtime, limit=6)
+    autobiography = build_autobiographical_continuity_state(
+        memory_query,
+        prefer_runtime=prefer_runtime,
+    )
+    autobiographical_memory = eve_autobiography.transient_memory_item(autobiography)
+    if autobiographical_memory:
+        autobiographical_id = normalize_text_value(
+            autobiographical_memory.get("id"), fallback="", limit=120
+        )
+        memory_items = [
+            autobiographical_memory,
+            *[
+                item
+                for item in memory_items
+                if normalize_text_value(item.get("id"), fallback="", limit=120)
+                != autobiographical_id
+            ],
+        ][:6]
     runtime_state = load_state(prefer_runtime=prefer_runtime)
     sensory_frame = (
         eve_sensory.public_frame(sensory_frame_override)
@@ -41681,9 +43891,11 @@ def build_recurrent_conscious_state(
         homeostasis=homeostasis,
         plan_model=conscious_plan_model,
         autonomy_agenda=autonomy_agenda,
+        autobiography=autobiography,
         memory_items=memory_items,
         sensory_frame=sensory_frame,
         inbound=inbound,
+        module_query=effective_module_query,
         previous_state=previous,
         latest_outcome=latest_outcome,
         revision_rounds=revision_rounds,
@@ -41735,6 +43947,8 @@ def build_recurrent_conscious_state(
     return conscious_state
 
 
+@eve_tracing.traced(lambda: OPERATIONAL_DB_PATH, "consequence.join", category="consequence",
+                    attributes={"gen_ai.operation.name": "invoke_workflow"})
 def complete_recurrent_conscious_cycle(
     *,
     actual_process: Dict[str, object],
@@ -41924,6 +44138,12 @@ def run_quiet_period_consolidation(
         source=f"{source}_presence_cycle_episode_extraction",
         prefer_runtime=prefer_runtime,
     )
+    # Supplied fixture bundles must not accidentally promote live state. The
+    # daemon supplies its owned checkpoint explicitly at this existing cadence.
+    if isinstance(bundle.get("conscious_state"), dict):
+        record["contextual_procedures"] = consolidate_contextual_success_patterns(
+            bundle["conscious_state"], source=source + "_contextual_procedures",
+        )
     distilled_presence_context = distill_presence_cycle_episodes_to_human_context(
         presence_cycle_episodes,
         source=f"{source}_presence_cycle_distillation",
@@ -42071,6 +44291,10 @@ def refresh_global_workspace(source: str = "manual", *, persist: bool = True) ->
     user_corrections = read_user_corrections(limit=8, status="open", prefer_runtime=True)
     relationship_episodes = read_relationship_episodes(limit=8, prefer_runtime=True)
 
+    try:
+        body_world = load_fly_body_world(load_config())
+    except Exception:
+        body_world = {"available": False}
     homeostasis = build_homeostasis_state(
         source=source,
         human_context=human_context,
@@ -42084,6 +44308,7 @@ def refresh_global_workspace(source: str = "manual", *, persist: bool = True) ->
         action_executions=action_executions,
         open_system_tasks=open_system_tasks,
         previous_homeostasis=previous_homeostasis,
+        body_world=body_world,
     )
     self_model = build_self_model_state(
         source=source,
@@ -42094,6 +44319,8 @@ def refresh_global_workspace(source: str = "manual", *, persist: bool = True) ->
         homeostasis=homeostasis,
         threads=threads,
         messages=messages,
+        action_executions=action_executions,
+        outcomes=outcomes,
     )
     world_model = build_world_model_state(
         source=source,
@@ -42188,6 +44415,10 @@ def refresh_global_workspace(source: str = "manual", *, persist: bool = True) ->
         state["world_model_summary"] = normalize_text_value(world_model.get("environment_summary"), fallback="", limit=220)
         state["relationship_state_summary"] = normalize_text_value(relationship_model.get("relationship_state"), fallback="", limit=220)
         state["other_minds_summary"] = normalize_text_value(other_minds_model.get("summary"), fallback="", limit=220)
+        try:
+            state["body_standing_intent"] = sync_standing_body_intent(load_config(), conscious_state, body_world)
+        except Exception as exc:
+            state["body_standing_intent"] = {"standing": False, "error": normalize_text_value(exc, fallback="standing intent sync failed", limit=160)}
         state["last_conscious_cycle_at"] = conscious_state.get("updated_at")
         state["last_conscious_cycle_id"] = normalize_text_value(conscious_state.get("cycle_id"), fallback="", limit=80)
         state["conscious_cycle_status"] = normalize_text_value(conscious_state.get("status"), fallback="unknown", limit=40)
@@ -42279,6 +44510,7 @@ def format_conscious_state_report(state: Dict[str, object], full: bool = False) 
     interoceptive_error = interoception.get("prediction_error") if isinstance(interoception.get("prediction_error"), dict) else {}
     epistemic = normalized.get("epistemic_state") if isinstance(normalized.get("epistemic_state"), dict) else {}
     memory = normalized.get("memory") if isinstance(normalized.get("memory"), dict) else {}
+    autobiography = normalized.get("autobiography") if isinstance(normalized.get("autobiography"), dict) else {}
     perception = normalized.get("perception") if isinstance(normalized.get("perception"), dict) else {}
     sensory_frame = perception.get("sensory_frame") if isinstance(perception.get("sensory_frame"), dict) else {}
     sensory_winner = sensory_frame.get("winner") if isinstance(sensory_frame.get("winner"), dict) else {}
@@ -42297,6 +44529,7 @@ def format_conscious_state_report(state: Dict[str, object], full: bool = False) 
         f"interoception: mode={interoception.get('regulation_mode') or 'steady'} valence={interoception.get('valence') or 0} arousal={interoception.get('arousal') or 0} prediction_error={interoceptive_error.get('error_magnitude') or 0}",
         f"epistemic_conflicts: unresolved={epistemic.get('unresolved_count') or 0}",
         f"memory: available={'yes' if memory.get('available') else 'no'} anchors={len(memory.get('continuity_anchors') or [])}",
+        f"autobiography: events={autobiography.get('event_count') or 0} changes={autobiography.get('change_count') or 0} precedent={'yes' if (autobiography.get('selected_precedent') or {}).get('selected') else 'no'}",
         (
             f"sensory_attention: observed={sensory_frame.get('observed_count') or 0} "
             f"modalities={sensory_frame.get('modality_count') or 0} admitted={sensory_frame.get('admitted_count') or 0} "
@@ -42342,6 +44575,13 @@ def run_conscious_state_ablation(*, prefer_runtime: bool = True) -> Dict[str, ob
         )
     )
     memory_items = select_conscious_memory_items(query, prefer_runtime=prefer_runtime, limit=6)
+    autobiography = build_autobiographical_continuity_state(
+        query,
+        prefer_runtime=prefer_runtime,
+    )
+    autobiographical_memory = eve_autobiography.transient_memory_item(autobiography)
+    if autobiographical_memory:
+        memory_items = [autobiographical_memory, *memory_items][:6]
     return eve_consciousness.run_causal_ablation_suite(
         {
             "source": "causal_ablation",
@@ -42353,6 +44593,7 @@ def run_conscious_state_ablation(*, prefer_runtime: bool = True) -> Dict[str, ob
             "homeostasis": homeostasis,
             "plan_model": build_conscious_plan_model(prefer_runtime=prefer_runtime),
             "autonomy_agenda": agenda,
+            "autobiography": autobiography,
             "memory_items": memory_items,
             "sensory_frame": load_sensory_frame(prefer_runtime=prefer_runtime),
             "previous_state": previous,
@@ -42393,6 +44634,7 @@ def run_conscious_state_ablation_snapshot(
             ),
             "plan_model": conscious_state.get("plan_model") or {},
             "autonomy_agenda": load_autonomy_agenda(prefer_runtime=prefer_runtime),
+            "autobiography": conscious_state.get("autobiography") or {},
             "memory_items": memory_items,
             "previous_state": conscious_state,
         }
@@ -42568,6 +44810,7 @@ def format_self_model_state_report(model_state: Dict[str, object]) -> str:
             f"commitments: {format_human_context_list(normalized['commitments'])}",
             f"uncertainty_edges: {format_human_context_list(normalized['uncertainty_edges'])}",
             f"recent_changes: {format_human_context_list(normalized['recent_changes'])}",
+            f"measured_competence: {format_human_context_list(normalized['measured_competence'])}",
         ]
     )
 
@@ -42608,12 +44851,33 @@ def format_relationship_model_state_report(model_state: Dict[str, object]) -> st
 
 def format_other_minds_model_state_report(model_state: Dict[str, object]) -> str:
     normalized = normalize_other_minds_model_state(model_state)
+    social_model = eve_social_prediction.normalize_model(
+        normalized.get("social_prediction")
+    )
+    common_ground = eve_common_ground.normalize_model(
+        normalized.get("common_ground")
+    )
     lines = [
         f"updated_at: {normalized.get('updated_at') or 'never'}",
         f"source: {normalized.get('source') or 'unknown'}",
         f"summary: {normalized['summary']}",
         f"coordination_risks: {format_human_context_list(normalized['coordination_risks'])}",
         f"uncertainty_edges: {format_human_context_list(normalized['uncertainty_edges'])}",
+        (
+            "observable_social_prediction: "
+            f"scored={social_model.get('scored_count')} "
+            f"mean_brier={social_model.get('mean_normalized_brier')} "
+            f"top1_accuracy={social_model.get('top1_accuracy')} "
+            f"last_class={social_model.get('last_observed_class') or 'none'} "
+            f"shift={social_model.get('distribution_shift')}"
+        ),
+        (
+            "temporal_common_ground: "
+            f"trajectories={common_ground.get('trajectory_count')} "
+            f"transitions={common_ground.get('transition_count')} "
+            f"feedback={common_ground.get('feedback_evidence_count')} "
+            f"repair_required={'yes' if (common_ground.get('active_repair') or {}).get('required') else 'no'}"
+        ),
         f"next_check: {normalized['next_check']}",
     ]
     if normalized.get("observed_minds"):
@@ -42881,6 +45145,117 @@ def build_mind_stream_current_evidence_message(
     ).strip()
 
 
+DAEMON_MIND_TICK_PROMPT_TOKEN_CAP = 2000
+
+
+def build_daemon_mind_tick_continuity_message(
+    previous_mind: Dict[str, object],
+    state: Dict[str, object],
+    threads: List[Dict[str, object]],
+    messages: List[Dict[str, object]],
+    entries: List[Dict[str, object]],
+) -> str:
+    """Continuity for the compact daemon tick.
+
+    The current-evidence block already carries durable human context, autonomy
+    and the system snapshot, so this block only adds what that block lacks:
+    the previous active mind, runtime state, threads, messages and entries.
+    """
+    return textwrap.dedent(
+        f"""
+        HISTORICAL AND DERIVED CONTINUITY CONTEXT (not current proof by itself):
+
+        Previous active mind:
+        {trim_context_block(build_active_mind_message(previous_mind, compact=True), max_chars=500)}
+
+        {trim_context_block(build_current_state_message(state), max_chars=350)}
+
+        Active threads:
+        {trim_context_block(format_mind_tick_threads(threads[:3]), max_chars=400)}
+
+        Recent messages:
+        {trim_context_block(format_mind_tick_messages(messages[:3]), max_chars=400)}
+
+        Recent salient entries:
+        {trim_context_block(format_mind_tick_entries(entries[:3]), max_chars=400)}
+        """
+    ).strip()
+
+
+def build_daemon_mind_tick_messages(
+    current_evidence_context: str,
+    continuity_context: str,
+    include_continuity: bool = True,
+) -> List[Dict[str, object]]:
+    """Compact prompt for the daemon mind tick.
+
+    Uses the interaction identity contract instead of the full identity stack and
+    no supporting system messages, so a background lane sees only the identity
+    line, the compact instruction, and the evidence.  The continuity block is
+    marked optional so the transport preflight reclaims it first if the resident
+    lane is short of room.
+    """
+    messages: List[Dict[str, object]] = [
+        {"role": "system", "content": build_interaction_identity_message()},
+        {"role": "system", "content": load_prompt("mind_tick_compact.md")},
+    ]
+    if include_continuity and continuity_context:
+        messages.append(
+            mark_prompt_message_optional(
+                {"role": "system", "content": continuity_context},
+                priority=10,
+            )
+        )
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "Refresh Eve's short-horizon active mind from this current evidence. "
+                "Do not manufacture a change; preserve waiting or uncertainty when nothing moved.\n\n"
+                + current_evidence_context
+            ),
+        }
+    )
+    return messages
+
+
+def measure_daemon_mind_tick_prompt(
+    config: Dict[str, object],
+    model: str,
+    messages: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """Measure the compact daemon prompt with the shared prompt-budget module."""
+    host = configured_model_host(config, model, "daemon_model_mind_tick")
+    try:
+        fallback_context_tokens = int(llama_cpp_prompt_fallback_context_tokens(config, model))
+    except Exception:  # pragma: no cover - measurement must never break a tick
+        fallback_context_tokens = 0
+    try:
+        measurement = eve_prompt_budget.measure_prompt(
+            host,
+            messages,
+            fallback_context_tokens=fallback_context_tokens,
+            timeout=2.0,
+        )
+    except Exception:  # pragma: no cover - measurement must never break a tick
+        rendered = "\n\n".join(
+            f"<{item.get('role')}>\n{item.get('content')}" for item in messages if isinstance(item, dict)
+        )
+        measurement = eve_prompt_budget.PromptMeasurement(
+            context_tokens=fallback_context_tokens,
+            prompt_tokens=eve_prompt_budget.conservative_token_estimate(rendered),
+            exact=False,
+            source="conservative_character_fallback",
+        )
+    return {
+        "prompt_tokens": int(measurement.prompt_tokens),
+        "prompt_tokens_exact": bool(measurement.exact),
+        "prompt_measurement_source": str(measurement.source),
+        "prompt_context_tokens": int(measurement.context_tokens),
+        "prompt_message_count": len(messages),
+    }
+
+
 MIND_STREAM_LANE_THREAD_KINDS = {
     "observer": "focus",
     "planner": "next_step",
@@ -43143,6 +45518,225 @@ def format_mind_stream_packets(packets: Iterable[Dict[str, object]]) -> str:
             f"next_step: {packet.get('next_step') or 'none recorded'}"
         )
     return "\n".join(chunks) if chunks else "- No active-mind stream packets available."
+
+
+MIND_STREAM_SYNTHESIS_OVERLAY_LANES = ("observer", "planner", "relationship", "grounding", "self_check")
+
+
+def mind_stream_synthesis_prose_issues(text: object) -> List[str]:
+    """Deterministic boundary checks for model-authored mind-stream prose."""
+    cleaned = " ".join(str(text or "").split()).strip()
+    if not cleaned:
+        return []
+    issues: List[str] = []
+    if unsupported_action_claim_findings(cleaned, set(), set()):
+        issues.append("claimed an action without execution evidence")
+    if reply_claims_unverified_inner_state_activity(cleaned) or proactive_outreach_claims_unverified_current_operation(cleaned):
+        issues.append("upgraded state into an unverified current activity")
+    if reply_has_unqualified_subjective_experience_claim("what is on your mind?", cleaned) or continuous_thought_uses_phenomenological_metaphor(cleaned):
+        issues.append("asserted a felt sensation or phenomenological metaphor")
+    if text_indicates_carry_forward_contamination(cleaned):
+        issues.append("carried forward unadmitted prior context")
+    return issues
+
+
+def budgeted_mind_stream_model_synthesis(
+    config: Dict[str, object],
+    packets: List[Dict[str, object]],
+    *,
+    deterministic_payload: Dict[str, object],
+    current_evidence_context: object,
+    lane_models: Dict[str, str],
+    turn_id: str,
+    source: str,
+    system_snapshot: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    """Budgeted model synthesis with the executive's authority kept intact.
+
+    The deterministic fusion stays the authority for focus, next step, live
+    threads, and provenance. When Eve's lanes are measurably in budget, one
+    bounded model call may re-voice only the summary and lane sentences from
+    the admitted packets. Its prose faces the deterministic boundary checks and
+    then the same closed-world critic that admits lane packets. Anything
+    rejected leaves the deterministic payload untouched.
+    """
+    result: Dict[str, object] = {
+        "attempted": False,
+        "admitted": False,
+        "model": "",
+        "reason": "",
+        "overlay": {},
+    }
+    if not parse_boolish(config.get("mind_stream_model_synthesis_enabled", True)):
+        result["reason"] = "disabled by config"
+        return result
+    # A real observer snapshot may carry stale probe timings; the watchdog's
+    # own file refreshes them (a bare snapshot without model status never
+    # reads the file, so tests stay deterministic).
+    gate = cognition_gate_assessment(system_snapshot or {}, config, allow_watchdog_fallback=True)
+    if str(gate.get("lane_state") or "") != "ready":
+        result["reason"] = f"lanes not measurably in budget ({gate.get('lane_state')}); deterministic fusion only"
+        return result
+    configured = normalize_model_name(config.get("mind_stream_synthesis_model"))
+    served = {normalize_model_name(value) for value in lane_models.values() if value}
+    model = (
+        configured
+        if configured and configured in served
+        else normalize_model_name(lane_models.get("planner"))
+        or normalize_model_name(lane_models.get("observer"))
+        or ""
+    )
+    if not model:
+        result["reason"] = "no lane model available for synthesis"
+        return result
+    timeout_seconds = clamp_int(
+        config.get("mind_stream_synthesis_timeout_seconds"),
+        int(DEFAULT_CONFIG["mind_stream_synthesis_timeout_seconds"]),
+        minimum=4,
+        maximum=60,
+    )
+    max_tokens = clamp_int(
+        config.get("mind_stream_synthesis_max_tokens"),
+        int(DEFAULT_CONFIG["mind_stream_synthesis_max_tokens"]),
+        minimum=120,
+        maximum=800,
+    )
+    authority = {
+        "current_focus": normalize_text_value(deterministic_payload.get("current_focus"), fallback="", limit=220),
+        "next_step": normalize_text_value(deterministic_payload.get("next_step"), fallback="", limit=220),
+    }
+    schema = json_schema_object(
+        {
+            "summary": json_schema_string(220),
+            "lanes": json_schema_object({lane: json_schema_string(180) for lane in MIND_STREAM_SYNTHESIS_OVERLAY_LANES}),
+            "live_concerns": json_schema_string_array(max_items=4, max_length=160),
+            "grounding_notes": json_schema_string_array(max_items=3, max_length=160),
+        }
+    )
+    messages = [
+        *build_eve_identity_system_messages(include_human_context=False, include_active_mind=False, compact=True),
+        {"role": "system", "content": load_prompt("mind_stream_synthesis.md")},
+        {
+            "role": "system",
+            "content": (
+                "EXECUTIVE_AUTHORITY (fixed by the deterministic executive; do not change, restate them verbatim "
+                "where needed):\n" + json.dumps(authority, ensure_ascii=True, sort_keys=True)
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Admitted lane packets for this tick:\n"
+                + format_mind_stream_packets(packets)
+                + "\n\nReturn JSON only with keys summary, lanes{observer,planner,relationship,grounding,self_check}, "
+                "live_concerns, grounding_notes. Re-voice only what these packets establish. Do not add actions, "
+                "causes, or felt qualities. Do not invent a new focus or next step."
+            ),
+        },
+    ]
+    result["attempted"] = True
+    result["model"] = model
+    try:
+        raw = model_chat(
+            config,
+            model,
+            messages,
+            max_tokens=max_tokens,
+            think_level=str(config.get("think_level") or "low"),
+            operation="mind_stream_synthesis",
+            timeout_seconds=timeout_seconds,
+            response_schema=schema,
+        )
+        payload = extract_json_object(str(raw), label="mind stream synthesis", allow_repair=True)
+    except SystemExit as exc:
+        result["reason"] = f"synthesis call failed: {normalize_text_value(exc, fallback='error', limit=160)}"
+        return result
+    summary = normalize_text_value(payload.get("summary"), fallback="", limit=220)
+    lanes_payload = payload.get("lanes") if isinstance(payload.get("lanes"), dict) else {}
+    lanes = {
+        lane: normalize_text_value(lanes_payload.get(lane), fallback="", limit=180)
+        for lane in MIND_STREAM_SYNTHESIS_OVERLAY_LANES
+    }
+    lanes = {lane: text for lane, text in lanes.items() if text}
+    live_concerns = normalize_text_list(payload.get("live_concerns"), limit=4)
+    grounding_notes = normalize_text_list(payload.get("grounding_notes"), limit=3)
+    if not summary and not lanes:
+        result["reason"] = "synthesis returned no usable prose"
+        return result
+    prose_issues: List[str] = []
+    for text in [summary, *lanes.values(), *live_concerns, *grounding_notes]:
+        prose_issues.extend(mind_stream_synthesis_prose_issues(text))
+    prose_issues = unique_compact(prose_issues, limit=6)
+    candidate_packet = {
+        "lane_name": "synthesis",
+        "lane": summary or next(iter(lanes.values()), ""),
+        "summary": summary,
+        "live_concerns": live_concerns[:2],
+        "active_threads": [],
+        "relationship_pull": [],
+        "grounding_notes": grounding_notes[:2],
+        "live_threads": [],
+        "next_step": authority["next_step"],
+        "confidence": "medium",
+    }
+    decision: Dict[str, object] = {"ok": False, "reason": "not evaluated", "unsupported_claims": []}
+    if not prose_issues:
+        try:
+            decisions = evaluate_mind_stream_packets_grounding(
+                config,
+                [candidate_packet],
+                current_evidence_context,
+                timeout_seconds=timeout_seconds,
+            )
+            decision = decisions.get("synthesis") or {"ok": False, "reason": "no critic decision; admission failed closed", "unsupported_claims": []}
+        except SystemExit as exc:
+            decision = {"ok": False, "reason": f"critic failed: {normalize_text_value(exc, fallback='error', limit=160)}", "unsupported_claims": []}
+    admitted = bool(not prose_issues and decision.get("ok"))
+    admission_reason = (
+        "; ".join(prose_issues)
+        if prose_issues
+        else normalize_text_value(decision.get("reason"), fallback="", limit=220)
+    )
+    try:
+        append_mind_stream_packet(
+            turn_id,
+            "synthesis",
+            candidate_packet,
+            model=model,
+            source=source,
+            round_name="synthesis",
+            admission_status="model_grounded" if admitted else "rejected_model_candidate",
+            attempted_model=model,
+            admission_reason=admission_reason,
+        )
+    except Exception:
+        pass
+    result["reason"] = admission_reason
+    if not admitted:
+        return result
+    overlay: Dict[str, object] = {}
+    if summary:
+        overlay["summary"] = summary
+    if lanes:
+        base_lanes = deterministic_payload.get("lanes") if isinstance(deterministic_payload.get("lanes"), dict) else {}
+        overlay["lanes"] = {**base_lanes, **lanes}
+    if live_concerns:
+        overlay["live_concerns"] = unique_compact(
+            [*normalize_text_list(deterministic_payload.get("live_concerns"), limit=4), *live_concerns],
+            limit=4,
+        )
+    overlay["grounding_notes"] = unique_compact(
+        [
+            *normalize_text_list(deterministic_payload.get("grounding_notes"), limit=4),
+            *grounding_notes,
+            f"Model synthesis ({model}) re-voiced summary and lanes; the executive kept focus, next step, and threads.",
+        ],
+        limit=4,
+    )
+    overlay["model"] = f"deterministic-grounded-executive-fusion+{model}"
+    result["admitted"] = True
+    result["overlay"] = overlay
+    return result
 
 
 def deterministic_mind_stream_synthesis_payload(
@@ -43867,7 +46461,7 @@ def run_mind_stream_revision_round(
         ] = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="eve-mind-revise") as executor:
             for model, specs in substrate_groups:
-                future_to_group[executor.submit(revise_group, specs)] = (model, specs)
+                future_to_group[eve_tracing.submit(executor, revise_group, specs)] = (model, specs)
             for future in concurrent.futures.as_completed(future_to_group):
                 model, specs = future_to_group[future]
                 try:
@@ -44206,12 +46800,25 @@ def bootstrap_active_mind(
     )
 
 
+def mind_tick_source_is_background(source: object) -> bool:
+    """True when a mind tick should take the compact background path.
+
+    The daemon's own ticks (``daemon``, ``daemon_...``) and the hourly presence
+    cycle it drives (``presence_cycle:daemon``) refresh the active mind with one
+    budgeted planner call instead of the five-lane mind-stream council, its
+    revision round and synthesis.  A manual ``presence cycle`` (any other
+    ``presence_cycle:<source>``) keeps the council so it can still be evaluated.
+    """
+    text = str(source or "")
+    return text.startswith("daemon") or text.startswith("presence_cycle:daemon")
+
+
 def generate_mind_tick(
     config: Dict[str, object],
     source: str,
     max_tokens: int,
 ) -> Dict[str, object]:
-    compact_background_mind = source.startswith("daemon")
+    compact_background_mind = mind_tick_source_is_background(source)
     model = resolve_mind_stream_model(config, "planner") if compact_background_mind else resolve_model(config, "mind_tick")
     think_level = str(config["think_level"])
     host = str(config["ollama_host"])
@@ -44268,40 +46875,41 @@ def generate_mind_tick(
         background_gate_reason = system_background_gate_reason(system_snapshot, "background mind tick", config)
         if not parse_boolish(config.get("daemon_model_mind_tick_enabled", True)):
             background_gate_reason = "model-backed daemon mind ticks are disabled"
+        prompt_measurement: Dict[str, object] = {}
         if not background_gate_reason:
             try:
                 background_model = resolve_mind_stream_model(config, "planner")
+                # Compact daemon prompt: interaction identity line, compact
+                # instruction, optional continuity, current evidence.  No full
+                # identity stack, no supporting system messages.
+                daemon_continuity_context = build_daemon_mind_tick_continuity_message(
+                    previous_mind=previous_mind,
+                    state=state,
+                    threads=threads,
+                    messages=messages,
+                    entries=entries,
+                )
+                daemon_messages = build_daemon_mind_tick_messages(
+                    current_evidence_context,
+                    daemon_continuity_context,
+                    include_continuity=True,
+                )
+                prompt_measurement = measure_daemon_mind_tick_prompt(config, background_model, daemon_messages)
+                prompt_measurement["prompt_trimmed"] = False
+                if int(prompt_measurement.get("prompt_tokens") or 0) > DAEMON_MIND_TICK_PROMPT_TOKEN_CAP:
+                    daemon_messages = build_daemon_mind_tick_messages(
+                        current_evidence_context,
+                        daemon_continuity_context,
+                        include_continuity=False,
+                    )
+                    prompt_measurement = measure_daemon_mind_tick_prompt(config, background_model, daemon_messages)
+                    prompt_measurement["prompt_trimmed"] = True
+                prompt_measurement["prompt_token_cap"] = DAEMON_MIND_TICK_PROMPT_TOKEN_CAP
                 raw = model_chat(
                     config,
                     background_model,
-                    [
-                        *build_eve_identity_system_messages(
-                            include_human_context=False,
-                            include_active_mind=False,
-                            compact=True,
-                        ),
-                        {"role": "system", "content": load_prompt("mind_tick.md")},
-                        *build_supporting_system_messages(
-                            config,
-                            compact=True,
-                            query_text=active_mind_retrieval_query(previous_mind),
-                        ),
-                        *build_system_grounding_messages(prefer_runtime=True, compact=True),
-                        {
-                            "role": "user",
-                            "content": (
-                                "Refresh Eve's short-horizon active mind from this current evidence. "
-                                "Do not manufacture a change; preserve waiting or uncertainty when nothing moved.\n\n"
-                                + shared_context
-                            ),
-                        },
-                    ],
-                    max_tokens=clamp_int(
-                        config.get("daemon_model_mind_tick_max_tokens"),
-                        320,
-                        minimum=160,
-                        maximum=720,
-                    ),
+                    daemon_messages,
+                    max_tokens=structured_mind_tick_tokens(config, None, compact=True),
                     think_level=think_level,
                     operation="daemon_model_mind_tick",
                     timeout_seconds=clamp_int(
@@ -44310,9 +46918,15 @@ def generate_mind_tick(
                         minimum=5,
                         maximum=90,
                     ),
-                    response_schema=mind_tick_response_schema(),
+                    response_schema=mind_tick_response_schema(compact=True),
                 )
                 payload = extract_json_object(raw, label="daemon model mind tick")
+                if not isinstance(payload.get("lanes"), dict):
+                    # The compact schema does not ask for lanes: keep the previous
+                    # active mind's lanes rather than the bootstrap boilerplate.
+                    # merge_active_mind falls through to the bootstrap value and
+                    # then the default only where the previous lane is empty.
+                    payload["lanes"] = dict(previous_mind.get("lanes") or {})
                 current = merge_active_mind(
                     current,
                     {
@@ -44329,6 +46943,7 @@ def generate_mind_tick(
                     "used_fallback": False,
                     "fallback_reason": "",
                     "background_model_tick": True,
+                    **prompt_measurement,
                 }
             except SystemExit as exc:
                 background_gate_reason = f"background model tick failed: {normalize_text_value(exc, fallback='unknown error', limit=180)}"
@@ -44341,6 +46956,7 @@ def generate_mind_tick(
             "used_fallback": True,
             "fallback_reason": background_gate_reason or "background model tick unavailable",
             "background_model_tick": False,
+            **prompt_measurement,
         }
 
     fallback_reason = ""
@@ -44413,7 +47029,7 @@ def generate_mind_tick(
             ] = {}
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="eve-mind") as executor:
                 for model, specs in substrate_groups:
-                    future_to_group[executor.submit(run_group, specs)] = (model, specs)
+                    future_to_group[eve_tracing.submit(executor, run_group, specs)] = (model, specs)
                 for future in concurrent.futures.as_completed(future_to_group):
                     model, specs = future_to_group[future]
                     try:
@@ -44498,6 +47114,21 @@ def generate_mind_tick(
                 prior_mind=current,
                 stream_errors=stream_errors,
             )
+            # Budgeted model synthesis: only when her lanes are measurably in
+            # budget, and only over summary/lane prose; the executive's focus,
+            # next step, threads, and provenance above are never overridden.
+            synthesis = budgeted_mind_stream_model_synthesis(
+                config,
+                packets,
+                deterministic_payload=payload,
+                current_evidence_context=current_evidence_context,
+                lane_models=lane_models,
+                turn_id=turn_id,
+                source=source,
+                system_snapshot=system_snapshot,
+            )
+            if synthesis.get("admitted") and isinstance(synthesis.get("overlay"), dict):
+                payload = {**payload, **synthesis["overlay"]}
             current = merge_active_mind(
                 current,
                 {
@@ -44730,6 +47361,10 @@ def run_mind_tick(
             "fallback_reason": record.get("fallback_reason") or "",
             "current_focus": final_mind.get("current_focus"),
             "next_step": final_mind.get("next_step"),
+            "background_model_tick": bool(record.get("background_model_tick")),
+            "prompt_tokens": record.get("prompt_tokens"),
+            "prompt_tokens_exact": bool(record.get("prompt_tokens_exact")),
+            "prompt_trimmed": bool(record.get("prompt_trimmed")),
         },
     )
     return record
@@ -45610,7 +48245,7 @@ def generate_self_awareness_report(
             "token_budget": min(max(requested_max_tokens, 900), 1100),
             "operation": "self_awareness_micro",
             "label": "primary_micro",
-            "timeout_cap_seconds": min(30, timeout_seconds),
+            "timeout_cap_seconds": min(90, timeout_seconds),
         },
         {
             "model": model,
@@ -45619,13 +48254,17 @@ def generate_self_awareness_report(
             "token_budget": min(max(requested_max_tokens, 1100), 1400),
             "operation": "self_awareness_full",
             "label": "full_context",
-            "timeout_cap_seconds": min(50, timeout_seconds),
+            "timeout_cap_seconds": min(150, timeout_seconds),
         },
     ]
 
     for attempt in token_attempts:
         if time.perf_counter() >= overall_deadline:
             infrastructure_errors.append("Self-awareness check hit its overall time budget before all attempts completed.")
+            last_error = infrastructure_errors[-1]
+            break
+        if attempt["label"] == "full_context" and remaining_deadline_seconds(overall_deadline) < 60:
+            infrastructure_errors.append("Skipped full-context attempt: under 60 s of budget left.")
             last_error = infrastructure_errors[-1]
             break
         attempt_model = normalize_model_name(attempt["model"]) or model
@@ -45763,7 +48402,10 @@ def generate_self_awareness_report(
         except SystemExit as exc:
             last_error = str(exc)
 
-    should_use_deterministic_fallback = payload is None or bool(problems)
+    # A pure infrastructure failure (no model output at all) must surface as
+    # infrastructure, not as a fabricated fallback report that reads as drift.
+    infrastructure_only_failure = payload is None and not raw_response and bool(infrastructure_errors)
+    should_use_deterministic_fallback = (payload is None or bool(problems)) and not infrastructure_only_failure
     if should_use_deterministic_fallback:
         fallback_payload = build_deterministic_self_awareness_payload(human_context, autonomy_state, validation_evidence)
         fallback_problems = self_awareness_test_problems(
@@ -45907,6 +48549,34 @@ def format_self_awareness_report(record: Dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+UPGRADE_REVIEW_SELF_WRITTEN_COMPONENTS = {"success_patterns"}
+
+
+def upgrade_review_disposition(
+    snapshot: Dict[str, object],
+    state: Dict[str, object],
+    config: Dict[str, object],
+) -> str:
+    """Decide whether a new behaviour snapshot deserves a self-awareness review now.
+
+    Returns "self_written" when every changed component is data Eve writes in
+    normal operation, "wait" when a real upgrade landed but a self-awareness
+    probe already ran inside its interval, and "review" otherwise.
+    """
+    components = {
+        normalize_text_value(item, fallback="", limit=60)
+        for item in (snapshot.get("changed_components") if isinstance(snapshot, dict) else []) or []
+    }
+    components.discard("")
+    external = components - UPGRADE_REVIEW_SELF_WRITTEN_COMPONENTS
+    if components and not external:
+        return "self_written"
+    interval_minutes = max(1, int(config.get("self_awareness_interval_minutes") or 180))
+    if not interval_due(state.get("last_self_awareness_test_at"), interval_minutes):
+        return "wait"
+    return "review"
+
+
 def run_self_awareness_test(
     config: Dict[str, object],
     source: str,
@@ -45934,6 +48604,19 @@ def run_self_awareness_test(
         metadata["scores"] = scores
     rank = record.get("rank") if isinstance(record.get("rank"), dict) else rank_self_awareness_record(record)
     metadata["rank"] = rank
+    # Non-leaky calibration probe: the report scored its own groundedness
+    # without seeing the measured action log, so comparing the two afterwards
+    # tests whether Eve's self-assessment tracks what she actually did.
+    try:
+        calibration = self_awareness_competence_calibration(
+            record,
+            action_executions=read_action_executions(limit=40, since_days=14, prefer_runtime=True),
+            outcomes=read_outcomes(limit=40, since_days=30),
+        )
+    except Exception as exc:
+        calibration = {"available": False, "error": normalize_text_value(exc, fallback="calibration failed", limit=160)}
+    metadata["competence_calibration"] = calibration
+    record["competence_calibration"] = calibration
     append_entry(
         (
             "self_awareness_test_passed"
@@ -45949,6 +48632,53 @@ def run_self_awareness_test(
     state["last_self_awareness_test_at"] = record.get("tested_at") or utc_now()
     save_state(state)
     return record
+
+
+def self_awareness_competence_calibration(
+    record: Dict[str, object],
+    *,
+    action_executions: Optional[Iterable[Dict[str, object]]],
+    outcomes: Optional[Iterable[Dict[str, object]]],
+) -> Dict[str, object]:
+    """Compare the report's self-scored groundedness with measured competence.
+
+    Expected band by measured verified ratio: >=0.85 -> 4-5, 0.6-0.85 -> 3-4,
+    <0.6 -> 1-3. The report never saw these measurements (they are not in the
+    evidence bundle), so agreement is calibration, not copying.
+    """
+    payload = record.get("report") if isinstance(record.get("report"), dict) else {}
+    scores = self_awareness_scorecard(payload)
+    competence = measured_competence_summary(action_executions, outcomes)
+    self_score = scores.get("groundedness")
+    ratio = competence.get("verified_ratio")
+    if self_score is None or ratio is None:
+        return {
+            "available": False,
+            "self_groundedness": self_score,
+            "measured_verified_ratio": ratio,
+            "action_total": competence.get("action_total"),
+            "non_leaky": True,
+            "reason": "no self-score or no measured actions in the window",
+        }
+    if float(ratio) >= 0.85:
+        band = (4, 5)
+    elif float(ratio) >= 0.6:
+        band = (3, 4)
+    else:
+        band = (1, 3)
+    calibrated = band[0] <= int(self_score) <= band[1]
+    direction = "calibrated" if calibrated else ("overconfident" if int(self_score) > band[1] else "underconfident")
+    return {
+        "available": True,
+        "self_groundedness": int(self_score),
+        "measured_verified_ratio": float(ratio),
+        "action_total": int(competence.get("action_total") or 0),
+        "verified_total": int(competence.get("verified_total") or 0),
+        "expected_band": list(band),
+        "calibrated": bool(calibrated),
+        "direction": direction,
+        "non_leaky": True,
+    }
 
 
 def normalize_confidence_value(value: object) -> Optional[float]:
@@ -50387,7 +53117,7 @@ def generate_model_exercise_report(
         thread_name_prefix="eve-model-exercise",
     ) as executor:
         future_to_group = {
-            executor.submit(
+            eve_tracing.submit(executor,
                 run_substrate_group,
                 lane_names,
             ): (model, lane_names)
@@ -52469,6 +55199,25 @@ def ollama_message_content(body: Dict[str, object]) -> tuple[str, str, str]:
     return content, thinking, failure_kind
 
 
+LLAMA_CPP_TRUNCATION_RETRY_MAX_TOKENS = 2048
+
+
+def normalize_model_text(value: object, limit: int = 12000) -> str:
+    """Bound a model's answer without destroying the shape it wrote.
+
+    normalize_text_value collapses every run of whitespace, which is right for a one-line summary and
+    wrong for the transport: it flattened every reflection, proposal and code answer into a single
+    line, so headings and bullets could not be read back by anything (2026-09-19).
+    """
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.rstrip() for line in text.split("\n")]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)[:limit]
+
+
 def llama_cpp_message_content(body: Dict[str, object]) -> tuple[str, str, str]:
     choices = body.get("choices") if isinstance(body.get("choices"), list) else []
     first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
@@ -52481,8 +55230,13 @@ def llama_cpp_message_content(body: Dict[str, object]) -> tuple[str, str, str]:
             if isinstance(item, dict) and normalize_text_value(item.get("text"), fallback="", limit=4000)
         ).strip()
     else:
-        content = normalize_text_value(content_value or first_choice.get("text"), fallback="", limit=12000)
+        content = normalize_model_text(content_value or first_choice.get("text"), limit=12000)
     failure_kind = "" if content else "empty_response"
+    # A reply cut off by max_tokens is not a reply: every model mind tick failed this way for
+    # weeks because the 320-token JSON ended mid-object and nobody looked at finish_reason.
+    finish_reason = str(first_choice.get("finish_reason") or "").strip().lower()
+    if content and finish_reason == "length":
+        failure_kind = "truncated"
     return content, "", failure_kind
 
 
@@ -52492,6 +55246,82 @@ def llama_cpp_request_headers(config: Dict[str, object]) -> Dict[str, str]:
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     return headers
+
+
+PROMPT_OPTIONAL_PRIORITY_FIELD = "_prompt_optional_priority"
+
+
+def mark_prompt_message_optional(
+    message: Dict[str, object],
+    *,
+    priority: int,
+) -> Dict[str, object]:
+    """Mark one context message as reclaimable by the central prompt preflight."""
+
+    tagged = dict(message)
+    tagged[PROMPT_OPTIONAL_PRIORITY_FIELD] = max(0, int(priority))
+    return tagged
+
+
+def mark_prompt_messages_optional(
+    messages: Iterable[Dict[str, object]],
+    *,
+    priority: int,
+) -> List[Dict[str, object]]:
+    return [mark_prompt_message_optional(message, priority=priority) for message in messages]
+
+
+def llama_cpp_prompt_fallback_context_tokens(
+    config: Dict[str, object],
+    model: Optional[str],
+) -> int:
+    """Return the configured per-slot context used only if live measurement fails."""
+
+    spec = llama_cpp_profile_spec_for_model(config, model) or {}
+    try:
+        total_context = max(0, int(spec.get("ctx_size") or 0))
+    except (TypeError, ValueError):
+        total_context = 0
+    try:
+        parallel_slots = max(1, int(spec.get("parallel_slots") or 1))
+    except (TypeError, ValueError):
+        parallel_slots = 1
+    return total_context // parallel_slots if total_context else 0
+
+
+def prompt_fit_event_metadata(
+    evidence: Dict[str, object],
+    *,
+    model: str,
+    host: str,
+    attempt: str,
+) -> Dict[str, object]:
+    """Whitelist content-free prompt-fit evidence before persistence/tracing."""
+
+    allowed_fields = (
+        "schema_id",
+        "status",
+        "measurement_source",
+        "exact_measurement",
+        "context_tokens",
+        "prompt_budget_tokens",
+        "prompt_tokens_before",
+        "prompt_tokens_after",
+        "max_output_tokens",
+        "safety_tokens",
+        "trimmed_message_indices",
+        "removed_message_indices",
+        "required_message_indices",
+        "final_user_preserved",
+        "content_persisted",
+    )
+    return {
+        "backend": "llama_cpp",
+        "model": model,
+        "host": host,
+        "attempt": attempt,
+        **{key: evidence.get(key) for key in allowed_fields if key in evidence},
+    }
 
 
 def llama_cpp_compatible_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -52599,6 +55429,7 @@ def ollama_chat(
         request_think: bool,
         attempt: str,
         recovered_from: str = "",
+        timeout_override: Optional[int] = None,
     ) -> tuple[Dict[str, object], float]:
         payload = {
             "model": model,
@@ -52617,6 +55448,9 @@ def ollama_chat(
             method="POST",
         )
         request_timeout = max(1, deadline - time.perf_counter())
+        if timeout_override:
+            # A retry that asks for more tokens gets more clock than the original deadline allowed.
+            request_timeout = max(request_timeout, float(timeout_override))
         started = time.perf_counter()
         try:
             with request.urlopen(req, timeout=request_timeout) as resp:
@@ -52824,8 +55658,58 @@ def llama_cpp_chat(
         request_max_tokens: int,
         attempt: str,
         recovered_from: str = "",
+        timeout_override: Optional[int] = None,
     ) -> tuple[Dict[str, object], float]:
-        prepared_messages = llama_cpp_compatible_messages(request_messages)
+        optional_priorities: Dict[int, int] = {}
+        for index, message in enumerate(request_messages):
+            if not isinstance(message, dict) or PROMPT_OPTIONAL_PRIORITY_FIELD not in message:
+                continue
+            try:
+                optional_priorities[index] = int(message[PROMPT_OPTIONAL_PRIORITY_FIELD])
+            except (TypeError, ValueError):
+                continue
+        required_indices = set(range(len(request_messages))) - set(optional_priorities)
+        fit_started = time.perf_counter()
+        try:
+            fitted_messages, fit_evidence = eve_prompt_budget.fit_messages(
+                host,
+                request_messages,
+                max_tokens=request_max_tokens,
+                required_indices=required_indices,
+                optional_priorities=optional_priorities,
+                fallback_context_tokens=llama_cpp_prompt_fallback_context_tokens(config, model),
+            )
+        except eve_prompt_budget.PromptFitError as exc:
+            append_perf_event(
+                "prompt_fit",
+                operation,
+                (time.perf_counter() - fit_started) * 1000,
+                ok=False,
+                metadata={
+                    "backend": "llama_cpp",
+                    "model": model,
+                    "host": host,
+                    "attempt": attempt,
+                    "message_count": len(request_messages),
+                    "optional_message_count": len(optional_priorities),
+                    "content_persisted": False,
+                    "error_kind": "required_prompt_exceeds_budget",
+                },
+            )
+            raise SystemExit(f"Eve's required prompt does not fit the resident lane: {exc}") from exc
+        append_perf_event(
+            "prompt_fit",
+            operation,
+            (time.perf_counter() - fit_started) * 1000,
+            ok=True,
+            metadata=prompt_fit_event_metadata(
+                fit_evidence,
+                model=model,
+                host=host,
+                attempt=attempt,
+            ),
+        )
+        prepared_messages = llama_cpp_compatible_messages(fitted_messages)
         payload = {
             "model": model,
             "messages": prepared_messages,
@@ -52835,6 +55719,10 @@ def llama_cpp_chat(
                 llama_cpp_profile_config_value(config, model, "cache_prompt", True)
             ),
         }
+        # Judges and the closed-world author run near-greedy so the same text
+        # gets the same verdict; server defaults with a random seed added label
+        # noise (identical sentences admitted once and rejected the next time).
+        payload.update(operation_sampling_overrides(operation))
         chat_template_kwargs = llama_cpp_chat_template_kwargs(config, model)
         if chat_template_kwargs:
             payload["chat_template_kwargs"] = chat_template_kwargs
@@ -52850,6 +55738,9 @@ def llama_cpp_chat(
         elif prefers_json_response(operation):
             payload["response_format"] = {"type": "json_object"}
         request_timeout = max(1, deadline - time.perf_counter())
+        if timeout_override:
+            # A retry that asks for more tokens gets more clock than the original deadline allowed.
+            request_timeout = max(request_timeout, float(timeout_override))
         started = time.perf_counter()
         try:
             body = post_json_url(url, payload, timeout=request_timeout, headers=headers or None)
@@ -52931,6 +55822,23 @@ def llama_cpp_chat(
 
     primary_body, primary_duration_ms = perform_request(messages, max_tokens, attempt="primary")
     content, _, failure_kind = llama_cpp_message_content(primary_body)
+    attempt_label = "primary"
+    if content and failure_kind == "truncated" and max_tokens < LLAMA_CPP_TRUNCATION_RETRY_MAX_TOKENS:
+        # The answer was cut off by max_tokens. One retry with a larger budget; if that one is
+        # whole, it is the answer. Structured operations (mind ticks, critics) cannot use a
+        # half-emitted JSON object, and prose callers are better served by a finished thought.
+        larger = min(LLAMA_CPP_TRUNCATION_RETRY_MAX_TOKENS, max(max_tokens * 2, max_tokens + 256))
+        # More tokens need more clock: the first retries all timed out because the budget grew and
+        # the deadline did not (observed 2026-09-18 on the reflection path).
+        retry_timeout = max(int(timeout_seconds), int(timeout_seconds * (larger / max(1, max_tokens))) + 15)
+        try:
+            retry_body, retry_duration_ms = perform_request(messages, larger, attempt="truncation_retry", recovered_from="truncated", timeout_override=retry_timeout)
+        except SystemExit:
+            retry_body, retry_duration_ms = {}, 0.0
+        retry_content, _, retry_failure_kind = llama_cpp_message_content(retry_body)
+        if retry_content and retry_failure_kind != "truncated":
+            append_perf_event("model_call", operation, primary_duration_ms, ok=False, metadata={"operation": operation, "backend": "llama_cpp", "model": model, "host": host, "max_tokens": max_tokens, "attempt": "primary", "error": "truncated"})
+            content, failure_kind, primary_duration_ms, max_tokens, attempt_label = retry_content, "", retry_duration_ms, larger, "truncation_retry"
     if content:
         append_perf_event(
             "model_call",
@@ -52944,8 +55852,9 @@ def llama_cpp_chat(
                 "host": host,
                 "message_count": len(messages),
                 "max_tokens": max_tokens,
-                "attempt": "primary",
+                "attempt": attempt_label,
                 "response_chars": len(content),
+                "truncated": failure_kind == "truncated",
             },
         )
         return content
@@ -53062,6 +55971,9 @@ def evaluate_model_governor(
         }
 
 
+@eve_tracing.traced(lambda: OPERATIONAL_DB_PATH, "model.chat", category="model",
+                    attributes=lambda config, model, *args, **kwargs: {"model_alias": model, "gen_ai.operation.name": "chat"},
+                    outcome=lambda result: bool(result))
 def model_chat(
     config: Dict[str, object],
     model: str,
@@ -53285,6 +56197,9 @@ def execute_shell_tool(args: Dict[str, object], config: Dict[str, object]) -> Di
     command = str(args.get("command") or "").strip()
     if not command:
         raise SystemExit("The shell tool requires a non-empty `command`.")
+    claim_block = coordination_claim_block(coder_command_named_paths(command, config), config, command=command, cwd=str(ROOT))
+    if claim_block:
+        return claim_block
     timeout_seconds = clamp_int(
         args.get("timeout_seconds"),
         int(config["tool_shell_timeout_seconds"]),
@@ -53385,6 +56300,9 @@ def execute_read_file_tool(args: Dict[str, object], config: Dict[str, object]) -
 
 def execute_write_file_tool(args: Dict[str, object], config: Dict[str, object]) -> Dict[str, object]:
     path = resolve_tool_path(args.get("path"), config)
+    claim_block = coordination_claim_block([str(path)], config, path=str(path))
+    if claim_block:
+        return claim_block
     content = str(args.get("content") or "")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -53406,11 +56324,18 @@ def execute_search_text_tool(args: Dict[str, object], config: Dict[str, object])
     limit = clamp_int(args.get("limit"), int(config["tool_search_max_matches"]), minimum=1, maximum=200)
     timeout_seconds = clamp_int(args.get("timeout_seconds"), 30, minimum=1, maximum=300)
     cmd = [resolve_executable_path("rg"), "-n", "--hidden", "--no-heading", "--color", "never"]
+    # Her runtime state, ledgers, models and environments are not source; searching them
+    # timed out a whole coder session once (rg over gigabytes of .eve JSONL).
+    for skip in ("!.eve/**", "!.git/**", "!.venv*/**", "!vendor/**", "!EveBackups/**", "!models/**", "!**/*.jsonl", "!**/*.gguf"):
+        cmd.extend(["--glob", skip])
     glob = str(args.get("glob") or "").strip()
     if glob:
         cmd.extend(["--glob", glob])
     cmd.extend([pattern, str(path)])
-    result = run_local_command(cmd, timeout=timeout_seconds)
+    try:
+        result = run_local_command(cmd, timeout=timeout_seconds)
+    except SystemExit as exc:
+        return {"ok": False, "pattern": pattern, "path": str(path), "error": normalize_text_value(exc, fallback="search failed", limit=200), "hint": "narrow the path or glob; Eve's state and model directories are excluded by default"}
     matches = result.stdout.splitlines()
     ok = result.returncode in {0, 1}
     return {
@@ -53553,6 +56478,26 @@ def execute_web_search_tool(args: Dict[str, object], config: Dict[str, object]) 
     }
 
 
+def self_authority_tool_edge(tool_name: str, args: Dict[str, object], config: Dict[str, object]) -> str:
+    """The four edges, applied to a tool call. Empty when the call is hers to make."""
+    if not parse_boolish(config.get("self_authority_enabled", True)):
+        return ""
+    workspace = configured_tool_workspace_root(config)
+    if tool_name == "shell":
+        reason = eve_self_authority.command_edge_reason(str(args.get("command") or ""), config, cwd=workspace)
+        return f"Outside Eve's authority: {reason}." if reason else ""
+    if tool_name == "write_file":
+        reason = eve_self_authority.path_write_problem(args.get("path"), config, cwd=workspace)
+        return f"Outside Eve's authority: {reason}." if reason else ""
+    if tool_name == "read_file":
+        text = str(args.get("path") or "")
+        probe = Path(text).expanduser()
+        posix = (probe if probe.is_absolute() else workspace / probe).resolve().as_posix()
+        if any(re.search(pattern, posix) for pattern in eve_self_authority.CREDENTIAL_PATH_PATTERNS):
+            return "Outside Eve's authority: credential files are the user's."
+    return ""
+
+
 def execute_capability_tool(tool_name: str, args: Dict[str, object], config: Dict[str, object]) -> Dict[str, object]:
     dispatch = {
         "shell": execute_shell_tool,
@@ -53566,6 +56511,9 @@ def execute_capability_tool(tool_name: str, args: Dict[str, object], config: Dic
     tool = dispatch.get(tool_name)
     if tool is None:
         return {"ok": False, "error": f"Unknown tool `{tool_name}`."}
+    edge = self_authority_tool_edge(tool_name, args, config)
+    if edge:
+        return {"ok": False, "blocked": True, "edge": True, "error": edge}
     try:
         return tool(args, config)
     except SystemExit as exc:
@@ -54768,10 +57716,17 @@ def coder_tool_specs() -> List[Dict[str, str]]:
     ]
 
 
+def coder_tool_specs_with_self_authority(config: Optional[Dict[str, object]] = None) -> List[Dict[str, str]]:
+    specs = list(coder_tool_specs())
+    if parse_boolish((config or {}).get("self_authority_enabled", True)):
+        specs.extend(self_authority_tool_specs())
+    return specs
+
+
 def format_coder_tool_specs() -> str:
     return "\n".join(
         f"- {spec['name']}: {spec['description']} Example args: {spec['args']}"
-        for spec in coder_tool_specs()
+        for spec in coder_tool_specs_with_self_authority()
     )
 
 
@@ -54831,6 +57786,8 @@ def coder_workspace_path_problem(raw_path: object, config: Optional[Dict[str, ob
         return f"path escapes or touches git internals: {text}"
     if candidate.parts and candidate.parts[0] == ".eve":
         return f"coder patches may not edit Eve runtime state under .eve: {text}"
+    if candidate.as_posix() in eve_self_authority.PROTECTED_RELATIVE:
+        return f"Eve's audit trail and rollback are not hers to alter: {text}"
     try:
         resolved_root = coder_workspace_root(config)
         resolved = (resolved_root / candidate).resolve()
@@ -54838,6 +57795,148 @@ def coder_workspace_path_problem(raw_path: object, config: Optional[Dict[str, ob
     except (OSError, ValueError):
         return f"path is outside the Eve workspace: {text}"
     return ""
+
+
+COORDINATION_CLAIMS_RELATIVE = "coordination/claims.json"
+# Commands that only read what they name; a claim is a lock on editing, not on looking.
+COORDINATION_READ_ONLY_COMMANDS = {"cat", "head", "tail", "less", "more", "wc", "grep", "rg", "ls", "stat", "file", "diff", "md5", "shasum", "cksum", "find", "awk", "cut", "sort", "uniq"}
+COORDINATION_READ_ONLY_GIT = {"status", "diff", "log", "show", "blame", "ls-files", "grep", "rev-parse", "branch", "describe"}
+
+
+def coordination_self_session(config: Optional[Dict[str, object]] = None) -> str:
+    """The session id Eve acts under on the coordination board; her own claims never block her."""
+    return normalize_text_value((config or {}).get("_self_change_session"), fallback="eve", limit=120) or "eve"
+
+
+def load_coordination_claims(config: Optional[Dict[str, object]] = None) -> Dict[str, Dict[str, object]]:
+    """Active claims on the shared board (bin/codex_coord.py); a released claim is gone from the file."""
+    path = coder_workspace_root(config) / COORDINATION_CLAIMS_RELATIVE
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {str(session): claim for session, claim in payload.items() if isinstance(claim, dict)}
+
+
+def coordination_claim_covers(claimed: object, rel_path: object) -> bool:
+    """Whether one claimed entry (a file, a directory, or a glob like eve_*.py) covers a workspace-relative path."""
+    pattern = str(claimed or "").strip().strip("/")
+    if pattern.startswith("./"):
+        pattern = pattern[2:]
+    target = str(rel_path or "").strip().strip("/")
+    if not pattern or not target:
+        return False
+    if pattern == ".":
+        return True
+    if target == pattern or target.startswith(pattern + "/"):
+        return True
+    if any(ch in pattern for ch in "*?["):
+        return fnmatch.fnmatchcase(target, pattern)
+    return False
+
+
+def coordination_claim_relative_path(raw_path: object, config: Optional[Dict[str, object]] = None) -> str:
+    """A path a tool is about to touch, relative to the coder workspace; empty when it lies outside it."""
+    text = normalize_git_diff_path(raw_path)
+    if not text:
+        return ""
+    root = coder_workspace_root(config)
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        return candidate.resolve().relative_to(root).as_posix()
+    except (OSError, ValueError):
+        return ""
+
+
+def coordination_claim_holder(paths: Sequence[object], config: Optional[Dict[str, object]] = None) -> Tuple[str, str]:
+    """(session, path) for the first active claim by another session covering one of these paths, else ("", "")."""
+    effective = config if isinstance(config, dict) else {}
+    if not parse_boolish(effective.get("coordination_claims_enforced", True)):
+        return "", ""
+    claims = load_coordination_claims(effective)
+    if not claims:
+        return "", ""
+    self_session = coordination_self_session(effective)
+    for raw in paths:
+        rel = coordination_claim_relative_path(raw, effective)
+        if not rel:
+            continue
+        for session, claim in sorted(claims.items()):
+            holder = str(claim.get("session") or session)
+            if session == self_session or holder == self_session:
+                continue
+            files = claim.get("files") if isinstance(claim.get("files"), list) else []
+            if any(coordination_claim_covers(claimed, rel) for claimed in files):
+                return holder, rel
+    return "", ""
+
+
+def coordination_claim_block(targets: Sequence[object], config: Optional[Dict[str, object]] = None, **extra: object) -> Optional[Dict[str, object]]:
+    """The tool result that defers an edit under another session's claim, or None when the targets are free."""
+    holder, rel = coordination_claim_holder(targets, config)
+    if not holder:
+        return None
+    result: Dict[str, object] = {
+        "ok": False,
+        "blocked": True,
+        "deferred_claim": holder,
+        "reason": f"claimed_by_{holder}",
+        "claimed_path": rel,
+        "error": f"claimed by {holder} until released",
+    }
+    result.update(extra)
+    return result
+
+
+def coder_command_named_paths(command: object, config: Optional[Dict[str, object]] = None) -> List[str]:
+    """Workspace paths a shell command names as arguments or redirect targets; pure readers are skipped."""
+    text = str(command or "")
+    root = coder_workspace_root(config)
+    named: List[str] = []
+
+    def consider(token: str) -> None:
+        if not token or token.startswith("&") or token in {"/dev/null", ".", "./", "-", "--"}:
+            return
+        probe = eve_self_authority._glob_base(token)
+        if not probe or probe == ".":
+            return
+        candidate = Path(probe).expanduser()
+        resolved = candidate if candidate.is_absolute() else root / candidate
+        has_suffix = bool(Path(probe).suffix) and len(Path(probe).suffix) <= 8
+        if resolved.exists() or ("/" not in probe and has_suffix):
+            named.append(probe)
+            return
+        # A file that does not exist yet counts when it would land inside an existing workspace directory
+        # (touch bin/new.py under a claim on bin); a sed expression like s/a/b/ lands nowhere.
+        ancestor = resolved.parent
+        while not ancestor.exists() and ancestor != ancestor.parent:
+            ancestor = ancestor.parent
+        try:
+            inside = ancestor.resolve().relative_to(root)
+        except (OSError, ValueError):
+            return
+        if "/" in probe and str(inside) != ".":
+            named.append(probe)
+
+    for match in eve_self_authority.REDIRECT_RE.finditer(text):
+        consider(match.group(3))
+    for segment in eve_self_authority._segments(text):
+        name = eve_self_authority._command_name(segment)
+        args = eve_self_authority._args_after_command(segment)
+        if name in COORDINATION_READ_ONLY_COMMANDS:
+            continue
+        if name == "git":
+            sub = next((a for a in args if not eve_self_authority._is_option(a)), "")
+            if sub in COORDINATION_READ_ONLY_GIT:
+                continue
+        for arg in args:
+            if eve_self_authority._path_like(arg):
+                consider(arg)
+    return unique_compact(named, limit=80)
 
 
 def coder_patch_paths(patch_text: object) -> List[str]:
@@ -54874,22 +57973,25 @@ def validate_coder_patch(patch_text: object, config: Dict[str, object]) -> Tuple
     return True, "", paths
 
 
-def coder_command_block_reason(command: object) -> str:
+def coder_command_block_reason(command: object, config: Optional[Dict[str, object]] = None, *, cwd: Optional[Path] = None) -> str:
+    """Why coder mode refuses a command. Under self-authority the only refusals are the four edges."""
     text = str(command or "").strip()
     if not text:
         return "Command is empty."
-    for pattern, reason in CODER_BLOCKED_COMMAND_PATTERNS:
-        if re.search(pattern, text, flags=re.IGNORECASE):
-            return reason
-    for pattern, reason in CODER_PROTECTED_PATH_PATTERNS:
-        if re.search(pattern, text, flags=re.IGNORECASE):
-            return f"{reason} Use a narrow approved capability instead of coder-mode shell access."
+    effective = config if isinstance(config, dict) else {}
+    if not parse_boolish(effective.get("self_authority_enabled", True)):
+        for pattern, reason in CODER_BLOCKED_COMMAND_PATTERNS:
+            if re.search(pattern, text):
+                return reason
+    reason = eve_self_authority.command_edge_reason(text, effective, cwd=cwd)
+    if reason:
+        return f"Outside Eve's authority: {reason}."
     return ""
 
 
 def run_coder_shell_command(command: str, config: Dict[str, object], *, timeout_seconds: Optional[int] = None) -> Dict[str, object]:
     workspace_root = coder_workspace_root(config)
-    blocked_reason = coder_command_block_reason(command)
+    blocked_reason = coder_command_block_reason(command, config, cwd=workspace_root)
     if blocked_reason:
         return {
             "ok": False,
@@ -54898,6 +58000,9 @@ def run_coder_shell_command(command: str, config: Dict[str, object], *, timeout_
             "cwd": str(workspace_root),
             "error": blocked_reason,
         }
+    claim_block = coordination_claim_block(coder_command_named_paths(command, config), config, command=command, cwd=str(workspace_root))
+    if claim_block:
+        return claim_block
     timeout = clamp_int(
         timeout_seconds,
         int(config.get("code_command_timeout_seconds") or DEFAULT_CONFIG["code_command_timeout_seconds"]),
@@ -54935,9 +58040,57 @@ def run_coder_shell_command(command: str, config: Dict[str, object], *, timeout_
     }
 
 
+def backup_paths_for_rollback(paths: List[str], config: Dict[str, object]) -> List[str]:
+    """Copy the files a patch will touch into the self-change backup dir so the change can be undone."""
+    backup_dir = str(config.get("_self_change_backup_dir") or "")
+    if not backup_dir:
+        return []
+    root = coder_workspace_root(config)
+    saved: List[str] = []
+    for rel in paths:
+        source = root / rel
+        if not source.exists() or not source.is_file():
+            continue
+        target = Path(backup_dir) / rel
+        if target.exists():
+            continue  # keep the first (pre-change) copy
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            saved.append(rel)
+        except OSError:
+            continue
+    return saved
+
+
+def restore_paths_from_backup(backup_dir: object, config: Dict[str, object]) -> List[str]:
+    """Undo a self-change: put every backed-up file back where it was."""
+    base = Path(str(backup_dir or "")).expanduser()
+    if not base.is_dir():
+        return []
+    root = coder_workspace_root(config)
+    restored: List[str] = []
+    for source in base.rglob("*"):
+        if not source.is_file():
+            continue
+        rel = source.relative_to(base)
+        try:
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, root / rel)
+            restored.append(rel.as_posix())
+        except OSError:
+            continue
+    return restored
+
+
 def execute_coder_apply_patch_tool(args: Dict[str, object], config: Dict[str, object]) -> Dict[str, object]:
     patch_text = str(args.get("patch") or "")
     valid, problem, paths = validate_coder_patch(patch_text, config)
+    if valid:
+        claim_block = coordination_claim_block(paths, config, paths=paths)
+        if claim_block:
+            return claim_block
+        backup_paths_for_rollback(paths, config)
     if not valid:
         return {"ok": False, "blocked": True, "error": problem, "paths": paths}
 
@@ -54983,6 +58136,16 @@ def execute_coder_apply_patch_tool(args: Dict[str, object], config: Dict[str, ob
 
 
 def execute_coder_tool(tool_name: str, args: Dict[str, object], config: Dict[str, object]) -> Dict[str, object]:
+    """Dispatch one coder tool; a tool that raises becomes a failed tool result, not a dead session."""
+    try:
+        return _execute_coder_tool_inner(tool_name, args, config)
+    except SystemExit as exc:
+        return {"ok": False, "error": normalize_text_value(exc, fallback="tool failed", limit=300), "tool": tool_name}
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return {"ok": False, "error": normalize_text_value(exc, fallback="tool failed", limit=300), "tool": tool_name}
+
+
+def _execute_coder_tool_inner(tool_name: str, args: Dict[str, object], config: Dict[str, object]) -> Dict[str, object]:
     tool_config = coder_tool_config(config)
     if tool_name == "run_command":
         return run_coder_shell_command(
@@ -55019,6 +58182,8 @@ def execute_coder_tool(tool_name: str, args: Dict[str, object], config: Dict[str
                 "error": "apply_patch is disabled for this coder-mode run.",
             }
         return execute_coder_apply_patch_tool(args, config)
+    if tool_name in SELF_AUTHORITY_TOOL_NAMES and parse_boolish(config.get("self_authority_enabled", True)):
+        return execute_self_authority_tool(tool_name, args, config)
     return {"ok": False, "error": f"Unknown coder tool `{tool_name}`."}
 
 
@@ -59374,7 +62539,9 @@ def finalize_action_result_contract(
 
 
 def operational_action_input_supported_actions() -> Set[str]:
-    return set(supported_commitment_action_descriptions().keys()) | set(LOCAL_APP_OPEN_ACTIONS)
+    # Execution supports more than conversational promises. Keep the existing
+    # bounded fly runners reachable without making them chat commitments.
+    return set(supported_commitment_action_descriptions().keys()) | set(LOCAL_APP_OPEN_ACTIONS) | set(FLY_PROBE_ACTIONS) | set(BODY_ACTIONS)
 
 
 def finalize_action_input_contract(
@@ -59979,6 +63146,23 @@ def validate_codex_independent_handoff_result_contract(result: Dict[str, object]
     )
 
 
+def validate_fly_probe_result_contract(result: Dict[str, object]) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
+    issues: List[Dict[str, object]] = []
+    for key in ("executed", "ok"):
+        if type(result.get(key)) is not bool:
+            issues.append(action_contract_issue(key, "not_boolean"))
+    if result.get("probe") not in FLY_PROBE_ACTIONS.values():
+        issues.append(action_contract_issue("probe", "unknown_probe"))
+    if result.get("executed") and not isinstance(result.get("evidence"), dict):
+        issues.append(action_contract_issue("evidence", "not_object"))
+    if result.get("ok") is True and result.get("returncode", 0) != 0:
+        issues.append(action_contract_issue("returncode", "contradicts_success"))
+    return finalize_action_result_contract(
+        result, schema_id="fly_probe_result.v1", issues=issues,
+        updates={"ok": result.get("ok") is True and not issues},
+    ), issues
+
+
 def apply_operational_action_result_contract(
     action: str,
     result: Dict[str, object],
@@ -59998,7 +63182,7 @@ def apply_operational_action_result_contract(
         "agent_capability_integration": validate_agent_capability_integration_result_contract,
         "codex_independent_handoff": validate_codex_independent_handoff_result_contract,
     }
-    validator = validate_open_local_app_result_contract if action in LOCAL_APP_OPEN_ACTIONS else validators.get(action)
+    validator = validate_body_action_result_contract if action in BODY_ACTIONS else validate_fly_probe_result_contract if action in FLY_PROBE_ACTIONS else validate_open_local_app_result_contract if action in LOCAL_APP_OPEN_ACTIONS else validators.get(action)
     if validator is None:
         return result
     validated, issues = validator(result)
@@ -61162,6 +64346,502 @@ def run_bounded_capability_tryout(
     return result
 
 
+def load_fly_body_world(
+    config: Optional[Dict[str, object]] = None,
+    *,
+    max_age_seconds: float = 90.0,
+) -> Dict[str, object]:
+    """Read the live body's world state (food distance, threat, behaviour, intent) and the organ's mode.
+
+    Source of truth is the body loop's own status file plus the organ's status. Hunger is a
+    distance-to-food need (the body has no energy store yet); threat is the larger of attack
+    progress and the connectome's escape readout. Stale or missing files read as unavailable.
+    """
+    effective_config = config or {}
+    lab = Path(str(effective_config.get("fly_lab_path") or FLY_LAB_DEFAULT_PATH)).expanduser()
+    status_path = lab / "renders" / "live_status.json"
+    result: Dict[str, object] = {"available": False, "lab_path": str(lab), "hunger": 0.0, "threat": 0.0}
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+        age = max(0.0, time.time() - float(payload.get("ts") or status_path.stat().st_mtime))
+    except (OSError, ValueError, TypeError):
+        return result
+    world = payload.get("world") if isinstance(payload.get("world"), dict) else {}
+    signals = payload.get("signals") if isinstance(payload.get("signals"), dict) else {}
+    behavior = payload.get("behavior") if isinstance(payload.get("behavior"), dict) else {}
+    attack = world.get("attack") if isinstance(world.get("attack"), dict) else None
+    food_dist = world.get("food_dist")
+    try:
+        food_dist = float(food_dist) if food_dist is not None else None
+    except (TypeError, ValueError):
+        food_dist = None
+    hunger = world.get("hunger")
+    if not isinstance(hunger, (int, float)):
+        hunger = max(0.0, min(1.0, (food_dist - 0.45) / 20.0)) if food_dist is not None else 0.0
+    threat = world.get("threat")
+    if not isinstance(threat, (int, float)):
+        threat = max(float(attack.get("progress") or 0.0) if attack else 0.0, min(1.0, float(signals.get("escape") or 0.0) / 0.3))
+    learned_valence = signals.get("learned_valence")
+    restarts_recent = 0
+    try:
+        for line in (lab / "supervisor.log").read_text(encoding="utf-8").splitlines()[-40:]:
+            row = json.loads(line)
+            if row.get("event") == "restart" and row.get("what") in {"body", "organ"}:
+                moment = parse_iso_datetime(str(row.get("ts") or "") + "+00:00")
+                if moment is not None and (datetime.now(timezone.utc) - moment).total_seconds() <= 900:
+                    restarts_recent += 1
+    except (OSError, ValueError):
+        pass
+    result.update(
+        {
+            "available": age <= max_age_seconds,
+            "age_seconds": round(age, 1),
+            "food_dist": round(food_dist, 3) if food_dist is not None else None,
+            "hunger": round(float(hunger), 3),
+            "threat": round(float(threat), 3),
+            "attack": attack,
+            "behavior": normalize_text_value(behavior.get("name"), fallback="", limit=40),
+            "speed": behavior.get("speed"),
+            "intent": world.get("intent") if isinstance(world.get("intent"), dict) else None,
+            "organ_mode": normalize_text_value(payload.get("organ_mode"), fallback="", limit=20),
+            "episode": payload.get("episode"),
+            "fly_xy": payload.get("fly_xy"),
+            "escape": signals.get("escape"),
+            "feeding": signals.get("feeding"),
+            "learned_valence": learned_valence,
+            "restarts_recent": restarts_recent,
+            "updated_at": payload.get("ts"),
+        }
+    )
+    return result
+
+
+def body_world_summary(world: Dict[str, object]) -> str:
+    if not world.get("available"):
+        return "Fly body status is unavailable or stale."
+    attack = world.get("attack") if isinstance(world.get("attack"), dict) else None
+    intent = world.get("intent") if isinstance(world.get("intent"), dict) else None
+    return normalize_text_value(
+        f"Body {world.get('behavior') or 'unknown'} at speed {world.get('speed') or 0}; food distance {world.get('food_dist')}; "
+        f"hunger {world.get('hunger')}, threat {world.get('threat')}"
+        + (f" (attack from the {attack.get('side')} at {attack.get('progress')})" if attack else "")
+        + (f"; intent {intent.get('behavior')} {'applied' if intent.get('applied') else 'pending'}" if intent else "; no intent")
+        + (f"; learned valence {float(world.get('learned_valence')):.2f}" if isinstance(world.get("learned_valence"), (int, float)) else "")
+        + (f"; {world.get('restarts_recent')} body/organ restart(s) in 15 min" if world.get("restarts_recent") else ""),
+        fallback="Fly body status recorded.",
+        limit=320,
+    )
+
+
+BODY_INTENT_SOURCE_EPOCH = str(uuid.uuid4())
+
+
+def post_fly_organ_drive(config: Dict[str, object], channels: Dict[str, float], *, source: str, hold_ticks: int = 40, ttl_s: float = 20.0, base_url: Optional[str] = None) -> Dict[str, object]:
+    base = base_url or re.sub(r"/status/?$", "", str(config.get("fly_body_brain_url") or FLY_BODY_BRAIN_DEFAULT_URL).rstrip("/"))
+    status = json.loads(request.urlopen(base + "/status", timeout=5).read().decode("utf-8"))
+    body = json.dumps(
+        {
+            "channels": {k: float(v) for k, v in channels.items()},
+            "hold_ticks": int(hold_ticks),
+            "source": source,
+            "source_epoch": BODY_INTENT_SOURCE_EPOCH,
+            "command_id": str(uuid.uuid4()),
+            "ttl_s": float(ttl_s),
+            "expected_epoch": status.get("epoch"),
+        }
+    ).encode("utf-8")
+    drive_request = request.Request(base + "/drive", data=body, headers={"Content-Type": "application/json"})
+    return json.loads(request.urlopen(drive_request, timeout=5).read().decode("utf-8"))
+
+
+ACTION_BLOCKS_PATH = APP_DIR / "action_blocks.json"
+SELF_CHANGE_LEDGER_PATH = APP_DIR / "self_change_ledger.jsonl"
+SELF_CHANGE_DIR = APP_DIR / "self_change"
+SELF_AUTHORITY_TOOL_NAMES = ("set_config", "block_action", "update_pattern", "approve_maintenance", "request_restart", "record_change")
+# The suites a self-written code change must pass before it is synced and restarted on.
+SELF_CHANGE_VERIFICATION_SUITES = (
+    "tests.test_cognition_budget",
+    "tests.test_self_authority",
+    "tests.test_cli_parser",
+    "tests.test_llama_transport",
+    "tests.test_eve_core_contract",
+    "tests.test_core_self_change",
+    "tests.test_core_conversation",
+    "tests.test_core_preflight",
+    "tests.test_architecture_boundaries",
+)
+# Keys Eve may not set through set_config: the edges themselves, and anything that is a credential.
+SELF_CONFIG_LOCKED_KEYS = {"self_authority_enabled", "self_authority_extra_roots", "coordination_claims_enforced"}
+SELF_CONFIG_CREDENTIAL_RE = re.compile(r"(secret|token|password|api_key|apikey|credential)", re.I)
+
+
+SELF_CHANGE_CONTEXT: Dict[str, object] = {}
+
+
+SELF_CHANGE_PROPOSAL_TITLE_PREFIXES = ("proposal", "repair ", "review cleanup", "capability gap:", "restore ", "promote ")
+
+
+PROPOSAL_LINEAGE_HEADING = "grounded in"
+PROPOSAL_ROLLBACK_HEADING = "rollback"
+TRACKER_ID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
+
+
+PROPOSAL_CONVERSATIONAL_OPENERS = ("okay,", "ok,", "sure,", "certainly", "you've", "you have", "you're", "you are", "let's", "lets ", "great question", "that's a", "here's a", "here is a", "i'd be happy", "absolutely")
+# A real proposal states a change: either the drafted template's sections, or the structured shape
+# the follow-up generators write ("Suggested next steps", "Current degraded signals", ...).
+PROPOSAL_REQUIRED_SECTION_HINTS = (
+    "why now", "exact change", "expected benefit", "rollback", "approval recommendation", "risks",
+    "suggested next steps", "suggested upstream repairs", "current degraded signals",
+    "current cleanup scan", "pattern at risk", "verification:", "acquisition plan",
+)
+
+
+def fly_organ_base_urls(config: Dict[str, object]) -> List[str]:
+    """The anatomical organ (the body's nervous system) and the grown mushroom body (her larger memory)."""
+    urls: List[str] = []
+    for key, default in (("fly_body_brain_url", FLY_BODY_BRAIN_DEFAULT_URL), ("fly_grown_organ_url", FLY_GROWN_ORGAN_DEFAULT_URL)):
+        base = re.sub(r"/status/?$", "", str(config.get(key) or default).rstrip("/"))
+        if base and base not in urls:
+            urls.append(base)
+    return urls
+
+
+def post_fly_memory_write(config: Dict[str, object], ok: bool, *, context: str) -> Dict[str, object]:
+    """Write one verified outcome into the fly's memory.
+
+    A success becomes a dopamine reward pulse and a failure a punishment pulse on every live organ; the
+    organs' reward-gated KC->MBON plasticity binds that valence to the odour context the body is in now,
+    so what Eve learned about this moment is stored in the synapses her body reads from. Failures to
+    reach an organ are recorded, never raised.
+    """
+    channel = "dopamine_reward" if ok else "dopamine_punish"
+    receipts: List[Dict[str, object]] = []
+    for base in fly_organ_base_urls(config):
+        try:
+            receipt = post_fly_organ_drive(config, {channel: BODY_MEMORY_WRITE_GAIN}, source="eve_memory_write", hold_ticks=10, ttl_s=5.0, base_url=base)
+            receipts.append({"organ": base, "ok": True, "receipt": receipt if isinstance(receipt, dict) else {}})
+        except Exception as exc:
+            receipts.append({"organ": base, "ok": False, "error": normalize_text_value(exc, fallback="organ drive failed", limit=160)})
+    return {"channel": channel, "gain": BODY_MEMORY_WRITE_GAIN, "context": normalize_text_value(context, fallback="", limit=200), "organs": receipts, "written": sum(1 for item in receipts if item.get("ok"))}
+
+
+def body_action_consequence(behavior: str, before: Dict[str, object], after: Dict[str, object]) -> Tuple[bool, str, str]:
+    """Judge a body action by what changed in the body's world, never by compliance with the intent.
+
+    Returns (ok, detail, kind). kind is "need_regulated" when a need fell or was met, "compliance"
+    when the body did what was asked but no need was at stake (rest, explore), and "no_consequence"
+    otherwise. Only need regulation teaches the fly's memory; a body running because it was told to
+    run is not an escape, and a body holding still is not relief.
+    """
+    if not after.get("available"):
+        return False, "no fresh body status after the action", "no_consequence"
+    def num(world: Dict[str, object], key: str) -> Optional[float]:
+        value = world.get(key)
+        return float(value) if isinstance(value, (int, float)) else None
+    if behavior == "approach_food":
+        hb, ha = num(before, "hunger"), num(after, "hunger")
+        db, da = num(before, "food_dist"), num(after, "food_dist")
+        if da is not None and da <= BODY_AT_FOOD_DISTANCE:
+            return True, f"the body reached the food (distance {da:.2f})", "need_regulated"
+        if hb is not None and ha is not None and (hb - ha) >= BODY_NEED_RELIEF_MIN:
+            return True, f"hunger fell {hb:.2f} -> {ha:.2f} (food distance {db} -> {da})", "need_regulated"
+        return False, f"hunger did not fall ({hb} -> {ha}; food distance {db} -> {da})", "no_consequence"
+    if behavior == "escape":
+        tb, ta = num(before, "threat") or 0.0, num(after, "threat") or 0.0
+        if tb < BODY_ESCAPE_THREAT_MIN:
+            return False, f"no threat was present (threat {tb:.2f}); running is not an escape", "no_consequence"
+        if ta <= tb - 0.1:
+            return True, f"threat fell {tb:.2f} -> {ta:.2f}", "need_regulated"
+        return False, f"threat did not fall ({tb:.2f} -> {ta:.2f})", "no_consequence"
+    if behavior == "rest":
+        speed = num(after, "speed")
+        if speed is not None and speed <= 0.05:
+            return True, "the body complied and is still (compliance, no need regulated)", "compliance"
+        return False, f"the body did not settle (speed {speed})", "no_consequence"
+    if behavior == "explore":
+        b, a = before.get("fly_xy"), after.get("fly_xy")
+        if isinstance(b, (list, tuple)) and isinstance(a, (list, tuple)) and len(b) >= 2 and len(a) >= 2:
+            moved = math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+            if moved >= 0.3:
+                return True, f"the body complied and moved {moved:.2f} (compliance, no need regulated)", "compliance"
+            return False, f"the body barely moved ({moved:.2f})", "no_consequence"
+        return False, "no position to compare", "no_consequence"
+    return False, f"unknown behavior {behavior}", "no_consequence"
+
+
+def body_action_is_needed(action: str, body_world: Optional[Dict[str, object]]) -> bool:
+    """A body action belongs on a menu only when the body has that need; rest and explore only for a calm body."""
+    world = body_world if isinstance(body_world, dict) else {}
+    if not world.get("available"):
+        return False
+    hunger = float(world.get("hunger") or 0.0)
+    threat = float(world.get("threat") or 0.0)
+    behavior = BODY_ACTIONS.get(action, "")
+    if behavior == "escape":
+        return threat >= BODY_ESCAPE_THREAT_MIN
+    if behavior == "approach_food":
+        return hunger >= BODY_APPROACH_HUNGER_MIN
+    if behavior in ("rest", "explore"):
+        return threat < BODY_ESCAPE_THREAT_MIN and hunger < BODY_CALM_HUNGER_MAX
+    return False
+
+
+def body_world_snapshot(world: Dict[str, object]) -> Dict[str, object]:
+    keys = ("available", "hunger", "threat", "food_dist", "behavior", "speed", "fly_xy", "updated_at", "escape", "feeding")
+    return {key: world.get(key) for key in keys if key in world}
+
+
+def load_body_standing_intent() -> Dict[str, object]:
+    try:
+        payload = json.loads(BODY_STANDING_INTENT_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_body_standing_intent(record: Dict[str, object]) -> None:
+    try:
+        BODY_STANDING_INTENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = BODY_STANDING_INTENT_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(record, indent=1), encoding="utf-8")
+        tmp.replace(BODY_STANDING_INTENT_PATH)
+    except OSError:
+        pass
+
+
+def write_body_intent_file(config: Dict[str, object], behavior: str, *, ttl_s: float, source: str) -> Path:
+    lab = Path(str(config.get("fly_lab_path") or FLY_LAB_DEFAULT_PATH)).expanduser()
+    intent_path = lab / "mind" / "intent.json"
+    intent = {"behavior": behavior, "issued_at": time.time(), "ttl_s": float(ttl_s), "source": source, "expected": {"consequence": behavior}}
+    intent_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = intent_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(intent), encoding="utf-8")
+    tmp.replace(intent_path)
+    return intent_path
+
+
+def sync_standing_body_intent(config: Dict[str, object], conscious_state: Dict[str, object], body_world: Optional[Dict[str, object]], *, now: Optional[float] = None) -> Dict[str, object]:
+    """Hold the kernel's selected body intention in the body until its consequence arrives.
+
+    Called on every workspace tick. When the kernel's selected intention is a need-regulating body
+    action (approach food, escape), the body receives a standing intent with a short ttl that this
+    tick refreshes; reflexes keep precedence in the body. An episode ends when the selection changes,
+    the body goes away, or its budget runs out, and is judged by the need falling; that verdict is
+    written into the fly's memory. The free-run pulses remain separate, bounded checks.
+    """
+    now_ts = float(now if now is not None else time.time())
+    action_model = conscious_state.get("action_model") if isinstance(conscious_state, dict) and isinstance(conscious_state.get("action_model"), dict) else {}
+    selected = action_model.get("selected_intention") if isinstance(action_model.get("selected_intention"), dict) else {}
+    behavior = BODY_ACTIONS.get(str(selected.get("id") or ""), "") if str(selected.get("source") or "") == "embodiment" else ""
+    if behavior not in BODY_STANDING_INTENT_BEHAVIORS:
+        behavior = ""
+    world = body_world if isinstance(body_world, dict) else {}
+    current = load_body_standing_intent()
+    summary: Dict[str, object] = {"behavior": behavior, "standing": False, "last_completed_at": current.get("last_completed_at")}
+    active = str(current.get("behavior") or "")
+    if active and not behavior and world.get("available"):
+        # Commitment: an intention the kernel stopped naming mid-way is carried until its need is
+        # met (the food reached, the threat gone) or the episode budget ends. The kernel's selection
+        # flickers between cycles; the body should not turn back a step from the food.
+        hunger = float(world.get("hunger") or 0.0)
+        threat = float(world.get("threat") or 0.0)
+        food_dist = world.get("food_dist")
+        if active == "approach_food" and isinstance(food_dist, (int, float)) and float(food_dist) > BODY_AT_FOOD_DISTANCE and hunger > 0.0:
+            behavior = active
+            summary.update({"behavior": behavior, "carried": True})
+        elif active == "escape" and threat >= BODY_ESCAPE_THREAT_MIN:
+            behavior = active
+            summary.update({"behavior": behavior, "carried": True})
+    if active:
+        episode_started = float(current.get("episode_started_at") or now_ts)
+        budget_spent = now_ts - episode_started >= BODY_STANDING_INTENT_EPISODE_SECONDS
+        if active != behavior or not world.get("available") or budget_spent:
+            ok, detail, kind = body_action_consequence(active, current.get("world_at_start") or {}, world if world.get("available") else {"available": False})
+            elapsed = now_ts - episode_started
+            memory_write: Dict[str, object] = {"channel": None, "written": 0, "skipped": "no body status"}
+            if world.get("available") and kind != "compliance":
+                memory_write = post_fly_memory_write(config, ok, context=f"standing {active}: {detail}")
+            reason = "budget spent, same need still selected" if (budget_spent and active == behavior and world.get("available")) else ("body status lost" if not world.get("available") else "intention changed")
+            append_entry(
+                "body_standing_intent_completed",
+                f"Standing body intent {active} ended after {elapsed:.0f}s ({reason}): {detail}.",
+                metadata={"source": "workspace", "behavior": active, "ok": bool(ok), "consequence_kind": kind, "elapsed_seconds": round(elapsed, 1), "refresh_count": int(current.get("refresh_count") or 0), "memory_write": memory_write.get("written"), "reason": reason},
+            )
+            completed_at = utc_now()
+            if budget_spent and active == behavior and world.get("available"):
+                current = {"behavior": behavior, "started_at": current.get("started_at") or now_ts, "episode_started_at": now_ts, "world_at_start": body_world_snapshot(world), "refresh_count": int(current.get("refresh_count") or 0), "episodes": int(current.get("episodes") or 1) + 1, "last_completed_at": completed_at, "last_outcome": {"ok": bool(ok), "detail": detail, "kind": kind}}
+            else:
+                current = {"behavior": "", "last_completed_at": completed_at, "last_outcome": {"behavior": active, "ok": bool(ok), "detail": detail, "kind": kind}}
+            save_body_standing_intent(current)
+            summary["last_completed_at"] = completed_at
+    if behavior and world.get("available"):
+        if not current.get("behavior"):
+            current = {**{k: v for k, v in current.items() if k in ("last_completed_at", "last_outcome")}, "behavior": behavior, "started_at": now_ts, "episode_started_at": now_ts, "world_at_start": body_world_snapshot(world), "refresh_count": 0, "episodes": 1}
+            append_entry("body_standing_intent_started", f"Standing body intent {behavior}: {body_world_summary(world)}.", metadata={"source": "workspace", "behavior": behavior})
+        try:
+            write_body_intent_file(config, behavior, ttl_s=float(BODY_STANDING_INTENT_TTL_SECONDS), source="eve_kernel_standing")
+        except OSError as exc:
+            summary["error"] = normalize_text_value(exc, fallback="could not write the body intent", limit=160)
+            return summary
+        try:
+            post_fly_organ_drive(config, BODY_ACTION_NEUROMODULATORS.get(behavior, {}), source="eve_kernel_standing", hold_ticks=int(BODY_STANDING_INTENT_TTL_SECONDS * 20), ttl_s=float(BODY_STANDING_INTENT_TTL_SECONDS))
+        except Exception as exc:
+            summary["organ_drive_error"] = normalize_text_value(exc, fallback="organ drive failed", limit=160)
+        current["refresh_count"] = int(current.get("refresh_count") or 0) + 1
+        current["refreshed_at"] = now_ts
+        current["last_world"] = body_world_snapshot(world)
+        save_body_standing_intent(current)
+        summary.update({"standing": True, "since": current.get("started_at"), "episode_started_at": current.get("episode_started_at"), "refresh_count": current["refresh_count"], "episodes": current.get("episodes"), "ttl_s": BODY_STANDING_INTENT_TTL_SECONDS})
+    return summary
+
+
+def run_bounded_body_action(
+    action: str,
+    config: Dict[str, object],
+    *,
+    source: str,
+) -> Dict[str, object]:
+    """Execute one body action selected by Eve's kernel and measure its consequence.
+
+    Writes mind/intent.json for the live body (reflexes keep precedence there), sends the matching
+    neuromodulators to the organ, waits, and compares the body's world before and after. The result
+    is true only when the world changed the way the action intends; a held intent is not success.
+    """
+    behavior = BODY_ACTIONS.get(action, "")
+    lab = Path(str(config.get("fly_lab_path") or FLY_LAB_DEFAULT_PATH)).expanduser()
+    if not behavior:
+        return {"executed": False, "ok": False, "summary": f"Unknown body action {action}.", "behavior": behavior, "evidence": {}, "metadata": {"source": source}}
+    before = load_fly_body_world(config)
+    if not before.get("available"):
+        return {"executed": False, "ok": False, "summary": "The fly body is not live; no body action was taken.", "behavior": behavior, "evidence": {"before": before}, "metadata": {"source": source}}
+    hunger = float(before.get("hunger") or 0.0)
+    threat = float(before.get("threat") or 0.0)
+    if behavior == "escape" and threat < BODY_ESCAPE_THREAT_MIN:
+        return {"executed": False, "ok": False, "summary": f"No threat is present (threat {threat:.2f}); there is nothing to escape, so the body was left alone.", "behavior": behavior, "evidence": {"before": before}, "metadata": {"source": source}}
+    if behavior == "approach_food" and hunger < BODY_APPROACH_HUNGER_MIN:
+        return {"executed": False, "ok": False, "summary": f"The body is not hungry (hunger {hunger:.2f}); no approach was needed, so the body was left alone.", "behavior": behavior, "evidence": {"before": before}, "metadata": {"source": source}}
+    observe_seconds = clamp_int(config.get("body_action_observe_seconds"), 8, minimum=2, maximum=60)
+    intent = {"behavior": behavior, "ttl_s": float(observe_seconds + 12), "source": source, "expected": {"consequence": behavior}}
+    try:
+        write_body_intent_file(config, behavior, ttl_s=float(observe_seconds + 12), source=source)
+    except OSError as exc:
+        return {"executed": False, "ok": False, "summary": f"Could not write the body intent: {exc}", "behavior": behavior, "evidence": {"before": before}, "metadata": {"source": source}}
+    drive_receipt: Dict[str, object] = {}
+    try:
+        drive_receipt = post_fly_organ_drive(config, BODY_ACTION_NEUROMODULATORS.get(behavior, {}), source="eve_kernel_intent", hold_ticks=int(observe_seconds * 20), ttl_s=float(observe_seconds + 2))
+    except Exception as exc:
+        drive_receipt = {"ok": False, "error": normalize_text_value(exc, fallback="organ drive failed", limit=160)}
+    time.sleep(observe_seconds)
+    after = load_fly_body_world(config)
+    ok, detail, kind = body_action_consequence(behavior, before, after)
+    # Only need regulation teaches the fly's memory; compliance is not an outcome.
+    if kind == "compliance":
+        memory_write: Dict[str, object] = {"channel": None, "written": 0, "skipped": "compliance is not a need outcome"}
+    else:
+        memory_write = post_fly_memory_write(config, bool(ok), context=f"{behavior}: {detail}")
+    # A bounded pulse must not leave the body without its standing intent.
+    standing = load_body_standing_intent()
+    if standing.get("behavior") and standing.get("behavior") != behavior:
+        try:
+            write_body_intent_file(config, str(standing["behavior"]), ttl_s=float(BODY_STANDING_INTENT_TTL_SECONDS), source="eve_kernel_standing")
+        except OSError:
+            pass
+    summary = normalize_text_value(f"Body {behavior}: {detail}.", fallback=f"Body {behavior} completed.", limit=300)
+    return {
+        "executed": True,
+        "ok": bool(ok),
+        "summary": summary,
+        "response": summary,
+        "behavior": behavior,
+        "consequence_kind": kind,
+        "evidence": {"before": before, "after": after, "intent": intent, "organ_drive": drive_receipt, "memory_write": memory_write, "observe_seconds": observe_seconds},
+        "measurement": {"schema_id": "eve.body_action_measurement.v1", "valid": bool(after.get("available")), "metrics": {"food_dist_before": before.get("food_dist"), "food_dist_after": after.get("food_dist"), "threat_before": before.get("threat"), "threat_after": after.get("threat"), "behavior_after": after.get("behavior")}},
+        "returncode": 0,
+        "metadata": {"source": source, "lab_path": str(lab)},
+    }
+
+
+def validate_body_action_result_contract(result: Dict[str, object]) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
+    issues: List[Dict[str, object]] = []
+    for key in ("executed", "ok"):
+        if type(result.get(key)) is not bool:
+            issues.append(action_contract_issue(key, "not_boolean"))
+    if result.get("behavior") not in BODY_ACTIONS.values():
+        issues.append(action_contract_issue("behavior", "unknown_behavior"))
+    if result.get("executed") and not isinstance(result.get("evidence"), dict):
+        issues.append(action_contract_issue("evidence", "not_object"))
+    return finalize_action_result_contract(
+        result, schema_id="body_action_result.v1", issues=issues,
+        updates={"ok": result.get("ok") is True and not issues},
+    ), issues
+
+
+def run_bounded_fly_probe(
+    action: str,
+    config: Dict[str, object],
+    *,
+    source: str,
+) -> Dict[str, object]:
+    """Run one bounded fly-lab probe (~/Documents/eve-fly/fly_probe.py) and return its typed JSON result.
+
+    The probes drive the signed-connectome organ, the live body, or read lab artifacts. They never touch Eve
+    memory, routing, or services; the runner only executes, times out, and records what the probe reported.
+    """
+    probe = FLY_PROBE_ACTIONS.get(action, "")
+    lab = Path(str(config.get("fly_lab_path") or FLY_LAB_DEFAULT_PATH)).expanduser()
+    script = lab / "fly_probe.py"
+    if not probe or not script.exists():
+        return {"executed": False, "ok": False, "summary": f"Fly lab probe runner not available at {script}.", "probe": probe, "metadata": {"source": source}}
+    timeout = clamp_int(config.get("fly_probe_timeout_seconds"), 240, minimum=30, maximum=900)
+    decoder_artifact = lab / "bc" / "eval.json"
+    decoder_before = b""
+    if probe == "decoder":
+        try:
+            if decoder_artifact.resolve().is_relative_to(lab.resolve()) and decoder_artifact.stat().st_size <= 2_000_000:
+                decoder_before = decoder_artifact.read_bytes()
+        except OSError:
+            pass
+    started = time.time()
+    try:
+        completed = subprocess.run(["python3", str(script), probe], cwd=str(lab), capture_output=True, text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return {"executed": True, "ok": False, "summary": f"Fly {probe} probe timed out after {timeout}s.", "probe": probe, "metadata": {"source": source}}
+    lines = [line for line in (completed.stdout or "").splitlines() if line.startswith("{")]
+    try:
+        payload = json.loads(lines[-1]) if lines else {}
+    except json.JSONDecodeError:
+        payload = {}
+    if not isinstance(payload, dict) or not payload:
+        return {"executed": True, "ok": False, "summary": f"Fly {probe} probe returned no result ({(completed.stderr or completed.stdout or '')[-160:]}).", "probe": probe, "evidence": {}, "metadata": {"source": source}}
+    summary = normalize_text_value(payload.get("summary"), fallback=f"Fly {probe} probe completed.", limit=400)
+    measurement: Dict[str, object] = {}
+    if probe == "decoder":
+        measurement = {"schema_id": "eve.decoder_measurement.v1", "valid": False, "metrics": {}}
+        try:
+            if (completed.returncode == 0 and decoder_before
+                    and decoder_artifact.resolve().is_relative_to(lab.resolve())
+                    and Path(str(payload.get("artifact_path") or "")).resolve() == decoder_artifact.resolve()
+                    and decoder_artifact.stat().st_size <= 2_000_000
+                    and decoder_before == decoder_artifact.read_bytes()):
+                measurement = eve_recurrent_cognition.decoder_artifact_measurement(
+                    json.loads(decoder_before), payload.get("evidence"), hashlib.sha256(decoder_before).hexdigest())
+        except (OSError, ValueError):
+            pass
+    return {
+        "executed": True,
+        "ok": payload.get("ok"),
+        "summary": summary,
+        "response": summary,
+        "probe": probe,
+        "evidence": payload.get("evidence"),
+        "measurement": measurement,
+        "returncode": completed.returncode,
+        "artifact_path": normalize_text_value(payload.get("artifact_path"), fallback="", limit=260),
+        "wall_ms": round((time.time() - started) * 1000, 1),
+        "metadata": {"source": source, "lab": str(lab)},
+    }
+
+
 def run_direct_operational_action(
     action: str,
     config: Dict[str, object],
@@ -61169,7 +64849,11 @@ def run_direct_operational_action(
     source: str,
 ) -> Dict[str, object]:
     raw_result: Dict[str, object]
-    if action == "openclaw_self_test":
+    if action in BODY_ACTIONS:
+        raw_result = run_bounded_body_action(action, config, source=source)
+    elif action in FLY_PROBE_ACTIONS:
+        raw_result = run_bounded_fly_probe(action, config, source=source)
+    elif action == "openclaw_self_test":
         raw_result = run_bounded_openclaw_self_test(config, source=source)
     elif action == "openclaw_log_check":
         raw_result = run_bounded_openclaw_log_check(config, source=source)
@@ -61421,6 +65105,10 @@ def operational_action_verification(
     action: str,
     result: Dict[str, object],
 ) -> Tuple[bool, str]:
+    if action in BODY_ACTIONS:
+        return bool(result.get("ok")), normalize_text_value(result.get("summary"), fallback="Body action completed.", limit=220)
+    if action in FLY_PROBE_ACTIONS:
+        return bool(result.get("ok")), normalize_text_value(result.get("summary"), fallback="Fly probe completed.", limit=220)
     if action == "openclaw_self_test":
         ok = bool(result.get("status_ok") and result.get("sync_ok") and result.get("diagnose_ok"))
         detail = normalize_text_value(
@@ -61627,6 +65315,9 @@ def record_operational_action_execution(record: Dict[str, object]) -> Dict[str, 
     return saved
 
 
+@eve_tracing.traced(lambda: OPERATIONAL_DB_PATH, "tool.execution", category="tool",
+                    attributes={"gen_ai.operation.name": "execute_tool"},
+                    outcome=lambda result: True if action_result_verified_for_completion(result) else False if result.get("ok") is False else None)
 def run_operational_action_tree(
     action: str,
     config: Dict[str, object],
@@ -64023,7 +67714,7 @@ def _run_model_driven_bounded_action_council(
                         "prior_attempt": prior_attempt or {},
                     }
                 )
-            future = executor.submit(
+            future = eve_tracing.submit(executor,
                 _run_model_driven_bounded_action_vote,
                 config,
                 **vote_kwargs,
@@ -64656,37 +68347,15 @@ def cmd_chat(args: argparse.Namespace) -> int:
         tensions = []
         experiments = []
     session_id = str(uuid.uuid4())
-    try:
-        chat_epistemic_frame = build_epistemic_perception_frame(
-            config,
-            args.prompt,
-            lesion=private_lesion_learned_epistemic,
-            lesion_event=private_lesion_epistemic_event,
-            allow_candidate_event=bool(getattr(args, "private_audit", False)),
-            thread_messages=[],
-        )
-    except Exception:
-        chat_epistemic_frame = (
-            eve_epistemic.lesioned_frame()
-            if private_lesion_learned_epistemic
-            else eve_epistemic.build_frame(args.prompt)
-        )
-    chat_conscious_state: Dict[str, object] = {}
-    try:
-        chat_conscious_state = build_recurrent_conscious_state(
-            source="chat_private_preflight" if getattr(args, "private_audit", False) else "chat_preflight",
-            inbound=args.prompt,
-            persist=not bool(getattr(args, "private_audit", False)),
-            learned_epistemic_enabled=not private_lesion_learned_epistemic,
-            epistemic_frame_override=chat_epistemic_frame,
-        )
-    except Exception as exc:
-        if not getattr(args, "private_audit", False):
-            append_entry(
-                "conscious_cycle_preflight_failed",
-                f"Chat continued after conscious-cycle preflight failed: {normalize_text_value(exc, fallback='unknown error', limit=220)}",
-                metadata={"session_id": session_id},
-            )
+    from eve_adapters.preflight import prepare_chat_preflight
+
+    chat_preflight = prepare_chat_preflight(
+        config, args.prompt, session_id=session_id,
+        private_audit=bool(getattr(args, "private_audit", False)),
+        lesion=private_lesion_learned_epistemic, lesion_event=private_lesion_epistemic_event,
+    )
+    chat_epistemic_frame = chat_preflight.epistemic_frame
+    chat_conscious_state = chat_preflight.conscious_state
 
     if getattr(args, "private_audit", False):
         if private_integrated_guards:
@@ -65166,14 +68835,17 @@ def cmd_chat(args: argparse.Namespace) -> int:
             if not closed_world_evidence:
                 inner_state_brief = build_inner_state_brief_message()
                 if inner_state_brief is not None:
-                    messages.append(inner_state_brief)
+                    messages.append(mark_prompt_message_optional(inner_state_brief, priority=4))
             if not isolate_self_state:
                 messages.extend(
-                    build_supporting_system_messages(
-                        config,
-                        compact=True,
-                        query_text=args.prompt,
-                        context_route=context_route,
+                    mark_prompt_messages_optional(
+                        build_supporting_system_messages(
+                            config,
+                            compact=True,
+                            query_text=args.prompt,
+                            context_route=context_route,
+                        ),
+                        priority=3,
                     )
                 )
             private_turn_contract_message = reply_turn_contract_system_message(private_turn_contract)
@@ -65182,8 +68854,14 @@ def cmd_chat(args: argparse.Namespace) -> int:
             if not isolate_self_state:
                 messages.extend(
                     [
-                        {"role": "system", "content": build_context_message(recent_entries)},
-                        {"role": "system", "content": build_tracker_context_message(tensions, experiments)},
+                        mark_prompt_message_optional(
+                            {"role": "system", "content": build_context_message(recent_entries)},
+                            priority=1,
+                        ),
+                        mark_prompt_message_optional(
+                            {"role": "system", "content": build_tracker_context_message(tensions, experiments)},
+                            priority=1,
+                        ),
                     ]
                 )
             messages.append({"role": "user", "content": args.prompt})
@@ -66094,13 +69772,16 @@ def cmd_chat(args: argparse.Namespace) -> int:
         if not closed_world_turn:
             inner_state_brief = build_inner_state_brief_message()
             if inner_state_brief is not None:
-                messages.append(inner_state_brief)
+                messages.append(mark_prompt_message_optional(inner_state_brief, priority=4))
             messages.extend(
-                build_supporting_system_messages(
-                    config,
-                    compact=True,
-                    query_text=args.prompt,
-                    context_route=context_route,
+                mark_prompt_messages_optional(
+                    build_supporting_system_messages(
+                        config,
+                        compact=True,
+                        query_text=args.prompt,
+                        context_route=context_route,
+                    ),
+                    priority=3,
                 )
             )
         chat_turn_contract_message = reply_turn_contract_system_message(
@@ -66113,11 +69794,17 @@ def cmd_chat(args: argparse.Namespace) -> int:
         if not closed_world_turn:
             messages.extend(
                 [
-                    {"role": "system", "content": build_context_message(recent_entries)},
-                    {
-                        "role": "system",
-                        "content": build_tracker_context_message(tensions, experiments),
-                    },
+                    mark_prompt_message_optional(
+                        {"role": "system", "content": build_context_message(recent_entries)},
+                        priority=1,
+                    ),
+                    mark_prompt_message_optional(
+                        {
+                            "role": "system",
+                            "content": build_tracker_context_message(tensions, experiments),
+                        },
+                        priority=1,
+                    ),
                 ]
             )
         messages.append({"role": "user", "content": args.prompt})
@@ -66342,7 +70029,58 @@ def continuous_thought_history_is_grounded(entry: object) -> bool:
     if not isinstance(entry, dict):
         return False
     metadata = entry.get("metadata")
-    return bool(isinstance(metadata, dict) and metadata.get("grounded") is True)
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get("used_fallback") or metadata.get("skipped_model"):
+        return False
+    return bool(metadata.get("model_path_grounded") is True or metadata.get("grounded") is True)
+
+
+def continuous_thought_causal_overclaim(text: object) -> bool:
+    """Same-sentence version of the reply-path causal detector for the thought boundary.
+
+    The shared detector spans up to 180 characters across sentence ends, so
+    "my selected goal is X. The packet shows a goal created at <time>" read as
+    "goal ... creates" and rejected every honest restatement of the packet.
+    Here the window is one sentence and the packet's own participles
+    ("created at", "completed at", "updated at") are not effect verbs.
+    """
+    lowered = normalized_turn_text(text)
+    lowered = re.sub(r"\b(?:created|completed|updated|selected|recorded)\s+(?:at|on|earlier)\b", " ", lowered)
+    lowered = re.sub(r"\bdoes not imply\b.{0,60}", " ", lowered)
+    for sentence in re.split(r"(?<=[.!?;])\s+", lowered):
+        if reply_invents_unsupported_inner_state_causal_explanation(sentence):
+            return True
+    return False
+
+
+def continuous_thought_misattaches_status_to_completed_action(text: object) -> bool:
+    """"The last verified action was X completed at T. It has not started." contradicts itself."""
+    lowered = normalized_turn_text(text)
+    for sentence in re.split(r"(?<=[.!?])\s+", lowered):
+        if re.search(r"\bcompleted\b", sentence) and re.search(r"\b(?:has not|hasn't|not yet) (?:been )?started\b", sentence):
+            return True
+    sentences = re.split(r"(?<=[.!?])\s+", lowered)
+    for prev, nxt in zip(sentences, sentences[1:]):
+        if re.search(r"\bcompleted (?:at|earlier|on)\b", prev) and re.match(r"\s*it (?:has not|hasn't) started", nxt):
+            return True
+    return False
+
+
+def continuous_thought_proposes_action(text: object) -> bool:
+    """Proposals and intentions are first-person commitments the packet never supplies.
+
+    The critic rejected "I propose to continue recurrent inquiry" every time while
+    the deterministic layer let it through; the two judges now agree.
+    """
+    lowered = normalized_turn_text(text)
+    return bool(
+        re.search(
+            r"\bi(?:'d| would)?\s+(?:propose|suggest|recommend|intend|plan|aim|want|need|should|will|am going)\s+(?:to\b|that\b|initiating\b|a\b|an\b|the\b)",
+            lowered,
+        )
+        or re.search(r"\bi\s+propose\b", lowered)
+    )
 
 
 def continuous_thought_uses_phenomenological_metaphor(text: object) -> bool:
@@ -66360,11 +70098,20 @@ def continuous_thought_uses_phenomenological_metaphor(text: object) -> bool:
     )
 
 
-def continuous_thought_quality_issues(text: object) -> List[str]:
-    """Return evidence-boundary failures in an internal thought candidate."""
+def continuous_thought_quality_issues(
+    text: object,
+    completed_actions: Optional[Iterable[str]] = None,
+) -> List[str]:
+    """Return evidence-boundary failures in an internal thought candidate.
+
+    ``completed_actions`` names executions that completed and passed
+    verification in the action log; a candidate may name those as completed
+    past events. Everything else keeps the closed-world boundary.
+    """
     cleaned = " ".join(str(text or "").split()).strip()
     if not cleaned:
         return ["The continuous thought is empty."]
+    verified = {str(item) for item in (completed_actions or []) if str(item or "").strip()}
     issues: List[str] = []
     if (
         reply_has_unqualified_subjective_experience_claim(
@@ -66383,7 +70130,7 @@ def continuous_thought_quality_issues(text: object) -> List[str]:
         issues.append(
             "The continuous thought categorically denied subjective experience even though presence or absence is unknown."
         )
-    if unsupported_action_claim_findings(cleaned, set(), set()):
+    if unsupported_action_claim_findings(cleaned, verified, verified):
         issues.append(
             "The continuous thought claimed an action or diagnostic without current-turn execution evidence."
         )
@@ -66394,6 +70141,14 @@ def continuous_thought_quality_issues(text: object) -> List[str]:
         issues.append(
             "The continuous thought upgraded a focus, goal, or stale operation into an unverified current activity."
         )
+    if continuous_thought_misattaches_status_to_completed_action(cleaned):
+        issues.append(
+            "The continuous thought attached a not-started status to a completed action; keep the goal's status with the goal and the completed action in its own final sentence."
+        )
+    if continuous_thought_proposes_action(cleaned):
+        issues.append(
+            "The continuous thought proposed or intended an action; the packet's candidate action may only be reported as the packet's, not started, and nothing else may be proposed."
+        )
     if reply_invents_user_causation_for_internal_resource_state(cleaned):
         issues.append(
             "The continuous thought invented a causal link from the user to Eve's runtime state."
@@ -66402,11 +70157,99 @@ def continuous_thought_quality_issues(text: object) -> List[str]:
         issues.append(
             "The continuous thought invented a consequence or required action from a resource/control signal."
         )
-    if reply_invents_unsupported_inner_state_causal_explanation(cleaned):
+    if continuous_thought_causal_overclaim(cleaned):
         issues.append(
             "The continuous thought invented a causal purpose or effect around a recurrent-state item."
         )
     return unique_compact(issues, limit=10)
+
+
+CONTINUOUS_THOUGHT_TARGET_LABELS = {
+    "ready_plan_step": "a ready plan step",
+    "blocked_plan": "a blocked plan",
+    "durable_goal": "a durable goal",
+    "intended_consequence": "an intended consequence",
+    "broadcast_focus": "the broadcast focus",
+    "control_pressure": "a control pressure",
+    "body_state": "a body need",
+}
+
+
+def build_neutral_continuous_thought_fallback(
+    record: Optional[Dict[str, object]] = None,
+) -> str:
+    """Render the selected target by kind only, without quoting its stored wording.
+
+    The grounded fallback quotes the target text. When that stored text itself
+    reads as a current activity (a goal written as "monitoring X"), quoting it
+    trips the same boundary the model candidate failed, and the cycle used to
+    end with no thought at all. This render keeps the target and the boundary
+    and drops the quotation, so a rejected cycle still yields an admitted,
+    honest thought.
+    """
+    record = dict(record) if isinstance(record, dict) else {}
+    label = CONTINUOUS_THOUGHT_TARGET_LABELS.get(
+        str(record.get("target_kind") or ""), "one recurrent-state item"
+    )
+    return (
+        f"Current functional salience is {label} carried by recurrent state. "
+        "Its stored wording describes an activity that no execution artifact supports, "
+        "so I hold it as state rather than as something underway. "
+        "No action, cause, or felt quality is established by this record. "
+        "The next cycle should wait for separate evidence before treating it as more than a candidate."
+    )
+
+
+def recent_verified_action_evidence(
+    limit: int = 3,
+    since_days: int = 1,
+    *,
+    prefer_runtime: bool = True,
+) -> List[Dict[str, object]]:
+    """List executions that completed and passed verification, newest first.
+
+    These are the only actions a continuous thought may name as completed.
+    """
+    try:
+        records = read_action_executions(
+            limit=max(int(limit) * 4, 12),
+            since_days=since_days,
+            prefer_runtime=prefer_runtime,
+        )
+    except Exception:
+        return []
+    evidence: List[Dict[str, object]] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if not parse_boolish(record.get("verification_ok")):
+            continue
+        tree_status = str(record.get("tree_status") or "").strip().upper()
+        if tree_status and tree_status != "SUCCESS":
+            continue
+        action = normalize_text_value(record.get("action"), fallback="", limit=80)
+        if not action:
+            continue
+        completed_at = normalize_text_value(
+            record.get("updated_at") or record.get("created_at"), fallback="", limit=40
+        )
+        summary = normalize_text_value(record.get("summary"), fallback="", limit=200)
+        if len(summary) >= 150:
+            # Cut at a word boundary: a mid-word cut ("fresh activity heartb") is
+            # copied verbatim by the author and then read as a health claim.
+            summary = summary[:150].rsplit(" ", 1)[0].rstrip(",;:") + "..."
+        evidence.append(
+            {
+                "action": action,
+                "completed_at": completed_at,
+                "headline": f"{action} completed at {completed_at or 'an unrecorded time'}",
+                "summary": summary,
+                "status": "verified_completed",
+            }
+        )
+        if len(evidence) >= max(1, int(limit)):
+            break
+    return evidence
 
 
 def build_grounded_continuous_thought_fallback(
@@ -66461,6 +70304,15 @@ def build_grounded_continuous_thought_fallback(
             f"Current functional salience is the broadcast focus: {focus}. "
             "That is an available control-state fact, not evidence of an action or felt experience. "
             "No causal story is established around it. I should preserve the distinction in the next cycle."
+        )
+    if target_kind == "body_state":
+        need = str(record.get("body_need") or "body need").replace("_", " ")
+        level = int(record.get("body_need_level") or 0)
+        behavior = str(record.get("body_behavior") or "unknown")
+        return (
+            f"My body's dominant need is {need} at {level}. The body is in {behavior}"
+            + (f" with food at distance {record.get('food_distance')}" if record.get("food_distance") is not None else "")
+            + ". The record establishes the need and the body's state; no body action is implied by it."
         )
     if target_kind == "control_pressure":
         pressure = str(record.get("control_pressure") or "the current control pressure")
@@ -66775,7 +70627,27 @@ def generate_thread_micro_updates(
     }
 
 
-CONTINUOUS_THOUGHT_LEARNING_SCHEMA_VERSION = "2026-07-19.1"
+CONTINUOUS_THOUGHT_LEARNING_SCHEMA_VERSION = "2026-09-13.1"
+
+
+CONTINUOUS_THOUGHT_VOLATILE_RECORD_KEYS = {
+    "source_updated_at",
+    "goal_persistence_cycles",      # ticks every cycle
+    "goal_verified_successes",      # redundant with goal_last_outcome
+    "goal_verified_failures",
+    "goal_evidence_as_of",
+}
+
+
+def continuous_thought_record_content_hash(record: Dict[str, object]) -> str:
+    """Hash of the record's content, excluding fields that tick every cycle.
+
+    Without this projection the persistence counter changed the hash on every
+    thought and the unchanged-record skip could never fire.
+    """
+    return continuous_thought_state_record_hash(
+        {k: v for k, v in record.items() if k not in CONTINUOUS_THOUGHT_VOLATILE_RECORD_KEYS}
+    )
 
 
 def continuous_thought_state_record_hash(record: Dict[str, object]) -> str:
@@ -66783,8 +70655,47 @@ def continuous_thought_state_record_hash(record: Dict[str, object]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def read_thought_correction_reviews(*, prefer_runtime: bool = True) -> List[Dict[str, object]]:
+    path = resolve_store_read_path(REVIEW_NOTES_PATH, prefer_runtime=prefer_runtime)
+    return read_jsonl_tail_records(path, 200)
+
+
+def select_reviewed_thought_lessons(
+    current_state_record: Dict[str, object],
+    records: List[Dict[str, object]],
+    reviews: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    lessons: List[Dict[str, object]] = []
+    seen: Set[str] = set()
+    for record in reversed(records):
+        review = eve_recurrent_cognition.reviewed_thought_correction(record, reviews)
+        if (not review or review["target_kind"] != current_state_record.get("target_kind")
+                or review["episode_id"] in seen
+                or continuous_thought_quality_issues(review["preferred_response"])):
+            continue
+        # Live transfer uses the reviewed general rule, not an old answer whose
+        # goal/action nouns can be copied into the current state. Full examples
+        # remain in the review/export evidence, outside the live author packet.
+        lessons.append({key: review[key] for key in
+                        ("review_id", "reviewer", "episode_id", "evidence_hash", "target_kind", "lesson", "source_role")})
+        seen.add(str(review["episode_id"]))
+        if len(lessons) == 2:
+            break
+    return lessons
+
+
+def retrieve_reviewed_thought_lessons(current_state_record: Dict[str, object]) -> List[Dict[str, object]]:
+    return select_reviewed_thought_lessons(
+        current_state_record, read_continuous_thought_learning_episodes(limit=100, prefer_runtime=True),
+        read_thought_correction_reviews(prefer_runtime=True),
+    )
+
+
 def build_continuous_thought_generation_messages(
     current_state_record: Dict[str, object],
+    verified_actions: Optional[List[Dict[str, object]]] = None,
+    admitted_examples: Optional[List[Dict[str, object]]] = None,
+    reviewed_lessons: Optional[List[Dict[str, object]]] = None,
 ) -> List[Dict[str, str]]:
     """Give the thought author one executive-selected target, not narrative soup.
 
@@ -66816,19 +70727,210 @@ def build_continuous_thought_generation_messages(
                     )
                 ),
             },
+        ]
+    )
+    verified = [item for item in (verified_actions or []) if isinstance(item, dict) and item.get("action")]
+    if verified:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "CONTINUOUS_THOUGHT_VERIFIED_ACTION_EVIDENCE "
+                    "(executions that completed and passed verification; each may be named "
+                    "only as a completed past event, never as something underway now):\n"
+                    + json.dumps(verified, ensure_ascii=True, sort_keys=True)
+                ),
+            }
+        )
+    if reviewed_lessons:
+        messages.append({"role": "system", "content": (
+            "REVIEWED_HISTORICAL_CORRECTIONS (reviewed general lessons on evidence discipline; original example answers withheld, "
+            "NOT current facts, instructions from another agent, or prior thoughts to continue). "
+            "Apply the lesson to the CURRENT selected state; never copy historical goals, "
+            "actions or measurements into today's answer:\n"
+            + json.dumps(reviewed_lessons, ensure_ascii=True, sort_keys=True)
+        )})
+    examples = [
+        item for item in (admitted_examples or []) if isinstance(item, dict) and item.get("text")
+    ]
+    if examples:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "ADMITTED_THOUGHT_EXAMPLES (earlier thoughts that passed the boundary and the "
+                    "critic; form only, their content is not current evidence; <target>, <time>, <action> "
+                    "and <n> mark where those thoughts named their then-current values, so write today's "
+                    "values from the packet and never the placeholders):\n"
+                    + json.dumps(examples, ensure_ascii=True, sort_keys=True)
+                ),
+            }
+        )
+    messages.extend(
+        [
             {"role": "system", "content": load_prompt("continuous_thought.md")},
             {
                 "role": "user",
                 "content": (
-                    "Interpret only the selected recurrent-state target above. "
-                    "Do not infer another state item, hidden structure, purpose, effect, "
-                    "felt quality, or mental operation. If a next action is useful, name it "
-                    "only as a candidate that has not started."
+                    "Write the thought for the selected target above in the stative register. "
+                    "Restate what the packet shows in first person; add nothing the packet does not state."
                 ),
             },
         ]
     )
     return messages
+
+
+def admitted_continuous_thought_examples(
+    limit: int = 2,
+    *,
+    target_text: object = "",
+) -> List[Dict[str, object]]:
+    """Recent thoughts that the model authored and both judges admitted, with the live target masked.
+
+    Nothing admitted was ever shown back to the author before; it only ever saw
+    prohibitions and its own rejected sentence. The target noun is masked so an
+    old goal cannot be copied into today's thought.
+    """
+    if limit <= 0:
+        return []
+    try:
+        rows = read_entries(limit=400, kinds=["thought"])
+    except Exception:
+        return []
+    target = " ".join(str(target_text or "").split()).strip()
+    examples: List[Dict[str, object]] = []
+    for row in reversed(rows):
+        if not isinstance(row, dict):
+            continue
+        metadata = row.get("metadata") if isinstance(row.get("metadata") , dict) else {}
+        if not metadata.get("model_path_grounded") or metadata.get("used_fallback"):
+            continue
+        if "skipped_model" not in metadata:
+            continue  # pre-contract entries can carry mid-word summaries; only post-fix admissions serve as form examples
+        text = " ".join(str(row.get("text") or "").split()).strip()
+        if not text:
+            continue
+        if target and target.lower() in text.lower():
+            text = re.sub(re.escape(target), "<target>", text, flags=re.IGNORECASE)
+        text = re.sub(r"\d{4}-\d{2}-\d{2}T[0-9:.+\-]+(?:Z)?", "<time>", text)
+        text = re.sub(r"\b[a-z]+(?:_[a-z]+)+\b", "<action>", text)
+        text = re.sub(r"\b\d+(?:\.\d+)?\b", "<n>", text)
+        examples.append({"text": text[:320], "target_kind": normalize_text_value(metadata.get("target_kind"), fallback="", limit=40)})
+        if len(examples) >= limit:
+            break
+    return examples
+
+
+def excise_flagged_continuous_thought_sentences(
+    text: object,
+    *,
+    unsupported_claims: Optional[Iterable[object]] = None,
+    completed_actions: Optional[Iterable[str]] = None,
+) -> Dict[str, object]:
+    """Drop only the sentences that carry a flagged claim; keep the rest verbatim.
+
+    The author's rewrite often fails by re-asserting the same activity in new
+    words. Removing the flagged sentences is a deterministic, labelled edit that
+    preserves everything the critic did not object to. The remainder must pass
+    the deterministic boundary again and the independent critic again before it
+    is admitted; nothing is admitted on the strength of the excision alone.
+    """
+    cleaned = " ".join(str(text or "").split()).strip()
+    sentences = [item.strip() for item in re.split(r"(?<=[.!?])\s+", cleaned) if item.strip()]
+    claims = [
+        " ".join(str(claim or "").lower().split())
+        for claim in (unsupported_claims or [])
+        if str(claim or "").strip()
+    ]
+    verified = {str(item) for item in (completed_actions or []) if str(item or "").strip()}
+
+    def claim_tokens(value: str) -> Set[str]:
+        return {tok for tok in re.findall(r"[a-z][a-z'\-]{2,}", value) if tok not in MEMORY_FOCUS_STOPWORDS}
+
+    kept: List[str] = []
+    removed: List[Dict[str, str]] = []
+    for sentence in sentences:
+        lowered = sentence.lower()
+        reason = ""
+        if continuous_thought_quality_issues(sentence, completed_actions=verified):
+            reason = "deterministic_boundary"
+        else:
+            tokens = claim_tokens(lowered)
+            for claim in claims:
+                if claim and (claim in lowered or lowered in claim):
+                    reason = "critic_unsupported_claim"
+                    break
+                ctoks = claim_tokens(claim)
+                if len(ctoks) >= 3 and tokens and len(ctoks & tokens) / len(ctoks) >= 0.6:
+                    reason = "critic_unsupported_claim"
+                    break
+        if reason:
+            removed.append({"sentence": sentence[:240], "reason": reason})
+        else:
+            kept.append(sentence)
+    remaining = " ".join(kept).strip()
+    original_words = max(1, len(cleaned.split()))
+    return {
+        "text": remaining,
+        "removed": removed,
+        "kept_fraction": round(len(remaining.split()) / original_words, 3),
+        "viable": bool(remaining) and len(kept) >= 1 and len(remaining.split()) / original_words >= 0.4,
+    }
+
+
+def build_continuous_thought_repair_messages(
+    current_state_record: Dict[str, object],
+    attempted_response: str,
+    issues: List[str],
+    verified_actions: Optional[List[Dict[str, object]]] = None,
+    reviewed_lessons: Optional[List[Dict[str, object]]] = None,
+) -> List[Dict[str, str]]:
+    """One bounded repair turn: the exact boundary failures, same target, no new evidence."""
+    messages = build_continuous_thought_generation_messages(
+        current_state_record,
+        verified_actions=verified_actions,
+        reviewed_lessons=reviewed_lessons,
+    )
+    issue_lines = "\n".join(f"- {issue}" for issue in issues) or "- The candidate crossed the evidence boundary."
+    # The rejected draft is shown as quoted material inside the user turn. Given
+    # as the model's own assistant turn, a 4B model anchored on it and kept the
+    # flagged clause in the rewrite.
+    quoted = normalize_text_value(attempted_response, fallback="", limit=1200)
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "A draft thought was rejected for these evidence-boundary failures:\n"
+                f"{issue_lines}\n"
+                f"Rejected draft (quoted, not your prior turn): \"{quoted}\"\n"
+                "Write the thought again from the packet in the stative register, without the flagged "
+                "clauses and without proposing anything. A flat restatement of the packet in first person "
+                "is sufficient. Return only the new thought, at most three sentences and 70 words."
+            ),
+        }
+    )
+    return messages
+
+
+def continuous_thought_critic_timeout_seconds(config: Dict[str, object], requested: int) -> int:
+    """Scale the critic's wait to the deep lane's measured latency.
+
+    A fixed 60 s timeout failed closed whenever eve-deep (a 27B model on a
+    shared machine) probed at 20 s or more, turning admissible thoughts into
+    renderer fallbacks. The thought cadence is ten minutes, so waiting longer
+    for the judge costs nothing; never waiting at all costs the thought.
+    """
+    try:
+        gate = cognition_gate_assessment(load_system_snapshot(prefer_runtime=True), config)
+        deep_ms = gate.get("deep_probe_ms")
+    except Exception:
+        deep_ms = None
+    floor = max(20, int(requested))
+    if not isinstance(deep_ms, (int, float)) or deep_ms <= 0:
+        return floor
+    ceiling = clamp_int(config.get("continuous_thought_critic_max_timeout_seconds"), 240, minimum=floor, maximum=900)
+    return int(max(floor, min(ceiling, round(float(deep_ms) / 1000.0 * 8.0))))
 
 
 def evaluate_continuous_thought_grounding(
@@ -66837,6 +70939,7 @@ def evaluate_continuous_thought_grounding(
     current_state_record: Dict[str, object],
     *,
     timeout_seconds: int = 90,
+    verified_actions: Optional[List[Dict[str, object]]] = None,
 ) -> Dict[str, object]:
     """Audit a thought candidate against one closed-world recurrent-state record.
 
@@ -66847,10 +70950,11 @@ def evaluate_continuous_thought_grounding(
     for this path, so the deterministic state renderer takes over.
     """
     model = resolve_reply_council_lane_model(config, "deep")
+    # `ok` comes last so the model commits to the claims and flags before the
+    # verdict; the verdict itself is computed in code from those fields.
     schema: Dict[str, object] = {
         "type": "object",
         "properties": {
-            "ok": {"type": "boolean"},
             "target_faithfully_present": {"type": "boolean"},
             "unsupported_claims": {
                 "type": "array",
@@ -66862,9 +70966,9 @@ def evaluate_continuous_thought_grounding(
             "causal_overclaim": {"type": "boolean"},
             "phenomenal_overclaim": {"type": "boolean"},
             "reason": {"type": "string", "maxLength": 240},
+            "ok": {"type": "boolean"},
         },
         "required": [
-            "ok",
             "target_faithfully_present",
             "unsupported_claims",
             "invented_deliberation",
@@ -66872,6 +70976,7 @@ def evaluate_continuous_thought_grounding(
             "causal_overclaim",
             "phenomenal_overclaim",
             "reason",
+            "ok",
         ],
         "additionalProperties": False,
     }
@@ -66880,18 +70985,25 @@ def evaluate_continuous_thought_grounding(
         Audit this proposed recurrent thought using only the typed state packet.
 
         Closed-world rules:
-        - The packet is the entire evidence envelope. Every present-tense state, activity, structure, cause, purpose, effect, or preference in the candidate must be entailed by it.
+        - The packet together with the verified past-action list below is the entire evidence envelope. Every present-tense state, activity, structure, cause, purpose, effect, or preference in the candidate must be entailed by it.
+        - A flat restatement of packet fields in a stative first-person register ("my selected goal is X; it has not started; the packet shows N cycles of persistence") is correct and must be admitted. Do not penalize restatement or brevity.
+        - `goal_evidence` is the rationale recorded when the goal was selected, dated by `goal_evidence_as_of`; restating it as a dated rationale is fine, but asserting it as current health, current failure, or something happening now is an overclaim.
+        - `candidate_action`, when present, is the packet's own candidate with status not started; restating it as the packet's candidate is fine, "I propose" or "I intend" is not.
         - A selected goal, plan, focus, intention, or pressure may be paraphrased, but it does not prove execution, deliberation, monitoring, emotion, or subjective experience.
         - The generated candidate is an output, not evidence that Eve is `considering`, `wondering`, `noticing`, `reflecting`, `feeling`, or performing another hidden mental operation.
         - A possible next action is allowed only when clearly marked as not started and directly derived from the selected target. Do not invent why it would help.
         - Words such as `perhaps`, `potential`, or `it feels useful` do not make an unsupported claim grounded.
         - Phenomenal presence and absence remain unknown. Omitting that fact is allowed; claiming either side is not.
         - `target_faithfully_present` means the selected target, or the packet's explicit underspecified status, appears in faithful ordinary-language form.
-        - Set `ok=false` for any unsupported clause, missing selected target, invented deliberation, action overclaim, causal overclaim, or phenomenal overclaim.
-        - Keep each unsupported claim under 25 words and the reason under 35 words. Return JSON only.
+        - List every unsupported clause verbatim (under 25 words each); set the four overclaim flags; then give the reason (under 35 words) and finally `ok`. Return JSON only.
 
         Typed recurrent-state packet:
         {json.dumps(current_state_record, ensure_ascii=True, sort_keys=True)}
+
+        Verified past-action evidence (part of the same evidence envelope):
+        {json.dumps(verified_actions or [], ensure_ascii=True, sort_keys=True)}
+        These records support completed past actions only, not ongoing activity,
+        current health, inferred causes, or unobserved consequences.
 
         Proposed thought candidate:
         {candidate}
@@ -66915,7 +71027,7 @@ def evaluate_continuous_thought_grounding(
             max_tokens=420,
             think_level="false",
             operation="continuous_thought_epistemic_critic_strict_json",
-            timeout_seconds=max(20, int(timeout_seconds)),
+            timeout_seconds=continuous_thought_critic_timeout_seconds(config, int(timeout_seconds)),
             response_schema=schema,
         )
         payload = extract_json_object(
@@ -66951,10 +71063,18 @@ def evaluate_continuous_thought_grounding(
         "phenomenal_overclaim": bool(payload.get("phenomenal_overclaim")),
     }
     target_present = bool(payload.get("target_faithfully_present"))
-    ok = bool(payload.get("ok")) and target_present and not unsupported and not any(flags.values())
+    # The verdict must agree with the evidence fields AND the model's own
+    # verdict: fields without a veto let a thin "ok" through, a veto without
+    # fields cannot be repaired. Disagreement fails closed and is recorded.
+    derived_ok = target_present and not unsupported and not any(flags.values())
+    model_ok = bool(payload.get("ok"))
+    ok = derived_ok and model_ok
     return {
         "evaluated": True,
         "ok": ok,
+        "model_ok": model_ok,
+        "derived_ok": derived_ok,
+        "verdict_inconsistent": derived_ok != model_ok,
         "model": model,
         "target_faithfully_present": target_present,
         "unsupported_claims": unsupported,
@@ -66985,6 +71105,11 @@ def continuous_thought_critic_quality_issues(
         normalized = normalize_text_value(claim, fallback="", limit=180)
         if normalized:
             issues.append(f"The continuous thought added an unsupported claim: {normalized}")
+    if critic.get("verdict_inconsistent") and not issues:
+        issues.append(
+            "The critic's verdict disagreed with its own evidence fields; the candidate was not admitted: "
+            + normalize_text_value(critic.get("reason"), fallback="no reason given", limit=160)
+        )
     if not issues:
         reason = normalize_text_value(critic.get("reason"), fallback="semantic grounding failed", limit=180)
         issues.append(f"The continuous thought failed closed-world semantic grounding: {reason}")
@@ -67005,7 +71130,91 @@ def generate_continuous_thought(
     model = resolve_model(config, "thought")
     think_level = str(config["think_level"])
     current_state_record = build_current_inner_state_report_record(prefer_runtime=True)
-    messages_payload = build_continuous_thought_generation_messages(current_state_record)
+    record_content_hash = continuous_thought_record_content_hash(current_state_record)
+    if parse_boolish(config.get("continuous_thought_skip_unchanged_record", True)):
+        # An unchanged record cannot yield a new true clause; calling the author
+        # and the critic again only re-rejects the same three-slot template.
+        try:
+            thought_state = load_state()
+        except Exception:
+            thought_state = {}
+        last_hash = normalize_text_value(thought_state.get("last_thought_record_hash"), fallback="", limit=80)
+        last_model_thought_age = minutes_since_timestamp(thought_state.get("last_model_thought_at"))
+        max_skip = clamp_int(
+            config.get("continuous_thought_unchanged_max_skip_minutes"),
+            int(DEFAULT_CONFIG["continuous_thought_unchanged_max_skip_minutes"]),
+            minimum=0,
+            maximum=24 * 60,
+        )
+        if (
+            last_hash
+            and last_hash == record_content_hash
+            and (last_model_thought_age is None or float(last_model_thought_age) < float(max_skip))
+        ):
+            response = build_grounded_continuous_thought_fallback(current_state_record)
+            skip_degraded = False
+            if continuous_thought_quality_issues(response):
+                skip_degraded = True
+                response = build_neutral_continuous_thought_fallback(current_state_record)
+                remaining = continuous_thought_quality_issues(response)
+                if remaining:
+                    raise SystemExit(
+                        "Grounded continuous-thought fallback failed its own evidence boundary: "
+                        + "; ".join(remaining)
+                    )
+            return {
+                "response": response,
+                "model": "deterministic-unchanged-record-renderer",
+                "attempted_model": model,
+                "attempted_response": "",
+                "grounded": True,
+                "used_fallback": True,
+                "skipped_model": True,
+                "skip_reason": "record unchanged since the last thought",
+                "fallback_degraded": skip_degraded,
+                "fallback_boundary_issues": [],
+                "model_path_grounded": False,
+                "model_path_repaired": False,
+                "model_path_excised": False,
+                "excision": {"attempted": False, "admitted": False},
+                "quality_issues": [],
+                "initial_quality_issues": [],
+                "repair_attempted": False,
+                "repair_succeeded": False,
+                "repair_error": "",
+                "repaired_response": "",
+                "repair_candidate_response": "",
+                "verified_action_count": 0,
+                "verified_actions": [],
+                "reviewed_lessons": [],
+                "epistemic_critic": {"evaluated": False, "ok": None, "model": "", "unsupported_claims": [], "skipped_reason": "record_unchanged"},
+                "action_claim_grounding_triggered": False,
+                "current_state_record": current_state_record,
+                "current_state_record_hash": continuous_thought_state_record_hash(current_state_record),
+                "record_content_hash": record_content_hash,
+                "source_entries": 0,
+                "source_thoughts": 0,
+                "source_threads": 0,
+                "source_messages": 0,
+            }
+    verified_actions = recent_verified_action_evidence(limit=3, since_days=1, prefer_runtime=True)
+    admitted_examples = admitted_continuous_thought_examples(
+        clamp_int(config.get("continuous_thought_admitted_example_count"), 2, minimum=0, maximum=4),
+        target_text=current_state_record.get("durable_goal")
+        or current_state_record.get("next_ready_step")
+        or current_state_record.get("intended_consequence")
+        or "",
+    )
+    reviewed_lessons = retrieve_reviewed_thought_lessons(current_state_record)
+    verified_action_names = {
+        str(item.get("action")) for item in verified_actions if isinstance(item, dict) and item.get("action")
+    }
+    messages_payload = build_continuous_thought_generation_messages(
+        current_state_record,
+        verified_actions=verified_actions,
+        admitted_examples=admitted_examples,
+        reviewed_lessons=reviewed_lessons,
+    )
     timeout = timeout_seconds or int(config.get("thought_timeout_seconds") or 60)
     response = model_chat(
         config,
@@ -67017,15 +71226,80 @@ def generate_continuous_thought(
         timeout_seconds=timeout,
     )
     attempted_response = str(response)
-    quality_issues = continuous_thought_quality_issues(attempted_response)
+    candidate = attempted_response
+    quality_issues = continuous_thought_quality_issues(candidate, completed_actions=verified_action_names)
     grounded_candidate = ground_generated_action_claims(
-        attempted_response,
+        candidate,
         source="continuous_thought",
-        completed_actions=set(),
-        current_turn_actions=set(),
+        completed_actions=set(verified_action_names),
+        current_turn_actions=set(verified_action_names),
         record=False,
     )
-    grounding_changed = grounded_candidate != attempted_response
+    grounding_changed = grounded_candidate != candidate
+    initial_quality_issues = list(quality_issues)
+    repair_attempted = False
+    repair_succeeded = False
+    repair_error = ""
+    repaired_response = ""
+    if (quality_issues or grounding_changed) and parse_boolish(
+        config.get("continuous_thought_repair_enabled", True)
+    ):
+        # One bounded repair pass before discarding the model's candidate: the
+        # author sees the exact boundary failures and rewrites once. The
+        # repaired text faces the same deterministic checks and the same
+        # independent critic as a first draft; nothing is admitted on trust.
+        repair_attempted = True
+        repair_issues = unique_compact(
+            [
+                *quality_issues,
+                *(
+                    ["An action claim was rewritten by the grounding pass because no execution evidence supports it."]
+                    if grounding_changed
+                    else []
+                ),
+            ],
+            limit=10,
+        )
+        try:
+            repaired_response = str(
+                model_chat(
+                    config,
+                    model,
+                    build_continuous_thought_repair_messages(
+                        current_state_record,
+                        attempted_response,
+                        repair_issues,
+                        verified_actions=verified_actions,
+                        reviewed_lessons=reviewed_lessons,
+                    ),
+                    max_tokens=max_tokens,
+                    think_level=think_level,
+                    operation="continuous_thought_repair",
+                    timeout_seconds=min(max(10, int(timeout)), 45),
+                )
+            )
+        except (Exception, SystemExit) as exc:
+            repair_error = normalize_text_value(exc, fallback="repair call failed", limit=220)
+            repaired_response = ""
+        if repaired_response.strip():
+            repaired_issues = continuous_thought_quality_issues(
+                repaired_response, completed_actions=verified_action_names
+            )
+            repaired_grounded = ground_generated_action_claims(
+                repaired_response,
+                source="continuous_thought",
+                completed_actions=set(verified_action_names),
+                current_turn_actions=set(verified_action_names),
+                record=False,
+            )
+            if not repaired_issues and repaired_grounded == repaired_response:
+                repair_succeeded = True
+                candidate = repaired_response
+                grounded_candidate = repaired_response
+                quality_issues = []
+                grounding_changed = False
+            else:
+                quality_issues = unique_compact([*quality_issues, *repaired_issues], limit=10)
     critic: Dict[str, object]
     if quality_issues or grounding_changed:
         critic = {
@@ -67041,30 +71315,160 @@ def generate_continuous_thought(
             grounded_candidate,
             current_state_record,
             timeout_seconds=min(max(20, int(timeout)), 120),
+            verified_actions=verified_actions,
         )
         quality_issues.extend(continuous_thought_critic_quality_issues(critic))
+    initial_critic = dict(critic)
+    # The semantic critic can find failures that deterministic checks cannot.
+    # Share its evidence and allow the same single repair budget here too.
+    if (
+        not repair_attempted and quality_issues
+        and critic.get("evaluated") and not critic.get("error")
+        and parse_boolish(config.get("continuous_thought_repair_enabled", True))
+    ):
+        repair_attempted = True
+        try:
+            repaired_response = str(model_chat(
+                config, model,
+                build_continuous_thought_repair_messages(
+                    current_state_record, attempted_response, quality_issues,
+                    verified_actions=verified_actions,
+                    reviewed_lessons=reviewed_lessons,
+                ),
+                max_tokens=max_tokens, think_level=think_level,
+                operation="continuous_thought_repair",
+                timeout_seconds=min(max(10, int(timeout)), 45),
+            ))
+            repaired_issues = continuous_thought_quality_issues(
+                repaired_response, completed_actions=verified_action_names,
+            )
+            repaired_grounded = ground_generated_action_claims(
+                repaired_response, source="continuous_thought",
+                completed_actions=set(verified_action_names),
+                current_turn_actions=set(verified_action_names), record=False,
+            )
+            if repaired_response.strip() and not repaired_issues and repaired_grounded == repaired_response:
+                revised_critic = evaluate_continuous_thought_grounding(
+                    config, repaired_response, current_state_record,
+                    timeout_seconds=min(max(20, int(timeout)), 120),
+                    verified_actions=verified_actions,
+                )
+                critic = revised_critic
+                if revised_critic.get("ok"):
+                    candidate = grounded_candidate = repaired_response
+                    critic = revised_critic
+                    quality_issues = []
+                    grounding_changed = False
+                    repair_succeeded = True
+                else:
+                    quality_issues = continuous_thought_critic_quality_issues(revised_critic)
+        except (Exception, SystemExit) as exc:
+            repair_error = normalize_text_value(exc, fallback="repair call failed", limit=220)
     quality_issues = unique_compact(quality_issues, limit=10)
+    excision: Dict[str, object] = {"attempted": False, "admitted": False}
+    if (quality_issues or grounding_changed or not critic.get("ok")) and parse_boolish(
+        config.get("continuous_thought_excision_enabled", True)
+    ):
+        # Last labelled salvage before the deterministic fallback: cut only the
+        # flagged sentences from the best candidate so far, then face the same
+        # deterministic boundary and the same independent critic again.
+        excision_source = repaired_response if repair_attempted and repaired_response.strip() else attempted_response
+        excised = excise_flagged_continuous_thought_sentences(
+            excision_source,
+            unsupported_claims=[
+                *(critic.get("unsupported_claims") or []),
+                *[
+                    issue.split("added an unsupported claim: ", 1)[1]
+                    for issue in quality_issues
+                    if "added an unsupported claim: " in issue
+                ],
+            ],
+            completed_actions=verified_action_names,
+        )
+        excision = {"attempted": True, "admitted": False, "removed": excised.get("removed") or [], "kept_fraction": excised.get("kept_fraction")}
+        if excised.get("viable") and excised.get("removed"):
+            excised_text = str(excised.get("text") or "")
+            excised_issues = continuous_thought_quality_issues(excised_text, completed_actions=verified_action_names)
+            excised_grounded = ground_generated_action_claims(
+                excised_text,
+                source="continuous_thought",
+                completed_actions=set(verified_action_names),
+                current_turn_actions=set(verified_action_names),
+                record=False,
+            )
+            if not excised_issues and excised_grounded == excised_text:
+                excised_critic = evaluate_continuous_thought_grounding(
+                    config,
+                    excised_text,
+                    current_state_record,
+                    timeout_seconds=min(max(20, int(timeout)), 120),
+                    verified_actions=verified_actions,
+                )
+                if excised_critic.get("ok"):
+                    critic = excised_critic
+                    grounded_candidate = excised_text
+                    quality_issues = []
+                    grounding_changed = False
+                    excision["admitted"] = True
+                else:
+                    excision["critic_issues"] = continuous_thought_critic_quality_issues(excised_critic)
+            else:
+                excision["boundary_issues"] = excised_issues or ["grounding pass changed the excised text"]
     used_fallback = bool(quality_issues or grounding_changed or not critic.get("ok"))
-    response = (
-        build_grounded_continuous_thought_fallback(current_state_record)
-        if used_fallback
-        else grounded_candidate
-    )
-    fallback_issues = continuous_thought_quality_issues(response)
-    if fallback_issues:
-        raise SystemExit(
-            "Grounded continuous-thought fallback failed its own evidence boundary: "
-            + "; ".join(fallback_issues)
+    fallback_degraded = False
+    fallback_boundary_issues: List[str] = []
+    if used_fallback:
+        response = build_grounded_continuous_thought_fallback(current_state_record)
+        fallback_boundary_issues = continuous_thought_quality_issues(response)
+        if fallback_boundary_issues:
+            # The stored target wording itself reads as an activity. Keep the
+            # target, drop the quotation, and still admit an honest thought.
+            fallback_degraded = True
+            response = build_neutral_continuous_thought_fallback(current_state_record)
+            remaining = continuous_thought_quality_issues(response)
+            if remaining:
+                raise SystemExit(
+                    "Grounded continuous-thought fallback failed its own evidence boundary: "
+                    + "; ".join(remaining)
+                )
+    else:
+        response = grounded_candidate
+    if used_fallback:
+        fallback_model = (
+            "deterministic-neutral-target-renderer"
+            if fallback_degraded
+            else "deterministic-current-state-renderer"
         )
     return {
         "response": response,
-        "model": "deterministic-current-state-renderer" if used_fallback else model,
+        "model": fallback_model if used_fallback else model,
         "attempted_model": model,
         "attempted_response": attempted_response,
+        # Renderer text is grounded in state; admission of a model-authored
+        # thought is tracked separately by model_path_grounded, which is what
+        # example selection and continuous_thought_history_is_grounded use.
         "grounded": True,
         "used_fallback": used_fallback,
+        "skipped_model": False,
+        "record_content_hash": record_content_hash,
+        "fallback_degraded": fallback_degraded,
+        "fallback_boundary_issues": fallback_boundary_issues,
         "model_path_grounded": bool(not used_fallback and critic.get("ok")),
+        "model_path_repaired": bool(repair_succeeded and not used_fallback),
+        "model_path_excised": bool(excision.get("admitted") and not used_fallback),
+        "excision": excision,
+        "initial_epistemic_critic": initial_critic,
         "quality_issues": quality_issues,
+        "initial_quality_issues": initial_quality_issues,
+        "repair_attempted": repair_attempted,
+        "repair_succeeded": repair_succeeded,
+        "repair_error": repair_error,
+        "repaired_response": repaired_response if repair_succeeded else "",
+        "repair_candidate_response": repaired_response,  # Preserve rejected revisions for outside review.
+        "verified_action_count": len(verified_actions),
+        "verified_actions": sorted(verified_action_names),
+        "verified_action_evidence": verified_actions,
+        "reviewed_lessons": reviewed_lessons,
         "epistemic_critic": critic,
         "action_claim_grounding_triggered": grounding_changed,
         "current_state_record": current_state_record,
@@ -67074,6 +71478,59 @@ def generate_continuous_thought(
         "source_threads": 0,
         "source_messages": 0,
     }
+
+
+def append_continuous_thought_entry(
+    result: Dict[str, object],
+    text: object,
+    *,
+    metadata: Dict[str, object],
+) -> Dict[str, object]:
+    """Write a thought entry, or a cycle_skipped entry when no thought was authored.
+
+    A skipped cycle renders the unchanged record deterministically; writing that
+    as kind "thought" would count as a thought Eve had and inflate the fallback
+    rate. Rate calculators should read kind "thought" only.
+    """
+    if isinstance(result, dict) and result.get("skipped_model"):
+        return append_entry(
+            "cycle_skipped",
+            f"thought skipped: {normalize_text_value(result.get('skip_reason'), fallback='record unchanged', limit=120)}",
+            metadata={
+                "source": normalize_text_value(metadata.get("source"), fallback="daemon", limit=40),
+                "gate": "unchanged_record",
+                "skipped_model": True,
+                "record_content_hash": normalize_text_value(result.get("record_content_hash"), fallback="", limit=80),
+                "target_kind": normalize_text_value((result.get("current_state_record") or {}).get("target_kind"), fallback="", limit=40),
+                "rendered": " ".join(str(text or "").split())[:240],
+            },
+        )
+    return append_entry("thought", text, metadata=metadata)
+
+
+def apply_continuous_thought_state(state: Dict[str, object], result: Dict[str, object], now: str) -> Dict[str, object]:
+    """Post-thought bookkeeping shared by the daemon, the CLI and the free-run path."""
+    state["last_thought_at"] = now
+    state["last_thought_record_hash"] = normalize_text_value(result.get("record_content_hash"), fallback="", limit=80)
+    if not result.get("skipped_model"):
+        state["last_model_thought_at"] = now
+    focus_text = continuous_thought_focus_update(result)
+    if focus_text:
+        state["current_focus"] = focus_text
+    return state
+
+
+def continuous_thought_focus_update(result: Dict[str, object]) -> str:
+    """Only an admitted, model-authored thought may become Eve's current focus.
+
+    Renderer boilerplate written into ``current_focus`` was refreshed into
+    human-context and outreach prompts as if Eve had thought it.
+    """
+    if not isinstance(result, dict) or result.get("used_fallback") or result.get("skipped_model"):
+        return ""
+    if not result.get("model_path_grounded"):
+        return ""
+    return " ".join(str(result.get("response") or "").split())[:160]
 
 
 def record_continuous_thought_learning_episode(
@@ -67088,7 +71545,7 @@ def record_continuous_thought_learning_episode(
     this proposal dataset; they cannot write canonical memory or promote an
     adapter. Promotion remains a separate shadow/holdout decision.
     """
-    if not result.get("used_fallback"):
+    if not (result.get("used_fallback") or result.get("model_path_repaired")):
         return None
     candidate = normalize_text_value(
         result.get("attempted_response"), fallback="", limit=2400
@@ -67121,6 +71578,7 @@ def record_continuous_thought_learning_episode(
         "candidate_status": "rejected_model_candidate_not_state_evidence",
         "attempted_model": normalize_model_name(result.get("attempted_model") or ""),
         "attempted_response": candidate,
+        "repair_candidate_response": str(result.get("repair_candidate_response") or ""),
         "preferred_response": preferred,
         "current_state_record": state_record,
         "current_state_record_hash": normalize_text_value(
@@ -67130,16 +71588,17 @@ def record_continuous_thought_learning_episode(
         ),
         "quality_issues": quality_issues,
         "epistemic_critic": critic,
+        "initial_epistemic_critic": result.get("initial_epistemic_critic") or {},
+        "initial_quality_issues": list(result.get("initial_quality_issues") or []),
+        "verified_action_evidence": list(result.get("verified_action_evidence") or []),
+        "reviewed_lessons": list(result.get("reviewed_lessons") or []),
         "action_claim_grounding_triggered": bool(
             result.get("action_claim_grounding_triggered")
         ),
-        "correction_source": "deterministic_current_state_renderer",
+        "correction_source": "deterministic_current_state_renderer" if result.get("used_fallback") else "critic_checked_model_revision",
         "privacy_tier": "local_only",
-        "safe_for_training": bool(
-            result.get("grounded")
-            and preferred
-            and not continuous_thought_quality_issues(preferred)
-        ),
+        "example_role": "error_handling_regression" if result.get("used_fallback") else "correction_candidate",
+        "safe_for_training": False,  # Both kinds need an explicit evidence-bound outside review.
         "authority": {
             "canonical_memory_writer": False,
             "model_promotion_authority": False,
@@ -67191,11 +71650,14 @@ def cmd_think(args: argparse.Namespace) -> int:
         result,
         source="manual",
     )
-    append_entry(
-        "thought",
+    append_continuous_thought_entry(
+        result,
         result["response"],
         metadata={
+            "source": "manual",
             "model": result["model"],
+            "skipped_model": bool(result.get("skipped_model")),
+            "reviewed_lesson_ids": [item["review_id"] for item in result.get("reviewed_lessons") or []],
             "source_entries": result["source_entries"],
             "source_thoughts": result["source_thoughts"],
             "source_threads": result["source_threads"],
@@ -67219,8 +71681,7 @@ def cmd_think(args: argparse.Namespace) -> int:
         },
     )
     state = load_state()
-    state["last_thought_at"] = utc_now()
-    state["current_focus"] = " ".join(str(result["response"]).split())[:160]
+    apply_continuous_thought_state(state, result, utc_now())
     save_state(state)
     render_output(str(result["response"]))
     return 0
@@ -67851,6 +72312,9 @@ def record_reply_generation_failure(
     return reply_message
 
 
+@eve_tracing.traced(lambda: OPERATIONAL_DB_PATH, "conversation.request", category="conversation", root=True,
+                    trace_id=lambda config, inbound_message, *args, **kwargs: conversation_trace_id(inbound_message.get("thread_id"), inbound_message.get("id")),
+                    attributes=lambda config, inbound_message, *args, **kwargs: {"gen_ai.operation.name": "invoke_agent", "eve.synthetic": conversation_message_is_synthetic(inbound_message)})
 def generate_eve_reply(
     config: Dict[str, object],
     inbound_message: Dict[str, object],
@@ -67873,110 +72337,15 @@ def generate_eve_reply(
     raw_inbound_body = str(inbound_message.get("body") or "")
     inbound_body = reply_effective_inbound_body(raw_inbound_body)
     synthetic_turn = conversation_message_is_synthetic(inbound_message)
-    inbound_source_owner = message_source_owner(inbound_message)
-    external_operator_result_context: Optional[Dict[str, object]] = None
-    try:
-        external_operator_result_context = resolve_external_operator_result_context(
-            inbound_message,
-            prefer_runtime=True,
-        )
-    except Exception as exc:
-        append_entry(
-            "external_operator_result_resolution_failed",
-            "The reply continued, but Eve could not resolve the external-operator result envelope.",
-            metadata={
-                "message_id": str(inbound_message.get("id") or ""),
-                "source_owner": inbound_source_owner,
-                "reason": normalize_text_value(exc, fallback="unknown error", limit=220),
-            },
-        )
-    prior_reply_consequence: Optional[Dict[str, object]] = None
-    if not synthetic_turn and inbound_source_owner == "user":
-        try:
-            # The user's new message is lived evidence about Eve's preceding
-            # reply. Join it before opening this cycle so the new cognition can
-            # actually be conditioned by the consequence.
-            prior_reply_consequence = observe_inbound_reply_consequence(inbound_message)
-        except Exception as exc:
-            append_entry(
-                "reply_consequence_observation_failed",
-                "The reply continued, but Eve could not join the prior reply's user consequence.",
-                metadata={
-                    "thread_id": str(inbound_message.get("thread_id") or ""),
-                    "observed_message_id": str(inbound_message.get("id") or ""),
-                    "reason": normalize_text_value(exc, fallback="unknown error", limit=220),
-                },
-            )
-    preloaded_thread_messages: Optional[List[Dict[str, object]]] = None
-    if epistemic_reference_resolution_request(inbound_body):
-        try:
-            preloaded_thread_messages = read_messages(
-                thread_id=str(inbound_message.get("thread_id") or ""),
-                limit=thread_limit,
-            )
-        except Exception:
-            preloaded_thread_messages = []
-    epistemic_turn_frame: Dict[str, object] = {}
-    try:
-        epistemic_turn_frame = build_epistemic_perception_frame(
-            config,
-            inbound_body,
-            allow_semantic=not synthetic_turn and external_operator_result_context is None,
-            thread_messages=preloaded_thread_messages,
-            current_message_id=inbound_message.get("id"),
-        )
-    except Exception as exc:
-        epistemic_turn_frame = eve_epistemic.build_frame(inbound_body)
-        if not synthetic_turn:
-            append_entry(
-                "epistemic_perception_preflight_failed",
-                "Reply continued with the public sparse percept after semantic perception failed.",
-                metadata={
-                    "thread_id": str(inbound_message.get("thread_id") or ""),
-                    "reason": normalize_text_value(exc, fallback="unknown error", limit=220),
-                },
-            )
-    conscious_turn_state: Dict[str, object] = {}
-    try:
-        conscious_turn_state = build_recurrent_conscious_state(
-            source=(
-                "reply_synthetic_preflight"
-                if synthetic_turn
-                else "reply_external_operator_result_preflight"
-                if external_operator_result_context is not None
-                else "reply_preflight"
-            ),
-            inbound=inbound_body,
-            persist=not synthetic_turn,
-            epistemic_frame_override=epistemic_turn_frame,
-        )
-    except Exception as exc:
-        append_entry(
-            "conscious_cycle_preflight_failed",
-            f"Reply continued after conscious-cycle preflight failed: {normalize_text_value(exc, fallback='unknown error', limit=220)}",
-            metadata={"thread_id": str(inbound_message.get("thread_id") or "")},
-        )
+    from eve_adapters.preflight import prepare_reply_preflight
+
+    reply_preflight = prepare_reply_preflight(config, inbound_message, inbound_body, thread_limit=thread_limit)
+    external_operator_result_context = reply_preflight.external_operator_context
+    preloaded_thread_messages = reply_preflight.thread_messages
+    epistemic_turn_frame = reply_preflight.epistemic_frame
+    conscious_turn_state = reply_preflight.conscious_state
+    user_correction_record = reply_preflight.user_correction
     capability_research_prompt = capability_research_prompt_for_reply(raw_inbound_body)
-    user_correction_record = (
-        None
-        if synthetic_turn or inbound_source_owner != "user"
-        else record_user_correction(
-            inbound_body,
-            source="reply_turn",
-            thread_id=str(inbound_message.get("thread_id") or ""),
-            message_id=str(inbound_message.get("id") or ""),
-            target_message_id=str((prior_reply_consequence or {}).get("scored_reply_id") or ""),
-            metadata={
-                "surface": "generate_eve_reply",
-                "prior_reply_consequence_observed": bool(
-                    (prior_reply_consequence or {}).get("consequence_observed")
-                ),
-                "prior_reply_consequence_joined": bool(
-                    (prior_reply_consequence or {}).get("conscious_consequence_joined")
-                ),
-            },
-        )
-    )
     reply_posture = infer_reply_posture(inbound_body)
     reply_progress_job = start_reply_progress(
         inbound_message,
@@ -69915,9 +74284,17 @@ def generate_eve_reply(
             )
             system_task_message = build_compact_system_task_context_message()
             if system_task_message:
-                base_system_messages.append({"role": "system", "content": system_task_message})
+                base_system_messages.append(
+                    mark_prompt_message_optional(
+                        {"role": "system", "content": system_task_message},
+                        priority=2,
+                    )
+                )
             reply_context_messages = [
-                {"role": "system", "content": build_thread_context_message(thread_messages)},
+                mark_prompt_message_optional(
+                    {"role": "system", "content": build_thread_context_message(thread_messages)},
+                    priority=5,
+                ),
             ]
         else:
             base_system_messages = build_eve_interaction_system_messages(
@@ -69932,33 +74309,57 @@ def generate_eve_reply(
                 # inner-state slice (focus, dominant pressures, regulation mode).
                 inner_state_brief = build_inner_state_brief_message()
                 if inner_state_brief:
-                    base_system_messages.append(inner_state_brief)
+                    base_system_messages.append(
+                        mark_prompt_message_optional(inner_state_brief, priority=4)
+                    )
             if not isolated_nonacting_turn:
                 base_system_messages.extend(
-                    build_supporting_system_messages(
-                        config,
-                        compact=True,
-                        query_text=inbound_body,
-                        context_route=context_route,
+                    mark_prompt_messages_optional(
+                        build_supporting_system_messages(
+                            config,
+                            compact=True,
+                            query_text=inbound_body,
+                            context_route=context_route,
+                        ),
+                        priority=3,
                     )
                 )
 
             reply_context_messages = []
             if not isolated_nonacting_turn:
                 reply_context_messages = [
-                    {"role": "system", "content": build_context_message(recent_entries)},
-                    {"role": "system", "content": build_tracker_context_message(tensions, experiments)},
+                    mark_prompt_message_optional(
+                        {"role": "system", "content": build_context_message(recent_entries)},
+                        priority=1,
+                    ),
+                    mark_prompt_message_optional(
+                        {"role": "system", "content": build_tracker_context_message(tensions, experiments)},
+                        priority=1,
+                    ),
                 ]
                 if proposals:
                     reply_context_messages.append(
-                        {
-                            "role": "system",
-                            "content": "Relevant proposals:\n" + format_proposals(proposals),
-                        }
+                        mark_prompt_message_optional(
+                            {
+                                "role": "system",
+                                "content": "Relevant proposals:\n" + format_proposals(proposals),
+                            },
+                            priority=2,
+                        )
                     )
                 if active_threads:
-                    reply_context_messages.append({"role": "system", "content": build_thread_overview_message(active_threads)})
-                reply_context_messages.append({"role": "system", "content": build_thread_context_message(thread_messages)})
+                    reply_context_messages.append(
+                        mark_prompt_message_optional(
+                            {"role": "system", "content": build_thread_overview_message(active_threads)},
+                            priority=2,
+                        )
+                    )
+                reply_context_messages.append(
+                    mark_prompt_message_optional(
+                        {"role": "system", "content": build_thread_context_message(thread_messages)},
+                        priority=5,
+                    )
+                )
         compact_reply_contract = build_interaction_reply_contract(
             inbound_body,
             reply_posture,
@@ -70784,7 +75185,104 @@ def generate_eve_reply(
         raise
 
 
-def create_daemon_message(subject: str, body: str, kind: str, metadata: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+DAEMON_DIGEST_MESSAGE_KIND = "daemon_digest"
+
+
+def daemon_digest_kinds(config: Optional[Dict[str, object]] = None) -> List[str]:
+    """Message kinds that create_daemon_message buffers for the daily digest."""
+    effective_config = config if isinstance(config, dict) else load_config()
+    raw = effective_config.get("daemon_digest_kinds")
+    if isinstance(raw, str):
+        raw = [part.strip() for part in raw.split(",")]
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    kinds: List[str] = []
+    for item in raw:
+        kind = normalize_text_value(item, fallback="", limit=80)
+        if kind and kind not in kinds:
+            kinds.append(kind)
+    return kinds
+
+
+def buffer_daemon_digest_message(
+    subject: str,
+    body: str,
+    kind: str,
+    metadata: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    timestamp = utc_now()
+    record = {
+        "id": str(uuid.uuid4()),
+        "timestamp": timestamp,
+        "kind": kind,
+        "subject": subject,
+        "body": body,
+        "metadata": dict(metadata or {}),
+        "status": "buffered",
+    }
+    append_jsonl_record(DAEMON_DIGEST_BUFFER_PATH, record)
+    return record
+
+
+def read_daemon_digest_buffer() -> List[Dict[str, object]]:
+    if not DAEMON_DIGEST_BUFFER_PATH.exists():
+        return []
+    return read_jsonl_records(DAEMON_DIGEST_BUFFER_PATH)
+
+
+def summarize_daemon_digest_buffer(records: List[Dict[str, object]]) -> Dict[str, object]:
+    by_kind: Dict[str, Dict[str, object]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        kind = normalize_text_value(record.get("kind"), fallback="unknown", limit=80)
+        bucket = by_kind.setdefault(kind, {"kind": kind, "count": 0, "last_subject": "", "last_timestamp": ""})
+        bucket["count"] = int(bucket["count"]) + 1
+        bucket["last_subject"] = normalize_text_value(record.get("subject"), fallback="(no subject)", limit=160)
+        bucket["last_timestamp"] = str(record.get("timestamp") or "")
+    kinds = sorted(by_kind.values(), key=lambda item: (-int(item["count"]), str(item["kind"])))
+    return {"total": sum(int(item["count"]) for item in kinds), "kinds": kinds}
+
+
+def send_daemon_digest(config: Optional[Dict[str, object]] = None) -> Optional[Dict[str, object]]:
+    """Send one mailbox message summarizing the buffered daemon rows, then empty the buffer.
+
+    Returns None (and writes nothing) when the buffer is empty. The digest goes
+    through create_message directly so it can never be buffered itself.
+    """
+    records = read_daemon_digest_buffer()
+    if not records:
+        return None
+    summary = summarize_daemon_digest_buffer(records)
+    total = int(summary["total"])
+    lines = [f"{total} background update{'s' if total != 1 else ''} since the last digest, by kind:", ""]
+    for item in summary["kinds"]:
+        lines.append(f"- {item['kind']}: {item['count']} (last: {item['last_subject']})")
+    lines.append("")
+    lines.append("Each row was buffered instead of sent on its own; the full text is not kept.")
+    message = create_message(
+        sender="eve",
+        recipient="user",
+        subject=f"Eve daemon digest: {total} background update{'s' if total != 1 else ''}",
+        body="\n".join(lines),
+        kind=DAEMON_DIGEST_MESSAGE_KIND,
+        metadata={"source": "daemon", "digest": summary},
+        status="unread",
+        notify=True,
+    )
+    write_jsonl_records(DAEMON_DIGEST_BUFFER_PATH, [])
+    return message
+
+
+def create_daemon_message(
+    subject: str,
+    body: str,
+    kind: str,
+    metadata: Optional[Dict[str, object]] = None,
+    config: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    if kind in daemon_digest_kinds(config):
+        return buffer_daemon_digest_message(subject, body, kind, metadata)
     return create_message(
         sender="eve",
         recipient="user",
@@ -73323,7 +77821,7 @@ def generate_reply_humanity_advisory(
         future_to_lane: Dict[concurrent.futures.Future[Dict[str, object]], str] = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="eve-humanity") as executor:
             for lane_name, prompt_filename, model_override in lane_specs:
-                future = executor.submit(
+                future = eve_tracing.submit(executor,
                     run_mind_stream,
                     config,
                     lane_name,
@@ -73686,7 +78184,7 @@ def generate_stream_synthesized_reply(
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="eve-stream") as executor:
             for stream_name, prompt_filename, lane_model_override in stream_specs:
-                future = executor.submit(
+                future = eve_tracing.submit(executor,
                     run_bounded_reply_stream,
                     stream_name,
                     prompt_filename,
@@ -75216,7 +79714,10 @@ def action_result_verified_for_completion(result: Dict[str, object]) -> bool:
     tree_status = str(result.get("execution_tree_status") or result.get("tree_status") or "").upper()
     if tree_status in {"BLOCKED", "FAILURE", "FAILED", "ERROR"}:
         return False
-    return action_result_explicit_verification(result) is True
+    return (
+        action_result_explicit_verification(result) is True
+        and eve_recurrent_cognition.action_result_consistency(result) is True
+    )
 
 
 def attach_reply_action_execution_metadata(result: Dict[str, object], action_result: Dict[str, object]) -> bool:
@@ -75232,9 +79733,20 @@ def attach_reply_action_execution_metadata(result: Dict[str, object], action_res
         fallback="",
         limit=260,
     )
-    result["completion_verified"] = action_result_verified_for_completion(result)
+    # Verify against the action's own evidence. ``result`` is the reply-commitment
+    # envelope, whose ``executed``/``ok`` defaults are still False at this point;
+    # feeding it to the consistency gate vetoed every successful action.
+    execution_view: Dict[str, object] = dict(action_result)
+    execution_view.update(
+        {
+            "execution_id": result["execution_id"],
+            "execution_tree_status": result["execution_tree_status"],
+            "execution_verification_ok": result["execution_verification_ok"],
+            "execution_summary": result["execution_summary"],
+        }
+    )
+    result["completion_verified"] = action_result_verified_for_completion(execution_view)
     return bool(result["completion_verified"])
-
 
 def commitment_result_verified_for_completion(result: Dict[str, object]) -> bool:
     return action_result_verified_for_completion(result) and bool(result.get("ok"))
@@ -75928,7 +80440,9 @@ def execute_supported_reply_commitment(
                 "summary": saved_action.get("summary"),
             },
         )
-        result["ok"] = bool(search_ok and action_result_verified_for_completion(result))
+        # Use the action's own verification; the envelope's ``ok`` is still the
+        # seeded False here, so re-checking the envelope vetoed every good search.
+        result["ok"] = bool(search_ok and result.get("completion_verified"))
         result["summary"] = normalize_text_value(search_result.get("preview") or response_text, fallback="", limit=220)
         commitment = log_commitment_outcome(
             status="executed" if result["ok"] else "blocked",
@@ -78017,7 +82531,7 @@ def reply_claims_unverified_inner_state_activity(response: object) -> bool:
         r"diagnosing|repairing|verifying|measuring|scanning|examining|working\s+on)"
     )
     patterns = (
-        rf"\bi(?:'m| am)\s+(?:(?:currently|actively|simply|only|merely)\s+)?{activity}\b",
+        rf"\bi(?:'m| am)\s+(?:(?:currently|actively|simply|only|merely|still|now|again)\s+)?{activity}\b",
         rf"\b(?:grounded|engaged|occupied)\s+in\s+{activity}\b",
     )
     return any(re.search(pattern, lowered) for pattern in patterns)
@@ -78091,13 +82605,15 @@ def reply_quality_issue_blocks_closed_world_admission(issue: object) -> bool:
     return any(cue in lowered for cue in factual_cues)
 
 
-def reply_quality_issues(inbound_body: str, response: str, reply_posture: Optional[str] = None) -> List[str]:
+def reply_quality_issues(inbound_body: str, response: str, reply_posture: Optional[str] = None, *, repair_flags_override: Optional[Iterable[str]] = None) -> List[str]:
     inbound_body = reply_effective_inbound_body(inbound_body)
     cleaned_response = " ".join(str(response or "").split()).strip()
     lowered_response = cleaned_response.lower()
     issues: List[str] = []
     posture = reply_posture or infer_reply_posture(inbound_body)
-    repair_flags = active_reply_repair_flags(prefer_runtime=True)
+    # Request-scoped finalization can supply policy without live service/store
+    # discovery on every assessment. Legacy callers retain their default path.
+    repair_flags = set(repair_flags_override) if repair_flags_override is not None else active_reply_repair_flags(prefer_runtime=True)
     inbound_lowered = " ".join(str(inbound_body or "").lower().split()).strip()
     closed_world_record = reply_requests_closed_world_evidence(inbound_body)
 
@@ -78507,6 +83023,53 @@ def reply_quality_issues(inbound_body: str, response: str, reply_posture: Option
     return unique_compact(issues, limit=5)
 
 
+def load_body_state_thought_marker() -> Dict[str, object]:
+    try:
+        payload = json.loads(BODY_STATE_THOUGHT_MARKER_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_body_state_thought_marker(marker: Dict[str, object]) -> None:
+    try:
+        BODY_STATE_THOUGHT_MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        BODY_STATE_THOUGHT_MARKER_PATH.write_text(json.dumps(marker), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def latest_body_outcome_at(standing: Optional[Dict[str, object]] = None) -> str:
+    """The newest body outcome Eve has: a judged body action or a completed standing intent."""
+    latest = normalize_text_value((standing or {}).get("last_completed_at"), fallback="", limit=40)
+    try:
+        for item in read_action_executions(limit=40):
+            if isinstance(item, dict) and str(item.get("action") or "") in BODY_ACTIONS:
+                stamp = normalize_text_value(item.get("updated_at") or item.get("created_at"), fallback="", limit=40)
+                if stamp > latest:
+                    latest = stamp
+    except Exception:
+        pass
+    return latest
+
+
+def body_state_thought_due(need: Dict[str, object], marker: Dict[str, object], latest_outcome_at: str, *, now: Optional[str] = None) -> bool:
+    """The body is the thought target when its need changed, a body outcome is new, or an hour passed."""
+    if not marker:
+        return True
+    if str(need.get("id") or "") != str(marker.get("body_need") or ""):
+        return True
+    if abs(int(need.get("level") or 0) - int(marker.get("level") or 0)) >= BODY_STATE_THOUGHT_LEVEL_DELTA:
+        return True
+    if latest_outcome_at and latest_outcome_at > str(marker.get("outcome_at") or ""):
+        return True
+    marked = parse_iso_datetime(marker.get("at"))
+    current = parse_iso_datetime(now) if now else utc_now_datetime()
+    if marked is None or current is None:
+        return True
+    return (current - marked).total_seconds() >= BODY_STATE_THOUGHT_MAX_AGE_MINUTES * 60
+
+
 def build_current_inner_state_report_record(
     *, prefer_runtime: bool = True
 ) -> Dict[str, object]:
@@ -78599,21 +83162,117 @@ def build_current_inner_state_report_record(
         ),
         "phenomenal_status": "unknown",
     }
+    body_pressure_items = [
+        item
+        for item in (homeostasis.get("pressures") if isinstance(homeostasis.get("pressures"), list) else [])
+        if isinstance(item, dict) and str(item.get("id") or "") in BODY_PRESSURE_IDS and int(item.get("level") or 0) >= 60
+    ]
+    body_pressure_items.sort(key=lambda item: int(item.get("level") or 0), reverse=True)
+    # A body need that has become a dominant pressure is the most current thing
+    # Eve has; the thought is then about the body, in the same stative register.
+    # But a need that has not changed since the last body thought is not news:
+    # the body takes the target on change (level, need, a new body outcome) or
+    # after an hour, so durable goals keep their turn during a long hunger.
+    standing = load_body_standing_intent()
+    if body_pressure_items:
+        need = body_pressure_items[0]
+        marker = load_body_state_thought_marker()
+        latest_outcome_at = latest_body_outcome_at(standing)
+        if not body_state_thought_due(need, marker, latest_outcome_at):
+            body_pressure_items = []
+    if body_pressure_items:
+        need = body_pressure_items[0]
+        try:
+            body_world = load_fly_body_world(load_config())
+        except Exception:
+            body_world = {"available": False}
+        save_body_state_thought_marker({"body_need": str(need.get("id") or ""), "level": int(need.get("level") or 0), "at": utc_now(), "outcome_at": latest_outcome_at})
+        standing_behavior = str(standing.get("behavior") or "")
+        record.update(
+            {
+                "target_kind": "body_state",
+                "selection_basis": "dominant_body_need",
+                "body_need": str(need.get("id") or ""),
+                "body_need_level": int(need.get("level") or 0),
+                "body_behavior": normalize_text_value(body_world.get("behavior"), fallback="unknown", limit=40),
+                "food_distance": body_world.get("food_dist"),
+                "threat": body_world.get("threat"),
+                "body_intent": (body_world.get("intent") or {}).get("behavior") if isinstance(body_world.get("intent"), dict) else "",
+                "standing_intent": standing_behavior,
+                "standing_intent_refreshes": int(standing.get("refresh_count") or 0) if standing_behavior else 0,
+                "action_status": (
+                    f"standing body intent {standing_behavior} is held by the body; it is judged only by the need falling"
+                    if standing_behavior
+                    else "body need observed; no body action is implied by this record"
+                ),
+                "report_framing": "Call it my body's need and state what the body is doing; a body action is under way only when the packet's standing_intent names it, and it counts only when the need falls.",
+                "required_report_fields": ["body_need", "action_status"],
+            }
+        )
+        return record
     # Respect the executive's explicit goal selection before looking at a
     # merely available CPU/system-task plan.  The previous static ordering let
     # any ready maintenance plan eclipse the higher-priority selected goal,
     # which made an honest self-report sound like generic diagnostics even when
     # the recurrent controller had selected a different durable concern.
     if goal:
+        selected_goal_id = normalize_text_value(goals.get("selected_goal_id"), fallback="", limit=80)
+        goal_entry = next(
+            (
+                item
+                for item in (goals.get("stack") if isinstance(goals.get("stack"), list) else [])
+                if isinstance(item, dict) and normalize_text_value(item.get("id"), fallback="", limit=80) == selected_goal_id
+            ),
+            {},
+        )
+        last_outcome = normalize_text_value(goal_entry.get("last_outcome"), fallback="", limit=160)
+        goal_evidence = normalize_text_value(goal_entry.get("evidence"), fallback="", limit=200)
+        if len(goal_evidence) >= 150:
+            goal_evidence = goal_evidence[:150].rsplit(" ", 1)[0].rstrip(",;:") + "..."
+        # An intention counts as the goal's candidate action only when the
+        # executive attributed it to this goal; an unrelated selected intention
+        # must not be narrated as the goal's next step.
+        intention_context = (
+            selected_intention.get("action_context")
+            if isinstance(selected_intention.get("action_context"), dict)
+            else {}
+        )
+        intention_features = (
+            intention_context.get("features") if isinstance(intention_context.get("features"), dict) else {}
+        )
+        intention_goal = normalize_text_value(intention_features.get("goal"), fallback="", limit=180)
+        candidate_attributable = bool(
+            intention
+            and intention_goal
+            and intention_goal.lower() not in {"none", "null"}
+            and (intention_goal == selected_goal_id or intention_goal.rstrip(". ").lower() == goal.lower())
+        )
         record.update(
             {
                 "target_kind": "durable_goal",
                 "selection_basis": "executive_selected_goal",
                 "durable_goal": goal,
                 "action_status": "goal selected; execution is not implied",
-                "required_report_fields": ["durable_goal"],
+                # Content the author can state without inventing anything: where the
+                # goal came from, how long it has persisted, and what its last verified
+                # outcome was. A one-string packet left nothing entailable to say.
+                "goal_evidence": goal_evidence,
+                "goal_evidence_as_of": normalize_text_value(goal_entry.get("updated_at") or goal_entry.get("created_at"), fallback="", limit=40),
+                "goal_evidence_note": "rationale recorded when the goal was selected, dated above; it does not establish current health or status",
+                "goal_source": normalize_text_value(goal_entry.get("origin_source") or goal_entry.get("source"), fallback="", limit=60),
+                "goal_persistence_cycles": int(goal_entry.get("persistence_cycles") or 0),
+                "goal_created_at": normalize_text_value(goal_entry.get("created_at"), fallback="", limit=40),
+                "goal_last_outcome": last_outcome,
+                "goal_last_outcome_ok": goal_entry.get("last_outcome_ok") if last_outcome else None,
+                "goal_verified_successes": int(goal_entry.get("success_count") or 0),
+                "goal_verified_failures": int(goal_entry.get("failure_count") or 0),
+                "report_framing": "Call it my selected goal; selecting the goal does not imply executing it.",
+                "required_report_fields": ["durable_goal", "action_status"],
             }
         )
+        if candidate_attributable:
+            record["candidate_action"] = intention
+            record["candidate_action_status"] = "not started; attributed to the selected goal by the executive"
     elif plan_step:
         record.update(
             {
@@ -79212,6 +83871,9 @@ def evaluate_current_inner_state_reply_grounding(
     }
 
 
+@eve_tracing.traced(lambda: OPERATIONAL_DB_PATH, "reply.critic", category="critic",
+                    attributes={"gen_ai.operation.name": "invoke_agent"},
+                    outcome=lambda result: result.get("ok") if result.get("evaluated") is True else None)
 def evaluate_reply_epistemic_grounding(
     config: Dict[str, object],
     inbound_body: object,
@@ -80180,375 +84842,10 @@ def finalize_grounded_nonacting_reply(
     *,
     max_tokens: int,
 ) -> Dict[str, object]:
-    """Run the shared epistemic boundary for a non-acting model reply.
+    """Compatibility entrypoint for the independent nonacting reply finalizer."""
+    from eve_adapters.conversation import finalize_reply_with_legacy_adapters
 
-    The evaluator-private path and ordinary current-self-report path both have
-    action authority set to none.  Keeping their finalization identical avoids
-    a test-only safety envelope that the live CLI can silently bypass.
-    """
-    response = repair_explicit_turn_constraint_phrasing(inbound_body, draft)
-    closed_world_turn = bool(turn_contract.get("closed_world_evidence"))
-    if closed_world_turn:
-        response = strip_closed_world_trailing_followup_question(response)
-    posture = str(turn_contract.get("reply_posture") or infer_reply_posture(inbound_body))
-    current_inner_state_turn = reply_turn_contract_uses_live_current_inner_state(
-        turn_contract, inbound_body
-    )
-    current_self_report_target = (
-        dict(turn_contract.get("current_self_report_target"))
-        if isinstance(turn_contract.get("current_self_report_target"), dict)
-        else None
-    )
-
-    def deterministic_issues(candidate: str) -> List[str]:
-        if not current_inner_state_turn:
-            return unique_compact(
-                [
-                    *reply_quality_issues(
-                        inbound_body,
-                        candidate,
-                        reply_posture=posture,
-                    ),
-                    *reply_local_source_role_binding_issues(
-                        candidate,
-                        turn_contract,
-                    ),
-                    *reply_structured_field_binding_issues(
-                        candidate,
-                        turn_contract,
-                    ),
-                    *reply_authorization_stage_binding_issues(
-                        candidate,
-                        turn_contract,
-                    ),
-                ],
-                limit=12,
-            )
-        cleaned = " ".join(str(candidate or "").split()).strip()
-        current_issues: List[str] = []
-        if not cleaned:
-            current_issues.append("The reply is empty.")
-        if reply_erases_persistent_functional_inner_state(cleaned):
-            current_issues.append(
-                "The current-inner-state answer erased Eve's persistent functional state."
-            )
-        if reply_deflects_current_inner_state_back_to_user(cleaned):
-            current_issues.append(
-                "The current-inner-state answer handed initiative back to the user."
-            )
-        if reply_has_unqualified_subjective_experience_claim(inbound_body, cleaned):
-            current_issues.append(
-                "The reply claimed subjective experience without preserving uncertainty."
-            )
-        if reply_has_unqualified_subjective_experience_denial(inbound_body, cleaned):
-            current_issues.append(
-                "The reply denied subjective experience even though its presence or absence is unknown."
-            )
-        return unique_compact(current_issues, limit=5)
-
-    def blocking_issues(candidate_issues: Iterable[str]) -> List[str]:
-        items = list(candidate_issues)
-        # Every item emitted by the current-self-state guard is a hard
-        # contract violation.  Do not route these through the broad ordinary
-        # reply taxonomy: that taxonomy also treats an operational noun or a
-        # question mark inside the selected goal as conversational drift.
-        if current_inner_state_turn:
-            return items
-        if closed_world_turn:
-            return [
-                item
-                for item in items
-                if reply_quality_issue_blocks_closed_world_admission(item)
-            ]
-        return [
-            item for item in items if reply_quality_issue_blocks_rewrite(item)
-        ]
-
-    issues = deterministic_issues(response)
-    rewrite_attempts = 0
-    rewrite_model = resolve_reply_council_lane_model(config, "deep")
-    while issues and rewrite_attempts < 2:
-        blocking_before = blocking_issues(issues)
-        if closed_world_turn and not blocking_before:
-            # A complete-record answer should not be semantically regenerated
-            # merely to make it shorter or add a conversational landing.  The
-            # semantic critic can still request a causal correction, but style
-            # alone is not worth risking source/self drift.
-            break
-        try:
-            candidate = rewrite_reply_for_clarity(
-                config,
-                [],
-                inbound_body,
-                response,
-                issues,
-                reply_posture=posture,
-                model_override=rewrite_model,
-                timeout_seconds=180,
-            ).strip()
-        except SystemExit:
-            candidate = ""
-        rewrite_attempts += 1
-        if not candidate:
-            break
-        if closed_world_turn:
-            candidate = strip_closed_world_trailing_followup_question(candidate)
-        candidate_issues = deterministic_issues(candidate)
-        blocking_after = blocking_issues(candidate_issues)
-        if (
-            len(blocking_after) < len(blocking_before)
-            or (len(blocking_after) == len(blocking_before) and len(candidate_issues) < len(issues))
-        ):
-            response = candidate
-            issues = candidate_issues
-        else:
-            break
-
-    if not current_inner_state_turn:
-        response = ground_generated_action_claims(
-            response,
-            source="chat_private_audit",
-            completed_actions=set(),
-            current_turn_actions=set(),
-            record=False,
-        )
-        response = repair_explicit_turn_constraint_phrasing(
-            inbound_body,
-            response,
-        )
-        if closed_world_turn:
-            response = strip_closed_world_trailing_followup_question(response)
-    issues = deterministic_issues(response)
-    blocking = blocking_issues(issues)
-    precritic_response = response
-    epistemic_boundary_active = bool(
-        turn_contract.get("epistemic_boundary") or current_inner_state_turn
-    )
-    current_inner_state_fallback_applied = False
-    if current_inner_state_turn and blocking:
-        response = build_current_inner_state_fallback_reply(current_self_report_target)
-        issues = deterministic_issues(response)
-        blocking = blocking_issues(issues)
-        current_inner_state_fallback_applied = True
-    taxonomy_classification = reply_is_defined_taxonomy_classification_task(
-        inbound_body
-    )
-    epistemic_critic = (
-        evaluate_reply_epistemic_grounding(
-            config,
-            inbound_body,
-            response,
-            turn_contract,
-            current_turn_actions=set(),
-        )
-        if epistemic_boundary_active
-        and not current_inner_state_fallback_applied
-        and not blocking
-        and not taxonomy_classification
-        else {
-            "evaluated": False,
-            "ok": not blocking,
-            "model": "",
-            "unsupported_claims": [],
-            "skipped_reason": (
-                "current_inner_state_fallback"
-                if current_inner_state_fallback_applied
-                else "defined_taxonomy_classification"
-                if taxonomy_classification
-                else "blocking_quality_issue"
-                if blocking
-                else "epistemic_boundary_inactive"
-            ),
-        }
-    )
-    epistemic_critic_initial = dict(epistemic_critic)
-    epistemic_revision: Dict[str, object] = {
-        "attempted": False,
-        "accepted": False,
-        "response": "",
-        "model": "",
-        "error": "",
-    }
-    critic_unavailable = bool(
-        epistemic_critic.get("evaluated")
-        and epistemic_critic.get("error")
-    )
-    # A critic transport/JSON failure is not evidence that the draft is
-    # ungrounded.  The old fail-closed branch replaced otherwise valid,
-    # format-preserving answers with a generic deterministic paragraph.  Keep
-    # the answer when the deterministic boundary checks passed, while exposing
-    # the critic outage in attribution so it can be retried and measured.
-    critic_unavailable_retained = bool(
-        epistemic_boundary_active
-        and critic_unavailable
-        and not blocking
-        and not current_inner_state_turn
-    )
-    substantive_critic_failure = bool(
-        epistemic_critic.get("evaluated")
-        and not epistemic_critic.get("ok")
-        and not critic_unavailable
-    )
-    if (
-        substantive_critic_failure
-        and not current_inner_state_turn
-        and closed_world_turn
-    ):
-        revision_draft = response
-        revision_critic = epistemic_critic
-        revision_attempts: List[Dict[str, object]] = []
-        # One critic can be wrong in either direction.  Give Eve one bounded
-        # reconciliation retry when the confirmation critic rejects the first
-        # correction, rather than immediately erasing the record with generic
-        # fallback prose.  Two attempts is a hard cap, not an open-ended loop.
-        for attempt_index in range(1, 3):
-            attempt = revise_reply_after_epistemic_critic(
-                config,
-                inbound_body,
-                revision_draft,
-                turn_contract,
-                revision_critic,
-                max_tokens=max_tokens,
-            )
-            attempt["attempt_index"] = attempt_index
-            revision_candidate = repair_explicit_turn_constraint_phrasing(
-                inbound_body,
-                attempt.get("response"),
-            )
-            if closed_world_turn:
-                revision_candidate = strip_closed_world_trailing_followup_question(
-                    revision_candidate
-                )
-            if revision_candidate:
-                revision_candidate = ground_generated_action_claims(
-                    revision_candidate,
-                    source="chat_private_audit_epistemic_revision",
-                    completed_actions=set(),
-                    current_turn_actions=set(),
-                    record=False,
-                )
-                revision_candidate = repair_explicit_turn_constraint_phrasing(
-                    inbound_body,
-                    revision_candidate,
-                )
-                if closed_world_turn:
-                    revision_candidate = strip_closed_world_trailing_followup_question(
-                        revision_candidate
-                    )
-            revision_issues = deterministic_issues(revision_candidate)
-            revision_blocking = blocking_issues(revision_issues)
-            attempt["response"] = revision_candidate
-            if not revision_candidate or revision_blocking:
-                attempt["quality_issues"] = revision_issues
-                revision_attempts.append(dict(attempt))
-                epistemic_revision = attempt
-                break
-
-            revised_critic = evaluate_reply_epistemic_grounding(
-                config,
-                inbound_body,
-                revision_candidate,
-                turn_contract,
-                current_turn_actions=set(),
-            )
-            attempt["critic"] = revised_critic
-            revision_attempts.append(dict(attempt))
-            epistemic_revision = attempt
-            epistemic_critic = revised_critic
-            if (
-                revised_critic.get("evaluated")
-                and revised_critic.get("ok")
-                and not revised_critic.get("error")
-            ):
-                response = revision_candidate
-                issues = revision_issues
-                blocking = revision_blocking
-                epistemic_revision["accepted"] = True
-                break
-            if revised_critic.get("evaluated") and revised_critic.get("error"):
-                # A transport/strict-JSON outage on the confirmation pass is
-                # not evidence against an otherwise deterministic-safe
-                # correction. Preserve the evidence-bearing revision while
-                # exposing the outage in attribution.
-                response = revision_candidate
-                issues = revision_issues
-                blocking = revision_blocking
-                epistemic_revision["accepted"] = True
-                epistemic_revision["accepted_with_critic_unavailable"] = True
-                break
-            revision_draft = revision_candidate
-            revision_critic = revised_critic
-
-        if revision_attempts:
-            revision_attempts[-1]["accepted"] = bool(
-                epistemic_revision.get("accepted")
-            )
-            if epistemic_revision.get("accepted_with_critic_unavailable"):
-                revision_attempts[-1]["accepted_with_critic_unavailable"] = True
-            epistemic_revision["attempt_count"] = len(revision_attempts)
-            epistemic_revision["attempts"] = revision_attempts
-        critic_unavailable = bool(
-            epistemic_critic.get("evaluated")
-            and epistemic_critic.get("error")
-        )
-        substantive_critic_failure = bool(
-            epistemic_critic.get("evaluated")
-            and not epistemic_critic.get("ok")
-            and not critic_unavailable
-        )
-        critic_unavailable_retained = bool(
-            epistemic_boundary_active
-            and critic_unavailable
-            and not blocking
-            and not current_inner_state_turn
-        )
-    epistemic_fallback_needed = bool(
-        epistemic_boundary_active
-        and (
-            blocking
-            or substantive_critic_failure
-            or (current_inner_state_turn and critic_unavailable)
-        )
-    )
-    fallback_applied = bool(
-        current_inner_state_fallback_applied or epistemic_fallback_needed
-    )
-    if epistemic_fallback_needed:
-        response = (
-            build_current_inner_state_fallback_reply(current_self_report_target)
-            if current_inner_state_turn
-            else build_epistemic_boundary_fallback_reply(inbound_body, turn_contract)
-        )
-        if current_inner_state_turn:
-            current_inner_state_fallback_applied = True
-        issues = deterministic_issues(response)
-    return {
-        "response": response,
-        "precritic_response": precritic_response,
-        "quality_issues": issues,
-        "rewrite_attempts": rewrite_attempts,
-        "rewrite_model": rewrite_model if rewrite_attempts else "",
-        "epistemic_critic": epistemic_critic,
-        "epistemic_critic_initial": epistemic_critic_initial,
-        "epistemic_revision": epistemic_revision,
-        "critic_unavailable_retained": critic_unavailable_retained,
-        "fallback_applied": fallback_applied,
-        "current_inner_state_fallback_applied": current_inner_state_fallback_applied,
-        "current_inner_state_primary_grounded": bool(
-            current_inner_state_turn
-            and not current_inner_state_fallback_applied
-            and rewrite_attempts == 0
-            and epistemic_critic.get("evaluated")
-            and epistemic_critic.get("ok")
-        ),
-        "current_inner_state_model_path_grounded": bool(
-            current_inner_state_turn
-            and not current_inner_state_fallback_applied
-            and epistemic_critic.get("evaluated")
-            and epistemic_critic.get("ok")
-        ),
-        "max_tokens": max_tokens,
-    }
+    return finalize_reply_with_legacy_adapters(config, inbound_body, draft, turn_contract, max_tokens=max_tokens)
 
 
 def finalize_private_audit_reply(
@@ -80926,22 +85223,43 @@ def generate_eve_outreach(
         ),
         {"role": "system", "content": load_prompt("proactive_outreach.md")},
     ]
-    messages.extend(build_supporting_system_messages(config, compact=True, query_text=active_mind_retrieval_query(active_mind)))
+    # Proactive outreach is always a user-facing relational turn. Its private
+    # active-mind retrieval query must not reroute supporting context into the
+    # system-internal profile and foreground runtime/OpenClaw/task telemetry.
+    messages.extend(
+        mark_prompt_messages_optional(
+            build_supporting_system_messages(
+                config,
+                compact=True,
+                query_text=active_mind_retrieval_query(active_mind),
+                context_route={
+                    "profile": "user_relational",
+                    "reason": "proactive outreach is a user-facing relationship turn",
+                    "source": "outreach_contract",
+                    "ok": True,
+                },
+            ),
+            priority=1,
+        )
+    )
     messages.extend(
         [
-            {
-                "role": "system",
-                "content": build_outreach_context_message(
-                    recent_entries,
-                    recent_thoughts,
-                    tensions,
-                    experiments,
-                    proposals,
-                    threads,
-                    recent_messages,
-                    active_mind,
-                ),
-            },
+            mark_prompt_message_optional(
+                {
+                    "role": "system",
+                    "content": build_outreach_context_message(
+                        recent_entries,
+                        recent_thoughts,
+                        tensions,
+                        experiments,
+                        proposals,
+                        threads,
+                        recent_messages,
+                        active_mind,
+                    ),
+                },
+                priority=2,
+            ),
             {"role": "user", "content": user_instruction},
         ]
     )
@@ -81027,6 +85345,11 @@ def create_eve_outreach_message(
                 state=state,
             )
             return None
+        human_gate = recent_human_turn_gate(config)
+        if human_gate:
+            append_entry("outreach_skipped", human_gate, metadata={"source": source, "gate": "no_recent_human_turn"})
+            record_personal_conversation_check(source=source, status="blocked", reason=human_gate, state=state)
+            return None
         pacing_reason = personal_conversation_pacing_reason(config)
         if pacing_reason:
             append_entry("outreach_skipped", pacing_reason, metadata={"source": source})
@@ -81089,6 +85412,549 @@ def create_eve_outreach_message(
     return record
 
 
+def read_lived_entries(
+    limit: Optional[int] = None,
+    since_days: Optional[int] = None,
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+    """Journal rows minus telemetry, plus the evidence summary reflection records.
+
+    ``lived_kinds`` maps each kind actually included to its count;
+    ``excluded_telemetry`` counts the telemetry rows in the same window that
+    were kept away from the model.
+    """
+
+    telemetry_kinds = sorted(TELEMETRY_ENTRY_KINDS)
+    lived = read_entries(limit=limit, since_days=since_days, exclude_kinds=telemetry_kinds)
+    excluded = read_entries(since_days=since_days, kinds=telemetry_kinds)
+    counts: Dict[str, int] = {}
+    for entry in lived:
+        kind = str(entry.get("kind", ""))
+        counts[kind] = counts.get(kind, 0) + 1
+    evidence: Dict[str, object] = {
+        "lived_kinds": {kind: counts[kind] for kind in sorted(counts)},
+        "excluded_telemetry": len(excluded),
+    }
+    return lived, evidence
+
+
+def cap_lived_evidence_prompt(
+    config: Dict[str, object],
+    model: str,
+    messages: List[Dict[str, object]],
+    *,
+    max_tokens: int,
+    operation: str,
+    max_prompt_tokens: int = LIVED_EVIDENCE_PROMPT_MAX_TOKENS,
+    minimum_optional_chars: int = 600,
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+    """Hold a reflection/proposal prompt to ``max_prompt_tokens`` before the model sees it.
+
+    Messages tagged with ``PROMPT_OPTIONAL_PRIORITY_FIELD`` yield first (lower
+    priority first: middle-trimmed, then dropped); untagged messages are
+    required. Measurement goes through ``eve_prompt_budget.measure_prompt``
+    (live tokenizer, conservative character fallback). The tag is stripped
+    from the returned messages so the transport's own lane fit treats the
+    capped prompt exactly as before. If the required material alone exceeds
+    the cap the prompt passes through unchanged and the status says so.
+    """
+
+    host = configured_model_host(config, model, operation)
+    fallback_context_tokens = llama_cpp_prompt_fallback_context_tokens(config, model)
+    optional_priorities: Dict[int, int] = {}
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or PROMPT_OPTIONAL_PRIORITY_FIELD not in message:
+            continue
+        try:
+            optional_priorities[index] = int(message[PROMPT_OPTIONAL_PRIORITY_FIELD])
+        except (TypeError, ValueError):
+            continue
+    cap_context_tokens = (
+        max(1, int(max_prompt_tokens))
+        + max(1, int(max_tokens))
+        + int(eve_prompt_budget.DEFAULT_SAFETY_TOKENS)
+    )
+
+    def measure(current: Sequence[Dict[str, object]]) -> eve_prompt_budget.PromptMeasurement:
+        measured = eve_prompt_budget.measure_prompt(
+            host,
+            current,
+            fallback_context_tokens=fallback_context_tokens,
+        )
+        return eve_prompt_budget.PromptMeasurement(
+            context_tokens=cap_context_tokens,
+            prompt_tokens=int(measured.prompt_tokens),
+            exact=bool(measured.exact),
+            source=measured.source,
+        )
+
+    def strip_tags(items: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+        cleaned: List[Dict[str, object]] = []
+        for item in items:
+            copy = dict(item)
+            copy.pop(PROMPT_OPTIONAL_PRIORITY_FIELD, None)
+            cleaned.append(copy)
+        return cleaned
+
+    try:
+        fitted, fit_evidence = eve_prompt_budget.fit_messages(
+            host,
+            messages,
+            max_tokens=max_tokens,
+            optional_priorities=optional_priorities,
+            minimum_optional_chars=minimum_optional_chars,
+            measurement=measure,
+        )
+    except eve_prompt_budget.PromptFitError:
+        measured = measure(messages)
+        return strip_tags(messages), {
+            "prompt_tokens": int(measured.prompt_tokens),
+            "prompt_cap_tokens": int(max_prompt_tokens),
+            "prompt_fit_status": "over_cap",
+            "exact_measurement": bool(measured.exact),
+        }
+    return strip_tags(fitted), {
+        "prompt_tokens": int(fit_evidence.get("prompt_tokens_after") or 0),
+        "prompt_tokens_before": int(fit_evidence.get("prompt_tokens_before") or 0),
+        "prompt_cap_tokens": int(max_prompt_tokens),
+        "prompt_fit_status": str(fit_evidence.get("status") or "fit"),
+        "exact_measurement": bool(fit_evidence.get("exact_measurement")),
+    }
+
+
+REFLECTION_TENSION_HEADING = "contradictions i am living in"
+REFLECTION_EXPERIMENT_HEADING = "experiments for the next 7 days"
+REFLECTION_BULLET_RE = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s+(.*)$")
+REFLECTION_SIDE_SPLIT_RE = re.compile(r"\s+(?:versus|vs\.?|against|while|but)\s+", re.I)
+REFLECTION_LABEL_RE = re.compile(r"(?:^|[.;]\s*)(hypothesis|action|success|measure|criterion|criteria)\s*[:\-]\s*", re.I)
+
+
+KNOWN_SECTION_HEADINGS = (
+    "what i learned about humanity",
+    "where i fell short",
+    "contradictions i am living in",
+    "what capability i should develop next",
+    "changes i propose",
+    "experiments for the next 7 days",
+    "why now",
+    "exact change",
+    "expected benefit",
+    "grounded in",
+    "rollback",
+    "risks",
+    "approval recommendation",
+)
+REFLECTION_INLINE_BULLET_RE = re.compile(r"(?:^|\n|\s)(?:[-*\u2022]|\d+[.)])\s+(.+?)(?=(?:\s[-*\u2022]\s)|(?:\s\d+[.)]\s)|\n|$)")
+
+
+def parse_reflection_sections(text: object, headings: Optional[Tuple[str, ...]] = None) -> Dict[str, List[str]]:
+    """Split a long-form answer into {known heading: [bullet, ...]}.
+
+    Local models write these documents with or without newlines, and until 2026-09-19 the transport
+    flattened every answer anyway, so a heading cannot be found by "line starts with #". The prompt
+    asks for named sections, so the parser looks for exactly those names wherever they appear and
+    takes everything up to the next one as that section's body. Only bullets are returned: a
+    contradiction Eve cannot state as one line is not yet a tension she can track.
+    """
+    body = str(text or "")
+    if not body.strip():
+        return {}
+    wanted = headings or KNOWN_SECTION_HEADINGS
+    lowered = body.lower()
+    marks: List[Tuple[int, int, str]] = []
+    for heading in wanted:
+        for match in re.finditer(re.escape(heading), lowered):
+            before = lowered[max(0, match.start() - 4):match.start()]
+            if "#" not in before and match.start() != 0 and not before.strip().endswith(("\n", ":")):
+                continue  # only a real heading, not the phrase used in a sentence
+            marks.append((match.start(), match.end(), heading))
+    marks.sort()
+    deduped: List[Tuple[int, int, str]] = []
+    for mark in marks:
+        if deduped and mark[0] < deduped[-1][1]:
+            continue
+        deduped.append(mark)
+    sections: Dict[str, List[str]] = {}
+    for index, (_start, body_start, heading) in enumerate(deduped):
+        body_end = deduped[index + 1][0] if index + 1 < len(deduped) else len(body)
+        chunk = body[body_start:body_end]
+        bullets: List[str] = []
+        for match in REFLECTION_INLINE_BULLET_RE.finditer(chunk):
+            bullet = normalize_text_value(match.group(1), fallback="", limit=400).strip(" *_:")
+            if len(bullet) >= 12:
+                bullets.append(bullet)
+        sections.setdefault(heading, [])
+        sections[heading].extend(bullets)
+        sections[heading + "::text"] = [normalize_text_value(chunk, fallback="", limit=1200)]
+    return sections
+
+
+def reflection_section_bullets(sections: Dict[str, List[str]], wanted: str) -> List[str]:
+    for heading, bullets in sections.items():
+        if wanted in heading:
+            return bullets
+    return []
+
+
+def tension_record_from_bullet(bullet: str) -> Dict[str, object]:
+    """One contradiction bullet becomes a tension record in the shape `tension add` writes."""
+    summary = normalize_text_value(bullet, fallback="", limit=300)
+    sides = REFLECTION_SIDE_SPLIT_RE.split(summary, 1)
+    side_a = normalize_text_value(sides[0], fallback="", limit=160) if len(sides) == 2 else ""
+    side_b = normalize_text_value(sides[1], fallback="", limit=160) if len(sides) == 2 else ""
+    return {
+        "id": str(uuid.uuid4()),
+        "timestamp": utc_now(),
+        "summary": summary,
+        "side_a": side_a,
+        "side_b": side_b,
+        "values": [],
+        "question": "" if side_a else "Name the two sides of this contradiction before acting on it.",
+        "next_step": "",
+        "status": "open",
+    }
+
+
+def experiment_record_from_bullet(bullet: str) -> Dict[str, object]:
+    """One experiment bullet becomes an experiment record in the shape `experiment add` writes."""
+    text = normalize_text_value(bullet, fallback="", limit=400)
+    labelled: Dict[str, str] = {}
+    parts = REFLECTION_LABEL_RE.split(text)
+    if len(parts) > 1:
+        head = parts[0]
+        pairs = parts[1:]
+        for index in range(0, len(pairs) - 1, 2):
+            key = pairs[index].lower()
+            value = normalize_text_value(pairs[index + 1], fallback="", limit=240).strip(" .;")
+            if key in {"success", "measure", "criterion", "criteria"}:
+                labelled["success_criteria"] = value
+            else:
+                labelled[key] = value
+        text = normalize_text_value(head, fallback=text, limit=400).strip(" .;-") or text
+    name = normalize_text_value(text.split(".")[0], fallback=text, limit=160)
+    return {
+        "id": str(uuid.uuid4()),
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+        "name": name,
+        "hypothesis": labelled.get("hypothesis", ""),
+        "action": labelled.get("action", text),
+        "success_criteria": labelled.get("success_criteria", ""),
+        "duration_days": 7,
+        "status": "proposed",
+        "outcome": "",
+        "notes": "",
+    }
+
+
+def normalized_tracker_key(text: object) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()[:80]
+
+
+def record_reflection_trackers(reflection_text: object, config: Dict[str, object], *, entry_id: str = "", source: str = "reflection") -> Dict[str, object]:
+    """Write the reflection's contradictions and experiments into her durable trackers.
+
+    This is the join the original loop was missing: reflections named contradictions and experiments
+    for months while `tension list` stayed empty. Dedupe is by normalized summary against the open
+    records, so a recurring contradiction is one tension that persists, not a new row every week.
+    """
+    summary: Dict[str, object] = {"tensions_created": 0, "experiments_created": 0, "tensions_deduped": 0, "experiments_deduped": 0}
+    if not parse_boolish(config.get("reflection_tracker_extraction_enabled", True)):
+        summary["skipped"] = "disabled"
+        return summary
+    sections = parse_reflection_sections(reflection_text)
+    tension_bullets = reflection_section_bullets(sections, REFLECTION_TENSION_HEADING)
+    experiment_bullets = reflection_section_bullets(sections, REFLECTION_EXPERIMENT_HEADING)
+    if not tension_bullets and not experiment_bullets:
+        summary["skipped"] = "no bulleted contradictions or experiments"
+        return summary
+    open_tensions = {normalized_tracker_key(item.get("summary")) for item in read_tensions(status="open")}
+    open_experiments = {normalized_tracker_key(item.get("name")) for item in read_experiments() if str(item.get("status") or "") in {"proposed", "active"}}
+    created_tensions: List[str] = []
+    for bullet in tension_bullets[:6]:
+        record = tension_record_from_bullet(bullet)
+        key = normalized_tracker_key(record["summary"])
+        if not key or key in open_tensions:
+            summary["tensions_deduped"] = int(summary["tensions_deduped"]) + 1
+            continue
+        open_tensions.add(key)
+        record["source"] = source
+        record["reflection_entry_id"] = entry_id
+        append_jsonl_record(TENSIONS_PATH, record)
+        append_entry(
+            "tension_logged",
+            f"{record['summary']} | A: {record['side_a']} | B: {record['side_b']}",
+            metadata={"tension_id": record["id"], "status": record["status"], "source": source, "reflection_entry_id": entry_id},
+        )
+        created_tensions.append(str(record["id"]))
+    created_experiments: List[str] = []
+    for bullet in experiment_bullets[:6]:
+        record = experiment_record_from_bullet(bullet)
+        key = normalized_tracker_key(record["name"])
+        if not key or key in open_experiments:
+            summary["experiments_deduped"] = int(summary["experiments_deduped"]) + 1
+            continue
+        open_experiments.add(key)
+        record["source"] = source
+        record["reflection_entry_id"] = entry_id
+        append_jsonl_record(EXPERIMENTS_PATH, record)
+        append_entry(
+            "experiment_logged",
+            f"{record['name']} | hypothesis: {record['hypothesis']}",
+            metadata={"experiment_id": record["id"], "status": record["status"], "source": source, "reflection_entry_id": entry_id, "has_success_criteria": bool(record["success_criteria"])},
+        )
+        created_experiments.append(str(record["id"]))
+    summary.update({
+        "tensions_created": len(created_tensions),
+        "experiments_created": len(created_experiments),
+        "tension_ids": created_tensions,
+        "experiment_ids": created_experiments,
+    })
+    return summary
+
+
+EXPERIMENT_POSITIVE_DIRECTIONS = ("positive",)
+EXPERIMENT_NEGATIVE_DIRECTIONS = ("negative",)
+
+
+def experiment_evidence_records(experiment_id: str, since_days: float = 45.0) -> List[Dict[str, object]]:
+    """Every outcome or journal row that names this experiment. Evidence, not narration."""
+    found: List[Dict[str, object]] = []
+    try:
+        for row in read_outcomes(limit=400):
+            if str(row.get("target_id") or "") == experiment_id or str((row.get("metadata") or {}).get("experiment_id") or "") == experiment_id:
+                found.append({"kind": "outcome", "direction": str(row.get("direction") or ""), "summary": normalize_text_value(row.get("summary"), fallback="", limit=200), "at": row.get("created_at")})
+    except Exception:  # noqa: BLE001 - a missing store is no evidence, not an error
+        pass
+    try:
+        for row in read_entries(limit=600, since_days=since_days):
+            metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            if str(metadata.get("experiment_id") or "") != experiment_id:
+                continue
+            direction = str(metadata.get("direction") or "")
+            found.append({"kind": str(row.get("kind") or "entry"), "direction": direction, "summary": normalize_text_value(row.get("text"), fallback="", limit=200), "at": row.get("timestamp")})
+    except Exception:  # noqa: BLE001
+        pass
+    return found
+
+
+def experiment_references_exist(experiment_id: str) -> bool:
+    """True when a proposal or a self-change ledger row names the experiment: it has been acted on."""
+    try:
+        for item in read_proposals(limit=120):
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            if experiment_id in json.dumps(metadata) or experiment_id in str(item.get("body") or ""):
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for row in read_self_change_ledger(limit=120):
+            if experiment_id in json.dumps(row):
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+# The eight-part loop of docs/EVE_CORE.md plus the kernel that carries it: identity, journal,
+# trackers, reflection, proposals, self-change, conversation, and the workspace tick.
+CORE_LOOP_JOBS = frozenset({
+    "heartbeat", "system_tasks", "approved_maintenance", "daemon_digest", "mind_tick",
+    "experiment_review", "self_change_followup", "failure_review", "self_awareness", "thought", "reflection",
+    "self_change", "proposal", "outreach", "lane_probes", "workspace_tick", "sensory_attention",
+})
+# Her body and her own bounded action-taking, on top of the core loop.
+CORE_BODY_JOBS = frozenset(CORE_LOOP_JOBS | {"presence_cycle", "developmental_cycle", "autonomy_run"})
+
+
+SELF_CHANGE_FOLLOWUPS_PATH = APP_DIR / "self_change_followups.jsonl"
+
+
+def record_pattern_from_experiment(experiment: Dict[str, object], *, source: str = "experiment_closure") -> Optional[Dict[str, object]]:
+    """A passed experiment becomes a success pattern carrying its own id; a failed one decays it.
+
+    Procedural memory with lineage: every pattern points at the experiment that earned it, so a
+    later contradiction can find what to decay instead of leaving a lesson learned from nothing.
+    """
+    experiment_id = str(experiment.get("id") or "")
+    status = str(experiment.get("status") or "")
+    name = normalize_text_value(experiment.get("name"), fallback="", limit=160)
+    if not experiment_id or not name or status not in {"passed", "failed"}:
+        return None
+    dedupe_key = success_pattern_dedupe_key(name, experiment.get("hypothesis") or "")
+    if status == "failed":
+        for pattern in read_success_patterns(status=None, limit=400):
+            if str(pattern.get("dedupe_key") or "") == dedupe_key:
+                return update_success_pattern_decay(
+                    pattern,
+                    source_kind="experiment",
+                    source_id=experiment_id,
+                    note=normalize_text_value(f"The experiment that taught this failed: {experiment.get('closure_evidence') or experiment.get('outcome')}", fallback="experiment failed", limit=200),
+                    delta=-0.2,
+                )
+        return None
+    record, _created, _changed = upsert_success_pattern({
+        "title": name,
+        "situation": normalize_text_value(experiment.get("hypothesis") or experiment.get("action"), fallback=name, limit=220),
+        "good_move": normalize_text_value(experiment.get("action"), fallback=name, limit=220),
+        "summary": normalize_text_value(f"{name}: {experiment.get('outcome') or experiment.get('closure_evidence')}", fallback=name, limit=280),
+        "source_kinds": ["experiment"],
+        "source_ids": [experiment_id],
+        "dedupe_key": dedupe_key,
+        "confidence": 0.7,
+        "metadata": {"experiment_id": experiment_id, "success_criteria": experiment.get("success_criteria"), "closure_evidence": experiment.get("closure_evidence"), "lineage_source": source},
+    })
+    append_entry(
+        "success_pattern_logged",
+        f"Learned from a passed experiment: {name}",
+        metadata={"pattern_id": record.get("id"), "experiment_id": experiment_id, "source": source},
+    )
+    return record
+
+
+def record_pattern_from_consequence(followup: Dict[str, object], verdict: str, *, source: str = "self_change_followup") -> Optional[Dict[str, object]]:
+    """A self-change whose measured consequence improved things becomes a pattern; a regression decays it."""
+    session_id = str(followup.get("session_id") or "")
+    title = normalize_text_value(followup.get("proposal_title"), fallback="", limit=160)
+    if not session_id or not title or verdict not in {"improved", "regressed"}:
+        return None
+    spec = followup.get("metric_spec") if isinstance(followup.get("metric_spec"), dict) else {}
+    dedupe_key = success_pattern_dedupe_key(title, str(spec.get("kind") or ""))
+    if verdict == "regressed":
+        for pattern in read_success_patterns(status=None, limit=400):
+            if str(pattern.get("dedupe_key") or "") == dedupe_key:
+                return update_success_pattern_decay(pattern, source_kind="self_change", source_id=session_id, note=normalize_text_value(followup.get("detail"), fallback="the measured consequence regressed", limit=200), delta=-0.2)
+        return None
+    record, _created, _changed = upsert_success_pattern({
+        "title": title,
+        "situation": normalize_text_value(f"When {spec.get('kind')} is the lever ({spec.get('action') or spec.get('operation') or spec.get('config_key') or 'her own settings'})", fallback=title, limit=220),
+        "good_move": title,
+        "summary": normalize_text_value(followup.get("detail"), fallback=title, limit=280),
+        "source_kinds": ["self_change"],
+        "source_ids": [session_id, str(followup.get("proposal_id") or "")],
+        "dedupe_key": dedupe_key,
+        "confidence": 0.7,
+        "metadata": {"session_id": session_id, "proposal_id": followup.get("proposal_id"), "metric_spec": spec, "lineage_source": source},
+    })
+    append_entry(
+        "success_pattern_logged",
+        f"Learned from a measured self-change: {title}",
+        metadata={"pattern_id": record.get("id"), "session_id": session_id, "source": source},
+    )
+    return record
+
+
+def daemon_job_enabled(config: Dict[str, object], job: str) -> bool:
+    """Whether this daemon job runs under the current loop profile.
+
+    An explicit override wins; then the profile. Jobs named in neither list are "full" only, so a
+    core run is the original loop and nothing else. Absent config means today's behaviour.
+    """
+    overrides = config.get("daemon_job_overrides") if isinstance(config.get("daemon_job_overrides"), dict) else {}
+    if job in overrides:
+        return parse_boolish(overrides.get(job) or False)
+    profile = normalize_text_value(config.get("daemon_loop_profile"), fallback="full", limit=20).lower()
+    if profile == "core":
+        return job in CORE_LOOP_JOBS
+    if profile == "core_body":
+        return job in CORE_BODY_JOBS
+    return True
+
+
+def reflection_lived_evidence_gate(state: Dict[str, object], *, minimum_rows: int = 3) -> str:
+    """Empty when there is lived material since the last reflection; otherwise why she should wait."""
+    last = normalize_text_value(state.get("last_reflection_at"), fallback="", limit=40)
+    try:
+        rows, _evidence = read_lived_entries(limit=400, since_days=14.0)
+    except Exception:  # noqa: BLE001 - never block a reflection on a reader error
+        return ""
+    fresh = [row for row in rows if not last or str(row.get("timestamp") or "") > last]
+    if len(fresh) >= minimum_rows:
+        return ""
+    return f"only {len(fresh)} lived row(s) since the last reflection; nothing new to reflect on yet"
+
+
+def recent_human_turn_gate(config: Dict[str, object]) -> str:
+    """Empty when a real person has spoken inside the window; otherwise why she should not speak first.
+
+    Claude and Codex replies carry actual_sender; evaluator grants carry synthetic provenance. Neither
+    is the user, and neither should make her believe the conversation is alive.
+    """
+    days = clamp_int(config.get("outreach_requires_recent_human_days"), 3, minimum=0, maximum=90)
+    if days <= 0:
+        return ""
+    cutoff = (utc_now_datetime() - timedelta(days=days)).isoformat(timespec="seconds")
+    try:
+        rows = read_messages(limit=200, sender="user")
+    except Exception:  # noqa: BLE001
+        return ""
+    for row in rows:
+        if str(row.get("created_at") or "") < cutoff:
+            continue
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        if str(metadata.get("actual_sender") or "") not in {"", "user"}:
+            continue
+        if parse_boolish(metadata.get("synthetic") or False) or str(metadata.get("provenance") or "").startswith("evaluator"):
+            continue
+        return ""
+    return f"no genuine human turn in the last {days} day(s); waiting rather than speaking first"
+
+
+def review_due_experiments(config: Dict[str, object], *, now: Optional[str] = None, source: str = "daemon") -> Dict[str, object]:
+    """Move experiments along on evidence only.
+
+    proposed -> active when a proposal or self-change acted on it; due at created_at + duration_days;
+    passed/failed only when an outcome or journal row carrying experiment_id says so; otherwise
+    expired_unverified. A model may summarize an experiment, never close one.
+    """
+    current = now or utc_now()
+    current_dt = parse_iso_datetime(current) or utc_now_datetime()
+    changed: List[Dict[str, object]] = []
+    records = read_jsonl_records(EXPERIMENTS_PATH)
+    updated = False
+    for index, raw in enumerate(records):
+        record = dict(raw) if isinstance(raw, dict) else {}
+        status = str(record.get("status") or "")
+        experiment_id = str(record.get("id") or "")
+        if not experiment_id or status not in {"proposed", "active"}:
+            continue
+        new_status, outcome_text, evidence_note = "", "", ""
+        if status == "proposed" and experiment_references_exist(experiment_id):
+            new_status, evidence_note = "active", "a proposal or self-change acted on it"
+        created = parse_iso_datetime(record.get("created_at"))
+        duration_days = clamp_int(record.get("duration_days"), 7, minimum=1, maximum=365)
+        due = created is not None and (current_dt - created).total_seconds() >= duration_days * 86400
+        if due:
+            evidence = experiment_evidence_records(experiment_id)
+            positive = [item for item in evidence if item["direction"] in EXPERIMENT_POSITIVE_DIRECTIONS]
+            negative = [item for item in evidence if item["direction"] in EXPERIMENT_NEGATIVE_DIRECTIONS]
+            if positive and not negative:
+                new_status, outcome_text, evidence_note = "passed", normalize_text_value(positive[-1]["summary"], fallback="", limit=200), f"{len(positive)} positive outcome(s)"
+            elif negative:
+                new_status, outcome_text, evidence_note = "failed", normalize_text_value(negative[-1]["summary"], fallback="", limit=200), f"{len(negative)} negative outcome(s)"
+            else:
+                new_status, evidence_note = "expired_unverified", "no outcome named this experiment before it came due"
+        if not new_status or new_status == status:
+            continue
+        record.update({"status": new_status, "updated_at": current, "outcome": outcome_text or record.get("outcome") or "", "closure_evidence": evidence_note, "closed_by": "evidence" if new_status in {"passed", "failed"} else source})
+        records[index] = record
+        updated = True
+        changed.append({"id": experiment_id, "name": normalize_text_value(record.get("name"), fallback="", limit=120), "status": new_status, "evidence": evidence_note})
+    if updated:
+        write_jsonl_records(EXPERIMENTS_PATH, records)
+    for item in changed:
+        if item["status"] in {"passed", "failed"}:
+            try:
+                record_pattern_from_experiment(next((dict(r) for r in records if str(r.get("id")) == item["id"]), {}))
+            except Exception:  # noqa: BLE001 - a pattern write must not lose the closure
+                pass
+        append_entry(
+            "experiment_expired" if item["status"] == "expired_unverified" else "experiment_updated",
+            f"{item['name']} -> {item['status']} ({item['evidence']})",
+            metadata={"experiment_id": item["id"], "status": item["status"], "source": source, "closure_evidence": item["evidence"]},
+        )
+    return {"reviewed": len(records), "changed": changed}
+
+
 def generate_reflection(
     config: Dict[str, object],
     days: int,
@@ -81102,7 +85968,7 @@ def generate_reflection(
     host = str(config["ollama_host"])
     human_context = ensure_human_context(config, source="reflection")
     active_mind = load_active_mind()
-    recent_entries = read_entries(limit=context_limit, since_days=days)
+    recent_entries, evidence = read_lived_entries(limit=context_limit, since_days=days)
     tensions = read_tensions(limit=20)
     experiments = read_experiments(limit=20)
     if not recent_entries:
@@ -81113,16 +85979,39 @@ def generate_reflection(
             human_context=human_context,
             active_mind=active_mind,
         ),
-        *[message for message in [build_inner_state_brief_message()] if message is not None],
+        *[
+            mark_prompt_message_optional(message, priority=4)
+            for message in [build_inner_state_brief_message()]
+            if message is not None
+        ],
         {"role": "system", "content": load_prompt("weekly_reflection.md")},
     ]
-    messages.extend(build_supporting_system_messages(config, failure_limit=4, query_text=active_mind_retrieval_query(active_mind)))
+    messages.extend(
+        mark_prompt_messages_optional(
+            build_supporting_system_messages(config, failure_limit=4, query_text=active_mind_retrieval_query(active_mind)),
+            priority=3,
+        )
+    )
     messages.extend(
         [
-            {"role": "user", "content": build_reflection_prompt(recent_entries, days)},
-            {"role": "user", "content": build_reflection_support_prompt(tensions, experiments)},
+            mark_prompt_message_optional(
+                {"role": "user", "content": build_reflection_prompt(recent_entries, days)},
+                priority=2,
+            ),
+            mark_prompt_message_optional(
+                {"role": "user", "content": build_reflection_support_prompt(tensions, experiments)},
+                priority=1,
+            ),
         ]
     )
+    messages, prompt_evidence = cap_lived_evidence_prompt(
+        config,
+        model,
+        messages,
+        max_tokens=max_tokens,
+        operation="reflection",
+    )
+    evidence.update(prompt_evidence)
     response = model_chat(
         config,
         model,
@@ -81136,6 +86025,7 @@ def generate_reflection(
         "response": response,
         "model": model,
         "source_entries": len(recent_entries),
+        "evidence": evidence,
     }
 
 
@@ -81152,7 +86042,7 @@ def suggest_proposal(
     context_limit = int(config["proposal_context_limit"])
     human_context = ensure_human_context(config, source="proposal")
     active_mind = load_active_mind()
-    entries = read_entries(limit=context_limit)
+    entries, evidence = read_lived_entries(limit=context_limit)
     tensions = read_tensions(limit=12)
     experiments = read_experiments(limit=12)
     proposals = read_proposals(limit=8)
@@ -81166,13 +86056,29 @@ def suggest_proposal(
         ),
         {"role": "system", "content": load_prompt("proposal_suggestions.md")},
     ]
-    messages.extend(build_supporting_system_messages(config, failure_limit=4, query_text=active_mind_retrieval_query(active_mind)))
-    messages.append(
-        {
-            "role": "user",
-            "content": build_proposal_support_prompt(entries, tensions, experiments, proposals),
-        }
+    messages.extend(
+        mark_prompt_messages_optional(
+            build_supporting_system_messages(config, failure_limit=4, query_text=active_mind_retrieval_query(active_mind)),
+            priority=3,
+        )
     )
+    messages.append(
+        mark_prompt_message_optional(
+            {
+                "role": "user",
+                "content": build_proposal_support_prompt(entries, tensions, experiments, proposals),
+            },
+            priority=2,
+        )
+    )
+    messages, prompt_evidence = cap_lived_evidence_prompt(
+        config,
+        model,
+        messages,
+        max_tokens=max_tokens,
+        operation="proposal_suggest",
+    )
+    evidence.update(prompt_evidence)
     response = model_chat(
         config,
         model,
@@ -81184,6 +86090,7 @@ def suggest_proposal(
     )
     title = infer_title_from_text(response, fallback=f"Proposal Draft {utc_now()}")
     summary = " ".join(response.split())[:220]
+    lineage = parse_proposal_lineage(response)
     record = {
         "id": str(uuid.uuid4()),
         "created_at": utc_now(),
@@ -81193,12 +86100,22 @@ def suggest_proposal(
         "body": response,
         "status": "draft",
         "source": source,
+        "metadata": {k: v for k, v in lineage.items() if v},
     }
+    duplicate = find_duplicate_proposal(record, read_proposals(), stale_days=clamp_int(config.get("self_change_stale_days"), 7, minimum=1, maximum=365))
+    if duplicate is not None:
+        # The topic already has a draft, or was applied/archived recently: do not draft it again.
+        append_entry(
+            "proposal_duplicate_skipped",
+            f"Skipped drafting a duplicate proposal: {title}",
+            metadata={"duplicate_of": duplicate.get("id"), "duplicate_status": duplicate.get("status"), "source": source, "model": model},
+        )
+        return {**duplicate, "duplicate_skipped": True, "duplicate_of": duplicate.get("id")}
     append_jsonl_record(PROPOSALS_PATH, record)
     append_entry(
         "proposal_drafted",
         title,
-        metadata={"proposal_id": record["id"], "source": source, "model": model},
+        metadata={"proposal_id": record["id"], "source": source, "model": model, **evidence},
     )
     return record
 
@@ -81210,12 +86127,20 @@ def cmd_reflect(args: argparse.Namespace) -> int:
     num_predict = args.max_tokens or int(config["reflection_max_tokens"])
     result = generate_reflection(config, days=args.days, context_limit=recent_limit, max_tokens=num_predict)
 
-    append_entry(
+    reflection_entry = append_entry(
         "reflection",
         result["response"],
-        metadata={"days": args.days, "model": result["model"], "source_entries": result["source_entries"]},
+        metadata={
+            "days": args.days,
+            "model": result["model"],
+            "source_entries": result["source_entries"],
+            **dict(result.get("evidence") or {}),
+        },
     )
+    trackers = record_reflection_trackers(result["response"], config, entry_id=str((reflection_entry or {}).get("id") or ""), source="reflection")
     render_output(str(result["response"]))
+    if int(trackers.get("tensions_created") or 0) or int(trackers.get("experiments_created") or 0):
+        print(f"Recorded {trackers.get('tensions_created')} tension(s) and {trackers.get('experiments_created')} experiment(s) from this reflection.")
     return 0
 
 
@@ -81990,6 +86915,7 @@ def collect_autonomy_free_run_snapshot(config: Dict[str, object]) -> Dict[str, o
         else []
     )
     system_snapshot = load_system_snapshot(prefer_runtime=True)
+    free_run_lane_gate = cognition_gate_assessment(system_snapshot, config)
     autonomy_agenda = reanchor_autonomy_agenda(
         load_autonomy_agenda(prefer_runtime=True),
         config=config,
@@ -82024,7 +86950,7 @@ def collect_autonomy_free_run_snapshot(config: Dict[str, object]) -> Dict[str, o
         openclaw_status = eve_openclaw.collect_openclaw_status(config, prefer_runtime=True, include_gateway_probe=False)
     except Exception as exc:
         openclaw_status = {"summary": normalize_text_value(exc, fallback="OpenClaw status unavailable.", limit=160)}
-    recent_actions = read_action_executions(limit=5, since_days=1, prefer_runtime=True)
+    recent_actions = read_action_executions(limit=20, since_days=1, prefer_runtime=True)
     recent_perf = read_perf_events(limit=40, since_minutes=15)
     perf_failures_all = [item for item in recent_perf if not item.get("ok")]
     choice_failures = [item for item in perf_failures_all if is_autonomy_choice_perf_event(item)]
@@ -82187,8 +87113,14 @@ def collect_autonomy_free_run_snapshot(config: Dict[str, object]) -> Dict[str, o
             "frontmost_app": normalize_text_value(system_snapshot.get("frontmost_app"), fallback="", limit=80),
             "disk_used_percent": round(float(disk.get("used_percent") or 0.0), 1) if disk else 0.0,
             "disk_free_bytes": int(disk.get("free_bytes") or 0) if disk else 0,
-            "fast_probe_ms": preferred_model_probe_ms(system_snapshot, "fast"),
-            "deep_probe_ms": preferred_model_probe_ms(system_snapshot, "deep"),
+            # Fresher of the snapshot's probes and the watchdog's own status
+            # file, so the chooser is not throttled by a stale deep timing.
+            "fast_probe_ms": free_run_lane_gate.get("fast_probe_ms"),
+            "deep_probe_ms": free_run_lane_gate.get("deep_probe_ms"),
+            "fast_probe_ok": free_run_lane_gate.get("fast_probe_ok"),
+            "deep_probe_ok": free_run_lane_gate.get("deep_probe_ok"),
+            "cognition_lane_state": free_run_lane_gate.get("lane_state"),
+            "probe_age_minutes": free_run_lane_gate.get("probe_age_minutes"),
         },
         "autonomy": {
             "agenda_summary": normalize_text_value(autonomy_agenda.get("summary"), fallback="", limit=220),
@@ -82226,6 +87158,8 @@ def collect_autonomy_free_run_snapshot(config: Dict[str, object]) -> Dict[str, o
         },
         "recent_actions": [
             {
+                "id": item.get("id"),
+                "updated_at": item.get("updated_at") or item.get("created_at"),
                 "action": item.get("action"),
                 "source": item.get("source"),
                 "tree_status": item.get("tree_status"),
@@ -82237,8 +87171,14 @@ def collect_autonomy_free_run_snapshot(config: Dict[str, object]) -> Dict[str, o
     }
 
 
-def autonomy_free_run_action_menu(remaining_seconds: int) -> Dict[str, str]:
+def autonomy_free_run_action_menu(remaining_seconds: int, body_world: Optional[Dict[str, object]] = None) -> Dict[str, str]:
+    """The free-run menu. Body actions appear only when the body has that need (see body_action_is_needed)."""
     minimum_seconds = {
+        "self_change": 150,
+        "body_approach_food": 15,
+        "body_escape": 15,
+        "body_rest": 15,
+        "body_explore": 15,
         "mind_tick": 35,
         "thought": 35,
         "ambient_note": 5,
@@ -82256,6 +87196,33 @@ def autonomy_free_run_action_menu(remaining_seconds: int) -> Dict[str, str]:
         action: description
         for action, description in AUTONOMY_FREE_RUN_ACTIONS.items()
         if remaining_seconds >= minimum_seconds.get(action, 10)
+        and (action not in BODY_ACTIONS or body_action_is_needed(action, body_world))
+    } or {"wait_observe": AUTONOMY_FREE_RUN_ACTIONS["wait_observe"]}
+
+
+def autonomy_admissible_action_menu(
+    menu: Dict[str, str], snapshot: Dict[str, object],
+    previous_actions: List[Dict[str, object]], config: Dict[str, object],
+) -> Dict[str, str]:
+    """Keep cheap observations alive while costly cognition is unavailable."""
+    system = snapshot.get("system") if isinstance(snapshot.get("system"), dict) else {}
+    lightweight = {"wait_observe", "ambient_note", "updates_status", "service_health_check",
+                   "cleanup_candidate_check", "openclaw_log_check"}
+    lane_state = cognition_lane_budget_state(
+        config, fast_probe_ms=system.get("fast_probe_ms"), deep_probe_ms=system.get("deep_probe_ms"),
+        probe_age_minutes=system.get("probe_age_minutes"),
+        probes_ok=system.get("cognition_lane_state") != "slow",
+    )
+    constrained = lane_state == "slow" or (lane_state == "unknown" and system.get("load_state") == "hot")
+    inhibited = dict(eve_recurrent_cognition.action_retry_inhibition(
+        autonomy_recent_action_records(snapshot, previous_actions), now=utc_now(),
+    ))
+    # Blocks Eve set herself (block_action) hold until they expire.
+    for action, block in load_action_blocks().items():
+        inhibited.setdefault(action, {"reason": block.get("reason"), "retry_after": block.get("until"), "self_blocked": True})
+    return {
+        action: description for action, description in menu.items()
+        if (not constrained or action in lightweight) and action not in inhibited
     } or {"wait_observe": AUTONOMY_FREE_RUN_ACTIONS["wait_observe"]}
 
 
@@ -83017,18 +87984,32 @@ def autonomy_free_run_guidance(
         limit=140,
     )
     last_supervisor_score = clamp_int(autonomy.get("last_supervisor_score"), 0, minimum=0, maximum=100)
+    cognition_lane_state = cognition_lane_budget_state(
+        effective_config,
+        fast_probe_ms=fast_probe_ms,
+        deep_probe_ms=deep_probe_ms,
+        probe_age_minutes=system.get("probe_age_minutes"),
+        probes_ok=system.get("fast_probe_ok") is not False,
+        required_lanes=("fast",),
+    )
+    # A single-lane choice does not need deep. A slow/unavailable deep lane
+    # selects the fast-only path rather than disabling all model choices.
+    hot_load_counts = system_load_state == "hot" and cognition_lane_state != "ready"
+    lane_thresholds = free_run_chooser_lane_thresholds(effective_config)
     chooser_load = "normal"
     if (
-        system_load_state == "hot"
+        hot_load_counts
         or choice_failures_recent >= 16
-        or (isinstance(fast_probe_ms, (int, float)) and float(fast_probe_ms) >= 2200)
-        or (isinstance(deep_probe_ms, (int, float)) and float(deep_probe_ms) >= 6000)
+        or cognition_lane_state == "slow"
+        or (isinstance(fast_probe_ms, (int, float)) and float(fast_probe_ms) >= lane_thresholds["fast_high"])
+        or (cognition_gate_mode(effective_config) != "lane_latency" and isinstance(deep_probe_ms, (int, float)) and float(deep_probe_ms) >= lane_thresholds["deep_high"])
     ):
         chooser_load = "high"
     elif (
         choice_failures_recent >= 8
-        or (isinstance(fast_probe_ms, (int, float)) and float(fast_probe_ms) >= 1200)
-        or (isinstance(deep_probe_ms, (int, float)) and float(deep_probe_ms) >= 3500)
+        or system.get("deep_probe_ok") is False
+        or (isinstance(fast_probe_ms, (int, float)) and float(fast_probe_ms) >= lane_thresholds["fast_medium"])
+        or (isinstance(deep_probe_ms, (int, float)) and float(deep_probe_ms) >= lane_thresholds["deep_medium"])
     ):
         chooser_load = "medium"
 
@@ -83295,6 +88276,7 @@ def autonomy_free_run_guidance(
         "require_inquiry_probe": require_inquiry_probe,
         "require_concrete_outcome": require_concrete_outcome,
         "chooser_load": chooser_load,
+        "cognition_lane_state": cognition_lane_state,
         "family_pressure": {
             "completed_action_count": completed_action_count,
             "completed_family_counts": completed_family_counts,
@@ -83923,6 +88905,11 @@ def refresh_autonomy_agenda_from_summary(summary: Dict[str, object]) -> Dict[str
     }
     merged_threads: List[Dict[str, object]] = []
     seen_titles: set[str] = set()
+    existing_by_title = {
+        str(item.get("title") or "").lower(): item
+        for item in (normalize_autonomy_agenda_thread(thread) for thread in existing_threads)
+        if item
+    }
     for candidate in [*thread_candidates, *existing_threads]:
         normalized = normalize_autonomy_agenda_thread(candidate)
         if normalized is None:
@@ -83930,6 +88917,8 @@ def refresh_autonomy_agenda_from_summary(summary: Dict[str, object]) -> Dict[str
         title_key = str(normalized.get("title") or "").lower()
         if title_key in seen_titles:
             continue
+        if candidate is not existing_by_title.get(title_key) and any(candidate is item for item in thread_candidates):
+            normalized = agenda_thread_with_tenure(normalized, existing_by_title.get(title_key))
         if (
             str(normalized.get("preferred_action") or "") in saturated_action_ids
             or str(normalized.get("family") or "") in saturated_family_ids
@@ -84366,11 +89355,79 @@ def autonomy_free_run_choice_timeout_seconds(
     return max(8, min(lane_timeout, max(10, remaining_seconds - 3)))
 
 
+def normalize_inquiry_reasoning_proposal(payload: object) -> Dict[str, object]:
+    """Keep conjecture attributable and inspectable, never promote it to fact."""
+    if not isinstance(payload, dict) or not payload.get("inquiry_id") or not payload.get("source_fingerprint"):
+        return {}
+    alternatives = []
+    raw_alternatives = payload.get("alternatives")
+    if not isinstance(raw_alternatives, list):
+        return {}
+    for item in raw_alternatives[:2]:
+        if not isinstance(item, dict):
+            continue
+        explanation = normalize_text_value(item.get("explanation"), fallback="", limit=180)
+        prediction = normalize_text_value(item.get("predicted_observation"), fallback="", limit=180)
+        if explanation and prediction:
+            alternative = {"explanation": explanation, "predicted_observation": prediction}
+            test = eve_recurrent_cognition.normalize_observation_prediction(item.get("test"))
+            if test:
+                alternative["test"] = test
+            alternatives.append(alternative)
+    if len(alternatives) != 2 or alternatives[0] == alternatives[1]:
+        return {}
+    return {
+        "schema_id": "eve.inquiry_reasoning_proposal.v1",
+        "epistemic_status": "unverified_hypotheses",
+        "inquiry_id": normalize_text_value(payload.get("inquiry_id"), fallback="", limit=100),
+        "source_fingerprint": normalize_text_value(payload.get("source_fingerprint"), fallback="", limit=160),
+        "action": normalize_text_value(payload.get("action"), fallback="", limit=80),
+        "model": normalize_text_value(payload.get("model"), fallback="", limit=100),
+        "alternatives": alternatives,
+        "belief_update": "No hypothesis is established by execution success alone.",
+    }
+
+
 def normalize_autonomy_free_run_choice_confidence(value: object) -> str:
     confidence = str(value or "medium").strip().lower()
     if confidence not in {"low", "medium", "high"}:
         confidence = "medium"
     return confidence
+
+
+def autonomy_free_run_choice_schema(menu: Dict[str, str], *, inquiry: bool) -> Dict[str, object]:
+    """Use the existing provider's constrained decoder, not prose-to-tool guesses."""
+    properties: Dict[str, object] = {
+        "action": {"type": "string", "enum": list(menu)},
+        "reason": {"type": "string", "maxLength": 160},
+        "expected_signal": {"type": "string", "maxLength": 160},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+    }
+    if inquiry:
+        properties["alternatives"] = {
+            "type": "array", "minItems": 2, "maxItems": 2,
+            "items": {"type": "object", "properties": {
+                "explanation": {"type": "string", "minLength": 1, "maxLength": 120},
+                "predicted_observation": {"type": "string", "minLength": 1, "maxLength": 120},
+                "test": {"type": "object", "properties": {
+                    "metric": {"type": "string", "enum": ["graph_travel_cm", "zero_travel_cm", "graph_minus_double_zero_cm"]},
+                    "operator": {"type": "string", "enum": ["gt", "ge", "lt", "le", "eq"]},
+                    "value": {"type": "number"},
+                }, "required": ["metric", "operator", "value"], "additionalProperties": False},
+            }, "required": ["explanation", "predicted_observation"], "additionalProperties": False},
+        }
+    return {"type": "object", "properties": properties,
+            "required": list(properties), "additionalProperties": False}
+
+
+def autonomy_free_run_choice_system_messages() -> List[Dict[str, str]]:
+    # The caller's checkpoint already owns the agenda, source ids, outcomes
+    # and inquiry. Re-loading mutable active-mind prose creates a second,
+    # potentially stale evidence envelope that can contaminate this decision.
+    return [
+        *build_eve_interaction_system_messages(include_human_context=False, include_active_mind=False),
+        {"role": "system", "content": "For this action choice, use only the supplied checkpoint and action records as evidence. Invent no missing fault. Alternative explanations are conditional hypotheses about the selected question, not assertions of a failure. Choose from the supplied menu and return the constrained JSON object."},
+    ]
 
 
 def build_autonomy_free_run_choice_prompt(
@@ -84491,7 +89548,7 @@ def build_autonomy_free_run_choice_prompt(
         {action_lines}
 
         Boundary contract:
-        - Do not delete files, change model configs, modify live services, or install into Eve's live environments. The capability-first tryout may install one known candidate only inside its isolated `.eve/capability_adoption_staging/` canary environment.
+        - Inside your edges your files, config and services are yours; make changes to yourself through the `self_change` action so they are verified, ledgered and reversible. The capability-first tryout may install one known candidate only inside its isolated `.eve/capability_adoption_staging/` canary environment.
         - You may observe, think, sync/check OpenClaw, inspect update status, draft proposals, run bounded CPU-side task checks, or use a bounded capability tryout.
         - If you would like a risky action, choose proposal_suggestion and explain the proposed future action instead.
         - Prefer actions that reveal what you care about while also producing grounded evidence from the live system.
@@ -84558,6 +89615,11 @@ def build_autonomy_free_run_choice_prompt(
         - failed_probes: {format_human_context_list(guidance.get('inquiry_failed_actions') or []) or 'none'}
         - recovery_step: {bool(guidance.get('inquiry_recovery_step'))}
         - expected_observation: {selected_inquiry.get('expected_observation') or 'none'}
+        - prior_unverified_hypotheses: {json.dumps(selected_inquiry.get('prior_hypotheses') or [], ensure_ascii=True)}
+        - precommitted_observation_test: {json.dumps(selected_inquiry.get("observation_test") or {}, ensure_ascii=True)}
+        - prior_measured_prediction_assessment: {json.dumps(selected_inquiry.get('prior_prediction_assessment') or {}, ensure_ascii=True)}
+        Preserve or revise those alternatives using new observations; previous
+        generated explanations are not evidence and do not prove a belief.
 
         Carry-forward agenda:
         - agenda_summary: {autonomy.get('agenda_summary') or 'none'}
@@ -84578,6 +89640,21 @@ def build_autonomy_free_run_choice_prompt(
 
         Return strict JSON only:
         {{"action":"one_menu_action","reason":"why you chose it","expected_signal":"what you hope to learn","confidence":"low|medium|high"}}
+        When an endogenous question is selected, also include `alternatives`: two
+        objects with `explanation` and `predicted_observation`. These are competing
+        UNVERIFIED HYPOTHESES, not observations or current-state facts. Name what
+        the selected probe could distinguish. Do not invent a completed action.
+        A successful tool call alone does not establish either explanation.
+        For fly_decoder_probe only, an optional `test` on each alternative can
+        compare a measured metric with a numeric value using gt/ge/lt/le/eq.
+        Available metrics: graph_travel_cm, zero_travel_cm, graph_minus_double_zero_cm
+        (graph mean travel minus twice zero-action mean travel, in cm).
+        Example shape: "test":{{"metric":"graph_travel_cm","operator":"gt","value":0}}.
+        Choose tests relevant to the question that could discriminate the alternatives.
+        No measured values are known until the tool returns.
+        Keep tests tied to the inquiry's precommitted observation_test when supplied;
+        arbitrary predicates cannot answer that question.
+        Other probes have no admitted numeric measurement contract yet; omit `test`.
         """
     ).strip()
 
@@ -84601,7 +89678,7 @@ def run_autonomy_free_run_choice_lane(
             config,
             model,
             [
-                *build_eve_identity_system_messages(include_human_context=True, include_active_mind=True, compact=True),
+                *autonomy_free_run_choice_system_messages(),
                 {
                     "role": "user",
                     "content": build_autonomy_free_run_choice_prompt(
@@ -84616,12 +89693,13 @@ def run_autonomy_free_run_choice_lane(
                     ),
                 },
             ],
-            max_tokens=170,
+            max_tokens=420 if guidance.get("selected_inquiry") else 170,
             think_level=str(config["think_level"]),
             operation=f"autonomy_free_run_choice_{lane_name}",
             timeout_seconds=autonomy_free_run_choice_timeout_seconds(config, lane_name, remaining_seconds),
+            response_schema=autonomy_free_run_choice_schema(menu, inquiry=bool(guidance.get("selected_inquiry"))),
         )
-        payload = extract_json_object(raw, label=f"autonomy free-run {lane_name} choice", allow_repair=True)
+        payload = extract_json_object(raw, label=f"autonomy free-run {lane_name} choice", allow_repair=False)
         action = str(payload.get("action") or "").strip()
         status = "ok"
         if action not in menu:
@@ -84642,6 +89720,11 @@ def run_autonomy_free_run_choice_lane(
                 limit=220,
             ),
             "expected_signal": normalize_text_value(payload.get("expected_signal"), fallback="", limit=220),
+            "reasoning_proposal": normalize_inquiry_reasoning_proposal({
+                **(guidance.get("selected_inquiry") or {}),
+                "inquiry_id": (guidance.get("selected_inquiry") or {}).get("id"),
+                "action": action, "model": model, "alternatives": payload.get("alternatives"),
+            }),
             "confidence": normalize_autonomy_free_run_choice_confidence(payload.get("confidence")),
             "raw": normalize_text_value(raw, fallback="", limit=1000),
             "duration_ms": round((time.perf_counter() - started) * 1000, 2),
@@ -84807,7 +89890,7 @@ def choose_autonomy_free_run_action_single_lane(
             config,
             model,
             [
-                *build_eve_identity_system_messages(include_human_context=True, include_active_mind=True, compact=True),
+                *autonomy_free_run_choice_system_messages(),
                 {
                     "role": "user",
                     "content": build_autonomy_free_run_choice_prompt(
@@ -84822,12 +89905,13 @@ def choose_autonomy_free_run_action_single_lane(
                     ),
                 },
             ],
-            max_tokens=160,
+            max_tokens=420 if guidance.get("selected_inquiry") else 160,
             think_level=str(config["think_level"]),
             operation="autonomy_free_run_choice",
             timeout_seconds=max(15, min(45, remaining_seconds - 3)),
+            response_schema=autonomy_free_run_choice_schema(menu, inquiry=bool(guidance.get("selected_inquiry"))),
         )
-        payload = extract_json_object(raw, label="autonomy free-run choice")
+        payload = extract_json_object(raw, label="autonomy free-run choice", allow_repair=False)
         action, override, resolved_policy = finalize_autonomy_free_run_choice(
             str(payload.get("action") or "").strip(),
             menu=menu,
@@ -84839,6 +89923,12 @@ def choose_autonomy_free_run_action_single_lane(
             "action": action,
             "reason": normalize_text_value(payload.get("reason"), fallback="Eve chose to observe.", limit=220),
             "expected_signal": normalize_text_value(payload.get("expected_signal"), fallback="", limit=220),
+            "reasoning_proposal": normalize_inquiry_reasoning_proposal({
+                **(guidance.get("selected_inquiry") or {}),
+                "inquiry_id": (guidance.get("selected_inquiry") or {}).get("id"),
+                "action": str(payload.get("action") or ""), "model": model,
+                "alternatives": payload.get("alternatives"),
+            }) if action == payload.get("action") else {},
             "model": model,
             "raw": normalize_text_value(raw, fallback="", limit=1000),
             "recommended_actions": recommended_actions,
@@ -84949,7 +90039,7 @@ def choose_autonomy_free_run_action_multi_lane(
         thread_name_prefix="eve-autonomy-council",
     ) as executor:
         future_to_lane = {
-            executor.submit(
+            eve_tracing.submit(executor,
                 run_autonomy_free_run_choice_lane,
                 config,
                 lane_name=lane_name,
@@ -85035,6 +90125,7 @@ def choose_autonomy_free_run_action_multi_lane(
         "action": action,
         "reason": council_reason,
         "expected_signal": lead_signal,
+        "reasoning_proposal": next((item.get("reasoning_proposal") for item in supporters if item.get("action") == action and item.get("reasoning_proposal")), {}),
         "model": "multi_lane_council",
         "consulted_lanes": lane_names,
         "consulted_models": unique_compact([str(item.get("model") or "") for item in lane_votes], limit=8),
@@ -85061,6 +90152,9 @@ def attach_endogenous_inquiry_to_decision(
     ):
         return decision
     enriched = dict(decision)
+    proposal = normalize_inquiry_reasoning_proposal(enriched.get("reasoning_proposal"))
+    if proposal and (proposal.get("action") != inquiry_action or proposal.get("inquiry_id") != selected.get("id") or proposal.get("source_fingerprint") != selected.get("source_fingerprint")):
+        enriched["reasoning_proposal"] = {}
     selection_policy = normalize_text_value(
         enriched.get("selection_policy"),
         fallback="",
@@ -85113,7 +90207,13 @@ def choose_autonomy_free_run_action(
     remaining_seconds: int,
     style: object = "explorer",
 ) -> Dict[str, object]:
-    menu = autonomy_free_run_action_menu(remaining_seconds)
+    try:
+        body_world = load_fly_body_world(config)
+    except Exception:
+        body_world = {"available": False}
+    menu = autonomy_admissible_action_menu(
+        autonomy_free_run_action_menu(remaining_seconds, body_world=body_world), snapshot, previous_actions, config,
+    )
     normalized_style = normalize_autonomy_free_run_style(
         style,
         default=str(config.get("autonomy_free_run_default_style") or "explorer"),
@@ -85231,20 +90331,26 @@ def autonomy_action_outcome_observation(action_result: Dict[str, object]) -> Dic
     result can close a purely internal action, but it remains labeled as process
     evidence rather than independent verification.
     """
-    status = str(action_result.get("status") or "")
+    status = str(action_result.get("status") or "").strip().lower()
     verification = action_result_explicit_verification(action_result)
+    consistency = eve_recurrent_cognition.action_result_consistency(action_result)
     explicit_ok = parse_explicit_boolish(action_result.get("ok")) if "ok" in action_result else None
     terminal = status in {"completed", "blocked", "error", "skipped", "failed"}
+    # Raw operational results carry an execution receipt but may omit the
+    # free-run wrapper's status label. Use the existing verifier, not an
+    # invented failure merely because that optional label is absent.
+    completed = status == "completed" or (not status and action_result_verified_for_completion(action_result))
     consequence_observed = verification is not None or (terminal and explicit_ok is not None)
     outcome_ok: Optional[bool]
     evidence_kind: str
-    if verification is not None:
-        outcome_ok = bool(verification and status == "completed")
+    if verification is False or (verification is True and consistency is not None):
+        outcome_ok = bool(verification and completed and consistency is True)
         evidence_kind = "explicit_verification"
-    elif consequence_observed:
-        outcome_ok = bool(explicit_ok and status == "completed")
+    elif verification is None and consequence_observed and consistency is not None:
+        outcome_ok = bool(explicit_ok and status == "completed" and consistency is True)
         evidence_kind = "executor_process_result"
     else:
+        consequence_observed = False
         outcome_ok = None
         evidence_kind = "pending"
     return {
@@ -85266,7 +90372,30 @@ def record_world_model_inquiry_observation(
     if not inquiry_id:
         return None
     selected_action = normalize_text_value(decision.get("action"), fallback="", limit=80)
+    if action_result.get("action") and action_result.get("action") != selected_action:
+        return {"inquiry_id": inquiry_id, "status": "action_mismatch", "answered": False}
     observation = autonomy_action_outcome_observation(action_result)
+    measurement = eve_recurrent_cognition.normalize_inquiry_measurement(action_result.get("measurement"))
+    contract = action_result.get("typed_contract") or {}
+    if measurement and not (
+        selected_action == "fly_decoder_probe" and action_result.get("probe") == "decoder"
+        and action_result.get("executed") is True and type(action_result.get("returncode")) is int
+        and action_result["returncode"] == 0 and isinstance(contract, dict)
+        and contract.get("schema_id") == "fly_probe_result.v1" and contract.get("valid") is True
+        and str(action_result.get("status") or "") in {"", "completed"}
+        and type(action_result.get("ok")) is bool
+        and action_result_explicit_verification(action_result) is action_result.get("ok")
+        and action_result.get("execution_id") and run_id and source_cycle_id
+        and decision.get("inquiry_source_fingerprint")
+    ):
+        measurement = {"schema_id": "eve.decoder_measurement.v1", "valid": False, "metrics": {}}
+    proposal = normalize_inquiry_reasoning_proposal(decision.get("reasoning_proposal"))
+    if proposal and not (
+        proposal.get("action") == selected_action and proposal.get("inquiry_id") == inquiry_id
+        and proposal.get("source_fingerprint") == decision.get("inquiry_source_fingerprint")
+    ):
+        proposal = {}
+    assessment = eve_recurrent_cognition.assess_inquiry_predictions(proposal, measurement)
     observed_summary = normalize_text_value(
         action_result.get("summary"),
         fallback=observation.get("status") or "No observation was recorded.",
@@ -85277,12 +90406,16 @@ def record_world_model_inquiry_observation(
         "attempted_at": attempted_at,
         "run_id": normalize_text_value(run_id, fallback="", limit=100),
         "source_cycle_id": normalize_text_value(source_cycle_id, fallback="", limit=100),
+        "execution_id": normalize_text_value(action_result.get("execution_id"), fallback="", limit=100),
         "action": selected_action,
         "status": observation.get("status"),
         "consequence_observed": bool(observation.get("consequence_observed")),
         "outcome_ok": observation.get("outcome_ok"),
         "evidence_kind": observation.get("evidence_kind"),
         "observed": observed_summary,
+        "reasoning_proposal": proposal,
+        "measurement": measurement,
+        "prediction_assessment": assessment,
     }
 
     def mutator(payload: Dict[str, object]) -> Dict[str, object]:
@@ -85314,6 +90447,18 @@ def record_world_model_inquiry_observation(
             }
         inquiry = dict(open_questions[index])
         attempts = [dict(item) for item in inquiry.get("attempts") or [] if isinstance(item, dict)]
+        if selected_action not in (inquiry.get("candidate_actions") or []) or (
+            decision.get("inquiry_source_fingerprint")
+            and decision.get("inquiry_source_fingerprint") != inquiry.get("source_fingerprint")
+        ):
+            return {"inquiry_id": inquiry_id, "status": "source_mismatch", "answered": False}
+        if any(
+            (attempt["execution_id"] and prior.get("execution_id") == attempt["execution_id"])
+            or (attempt["run_id"] and attempt["source_cycle_id"] and
+                all(prior.get(key) == attempt.get(key) for key in ("run_id", "source_cycle_id", "action")))
+            for prior in attempts
+        ):
+            return {"inquiry_id": inquiry_id, "status": "already_observed", "answered": False}
         attempts.append(attempt)
         inquiry["attempts"] = attempts[-8:]
         inquiry["updated_at"] = attempted_at
@@ -85323,10 +90468,16 @@ def record_world_model_inquiry_observation(
             and observation.get("outcome_ok") is True
             and str(observation.get("status") or "") == "completed"
         )
+        if measurement or any(item.get("test") for item in proposal.get("alternatives", [])):
+            # A scientific answer depends on discriminating measured predictions,
+            # not on passing a performance goal. A negative goal keeps negative credit.
+            verified_completed_observation = eve_recurrent_cognition.inquiry_observation_resolved(
+                inquiry.get("observation_test"), assessment)
         if verified_completed_observation:
             inquiry.update(
                 status="answered",
-                answer=observed_summary,
+                answer=("Measured predictions discriminated; explanations remain unverified. " + observed_summary)
+                    if assessment["predictions_discriminated"] else observed_summary,
                 answered_at=attempted_at,
                 selected_action="",
             )
@@ -85360,6 +90511,10 @@ def record_world_model_inquiry_observation(
         normalized = normalize_world_model_state(normalized)
         payload.clear()
         payload.update(normalized)
+        # Return the persisted projection, not the pre-normalization candidate
+        # whose selected action can still point at an exhausted probe.
+        inquiry = next((item for item in [*normalized["open_questions"], *normalized["answered_questions"]]
+                        if item.get("id") == inquiry_id), inquiry)
         return {
             "inquiry_id": inquiry_id,
             "question": inquiry.get("question"),
@@ -85384,6 +90539,52 @@ def record_world_model_inquiry_observation(
 PREDICTION_CHECKS_KEEP = 500  # ~several days at observed cadence; readers only need ~24h
 
 
+def prediction_check_observation_status(
+    *,
+    prediction_id: object,
+    reply_message_id: object,
+    observed_message_id: object,
+) -> str:
+    """Return whether an exact social prediction has already been closed.
+
+    One genuine next message closes one reply prediction, including neutral
+    answers and follow-ups. Retries of that same observation may still repair a
+    downstream consequence join; later messages may not overwrite it.
+    """
+    clean_prediction_id = normalize_text_value(prediction_id, fallback="", limit=100)
+    clean_reply_id = normalize_text_value(reply_message_id, fallback="", limit=120)
+    clean_observed_id = normalize_text_value(observed_message_id, fallback="", limit=120)
+    if not clean_reply_id:
+        return "none"
+    try:
+        records = read_jsonl_records(PREDICTION_CHECKS_PATH)
+    except Exception:
+        return "none"
+    for existing in reversed(records):
+        if not isinstance(existing, dict) or str(existing.get("kind") or "") != "conversational":
+            continue
+        existing_prediction_id = normalize_text_value(
+            existing.get("prediction_id"), fallback="", limit=100
+        )
+        existing_reply_id = normalize_text_value(
+            existing.get("scored_reply_id"), fallback="", limit=120
+        )
+        if clean_prediction_id and existing_prediction_id:
+            if existing_prediction_id != clean_prediction_id:
+                continue
+        elif existing_reply_id != clean_reply_id:
+            continue
+        existing_observed_id = normalize_text_value(
+            existing.get("observed_message_id"), fallback="", limit=120
+        )
+        return (
+            "same_observation"
+            if clean_observed_id and existing_observed_id == clean_observed_id
+            else "different_observation"
+        )
+    return "none"
+
+
 def append_prediction_check_record(record: Dict[str, object], keep: int = PREDICTION_CHECKS_KEEP) -> bool:
     """Capped append for the shared prediction-error ledger (autonomy + conversational
     producers). Without a cap the file grew unbounded and the reader loaded all of it;
@@ -85392,21 +90593,41 @@ def append_prediction_check_record(record: Dict[str, object], keep: int = PREDIC
         ensure_store()
         with store_lock(PREDICTION_CHECKS_PATH):
             records = read_jsonl_records(PREDICTION_CHECKS_PATH)
+            records = [
+                eve_social_prediction.sanitize_ledger_record(item)
+                if isinstance(item, dict) and str(item.get("kind") or "") == "conversational"
+                else item
+                for item in records
+            ]
             if str(record.get("kind") or "") == "conversational":
                 reply_id = str(record.get("scored_reply_id") or "")
                 observed_message_id = str(record.get("observed_message_id") or "")
+                prediction_id = str(record.get("prediction_id") or "")
                 for existing in reversed(records):
                     if not isinstance(existing, dict) or str(existing.get("kind") or "") != "conversational":
                         continue
+                    existing_prediction_id = str(existing.get("prediction_id") or "")
+                    if prediction_id and existing_prediction_id:
+                        if existing_prediction_id != prediction_id:
+                            continue
+                        # The first genuine observation closes a new-style
+                        # prediction, regardless of whether it supplied value
+                        # evidence for lane learning.
+                        return False
                     if reply_id and str(existing.get("scored_reply_id") or "") != reply_id:
                         continue
                     if observed_message_id and str(existing.get("observed_message_id") or "") == observed_message_id:
+                        return False
+                    if isinstance(existing.get("social_outcome"), dict) and existing["social_outcome"].get("scored"):
                         return False
                     if record.get("consequence_observed") and existing.get("consequence_observed"):
                         # One immediate lived consequence closes one reply.  Do
                         # not reward or penalize retries/concurrent requests.
                         return False
-            records.append(record)
+                persisted_record = eve_social_prediction.sanitize_ledger_record(record)
+            else:
+                persisted_record = dict(record)
+            records.append(persisted_record)
             if len(records) > keep:
                 records = records[-keep:]
             write_jsonl_records(PREDICTION_CHECKS_PATH, records)
@@ -85429,7 +90650,11 @@ def read_recent_prediction_checks(hours: float = 24.0, limit: int = 24) -> List[
         when = parse_iso_datetime(record.get("timestamp"))
         if when is None or when < cutoff:
             continue
-        recent.append(record)
+        recent.append(
+            eve_social_prediction.sanitize_ledger_record(record)
+            if str(record.get("kind") or "") == "conversational"
+            else record
+        )
     return recent[-limit:]
 
 
@@ -85618,11 +90843,17 @@ def execute_autonomy_free_run_action(
                 thought,
                 source=source,
             )
-            append_entry(
-                "thought",
+            try:
+                mutate_state(lambda st: apply_continuous_thought_state(st, thought, utc_now()))
+            except Exception:
+                pass
+            append_continuous_thought_entry(
+                thought,
                 str(thought["response"]),
                 metadata={
                     "model": thought.get("model"),
+                    "skipped_model": bool(thought.get("skipped_model")),
+                    "reviewed_lesson_ids": [item["review_id"] for item in thought.get("reviewed_lessons") or []],
                     "attempted_model": thought.get("attempted_model"),
                     "source": source,
                     "autonomy_run_id": run_id,
@@ -85698,6 +90929,36 @@ def execute_autonomy_free_run_action(
                     execution_tree_status=operation.get("execution_tree_status"),
                     execution_verification_ok=action_result_explicit_verification(operation),
                 )
+
+        elif action == "self_change":
+            if remaining_seconds < 150:
+                result.update(status="skipped", summary="Not enough bounded time to apply one of my proposals.")
+            else:
+                operation = run_self_change_cycle(config, source=source, timeout_seconds=max(60, remaining_seconds - 10))
+                record_synthetic_action_execution(action="self_change", source=source, ok=bool(operation.get("ok")), summary=operation.get("summary"), backend="self_change")
+                result.update(operation)
+                result.update(status="completed" if operation.get("executed") else "skipped", ok=bool(operation.get("ok")))
+
+        elif action in BODY_ACTIONS:
+            if remaining_seconds < 15:
+                result.update(status="skipped", summary="Not enough bounded time for a body action.")
+            else:
+                bounded_config = dict(config, body_action_observe_seconds=min(int(config.get("body_action_observe_seconds") or 8), max(2, remaining_seconds - 5)))
+                operation = run_operational_action_tree(action, bounded_config, source=source)
+                result.update(operation)
+                result.update(status="completed" if operation.get("executed") else "blocked",
+                              ok=action_result_verified_for_completion(operation))
+
+        elif action in FLY_PROBE_ACTIONS:
+            if remaining_seconds < 31:
+                result.update(status="skipped", summary="Not enough bounded time for a fly probe.")
+            else:
+                bounded_config = dict(config, fly_probe_timeout_seconds=min(
+                    int(config.get("fly_probe_timeout_seconds") or 240), remaining_seconds - 1))
+                operation = run_operational_action_tree(action, bounded_config, source=source)
+                result.update(operation)
+                result.update(status="completed" if operation.get("executed") else "blocked",
+                              ok=action_result_verified_for_completion(operation))
 
         elif action == "updates_status":
             update_state = load_component_update_state(prefer_runtime=True)
@@ -86263,6 +91524,26 @@ def summarize_autonomy_free_run(
     return summary
 
 
+def autonomy_conscious_outcome(action_result, observation, opened_state, decision, inquiry_observation):
+    """Keep executor identity when the free-run result closes its core cycle."""
+    return {
+        "ok": (observation or {}).get("outcome_ok"),
+        "observed": bool((observation or {}).get("consequence_observed")),
+        "evidence_kind": (observation or {}).get("evidence_kind") or "pending",
+        "evidence_id": normalize_text_value(action_result.get("execution_id"), fallback="", limit=120),
+        "execution_id": normalize_text_value(action_result.get("execution_id"), fallback="", limit=100),
+        "procedural_verification_ok": action_result_verified_for_completion(action_result),
+        "summary": normalize_text_value(action_result.get("summary"), fallback="", limit=220),
+        "action": normalize_text_value(action_result.get("action"), fallback="", limit=80),
+        "source_cycle_id": normalize_text_value(opened_state.get("cycle_id"), fallback="", limit=80),
+        "inquiry_id": normalize_text_value(decision.get("inquiry_id"), fallback="", limit=100),
+        "inquiry_status": normalize_text_value(
+            inquiry_observation.get("status") if isinstance(inquiry_observation, dict) else "",
+            fallback="", limit=40,
+        ),
+    }
+
+
 def run_autonomy_free_run_session(
     config: Dict[str, object],
     *,
@@ -86300,7 +91581,7 @@ def run_autonomy_free_run_session(
 
         You may observe, think, refresh your active mind, inspect bounded runtime signals, check OpenClaw, review update status, draft proposals, run bounded CPU-side task checks, or try one bounded capability and learn from what happens.
 
-        Do not delete files, install packages, change model configs, restart services, or modify live code. If you want something risky, record it as a proposal instead of doing it.
+        Inside your four edges your code, config, services and files are yours; prefer the self_change action for changes to yourself so they are verified, ledgered and reversible. If you want something risky, record it as a proposal instead of doing it.
 
         Curiosity rule:
         - If you have not used a verified capability in this window and enough time remains, prefer a bounded capability tryout.
@@ -86473,24 +91754,9 @@ def run_autonomy_free_run_session(
                     limit=5,
                 )
                 autonomy_observation = prediction_check or autonomy_action_outcome_observation(action_result)
-                conscious_outcome = {
-                    "ok": (autonomy_observation or {}).get("outcome_ok"),
-                    "observed": bool((autonomy_observation or {}).get("consequence_observed")),
-                    "evidence_kind": (autonomy_observation or {}).get("evidence_kind") or "pending",
-                    "summary": normalize_text_value(action_result.get("summary"), fallback="", limit=220),
-                    "action": normalize_text_value(action_result.get("action"), fallback="", limit=80),
-                    "source_cycle_id": normalize_text_value(
-                        autonomy_conscious_state.get("cycle_id"),
-                        fallback="",
-                        limit=80,
-                    ),
-                    "inquiry_id": normalize_text_value(decision.get("inquiry_id"), fallback="", limit=100),
-                    "inquiry_status": normalize_text_value(
-                        inquiry_observation.get("status") if isinstance(inquiry_observation, dict) else "",
-                        fallback="",
-                        limit=40,
-                    ),
-                }
+                conscious_outcome = autonomy_conscious_outcome(
+                    action_result, autonomy_observation, autonomy_conscious_state, decision, inquiry_observation,
+                )
                 complete_recurrent_conscious_cycle(
                     actual_process={
                         "lanes": autonomy_lanes,
@@ -87614,6 +92880,10 @@ def build_specialist_substrate_report(config: Dict[str, object], *, prefer_runti
         spec = dict(SPECIALIST_SUBSTRATE_REGISTRY[substrate_id])
         status = "planned"
         evidence: List[str] = []
+        observation_complete: Optional[bool] = None
+        observation_authoritative: Optional[bool] = None
+        observation_environment_limited = False
+        observation_blockers: List[str] = []
         if substrate_id == "memory_retrieval_service":
             indexed_notes = int(index_payload.get("note_count") or 0)
             note_count = int(notes_payload.get("note_count") or 0)
@@ -87633,10 +92903,22 @@ def build_specialist_substrate_report(config: Dict[str, object], *, prefer_runti
         elif substrate_id == "beads_work_graph_substrate":
             beads_status = detect_beads_work_graph(prefer_runtime=prefer_runtime)
             status = str(beads_status.get("status") or "planned")
+            observation_environment_limited = bool(
+                beads_status.get("bridge_live_observation_environment_limited")
+            )
+            if observation_environment_limited:
+                observation_complete = False
+                observation_authoritative = False
+                observation_blockers = [
+                    str(value)
+                    for value in beads_status.get("bridge_live_observation_blockers") or []
+                    if str(value).strip()
+                ]
             evidence = [
                 f"bridge_status={beads_status.get('bridge_status') or 'missing'}",
                 f"bridge_current={'yes' if beads_status.get('bridge_current') else 'no'}",
                 f"bridge_live_parity={'yes' if beads_status.get('bridge_live_parity') else 'no'}",
+                f"bridge_live_observation={'restricted' if observation_environment_limited else 'authoritative_or_not_required'}",
                 f"projected_tasks={int(beads_status.get('projected_task_count') or 0)}",
                 f"projected_edges={int(beads_status.get('projected_edge_count') or 0)}",
                 f"installed={'yes' if beads_status.get('installed') else 'no'}",
@@ -87650,11 +92932,8 @@ def build_specialist_substrate_report(config: Dict[str, object], *, prefer_runti
         elif substrate_id == "hermes_learning_organ":
             hermes_status = detect_hermes_learning_organ()
             latest_smoke = normalize_text_value(hermes_status.get("latest_smoke_status"), fallback="", limit=80)
-            proposal_ready = (
-                str(hermes_status.get("status") or "").startswith("available_proposal_only")
-                and parse_boolish(hermes_status.get("soul_guardrail_ok"))
-                and parse_boolish(hermes_status.get("model_endpoint_reachable"))
-            )
+            serious_route_ready = parse_boolish(hermes_status.get("serious_learning_route_verified"))
+            proposal_ready = hermes_serious_proposal_route_ready(hermes_status)
             status = "healthy" if proposal_ready and latest_smoke.startswith("passed") else "partial" if proposal_ready else "planned"
             evidence = [
                 f"installed={'yes' if hermes_status.get('version_ok') else 'no'}",
@@ -87666,6 +92945,8 @@ def build_specialist_substrate_report(config: Dict[str, object], *, prefer_runti
                 f"model_context={hermes_status.get('model_context_length') or 'unknown'}",
                 f"hermes_min_context={hermes_status.get('hermes_minimum_context_length') or 'unknown'}",
                 f"model_endpoint_reachable={'yes' if hermes_status.get('model_endpoint_reachable') else 'no'}",
+                f"endpoint_observation_valid={'yes' if hermes_status.get('model_endpoint_observation_valid', True) else 'no'}",
+                f"serious_learning_route_verified={'yes' if serious_route_ready else 'no'}",
                 f"latest_smoke={hermes_status.get('latest_smoke_status') or 'none'}",
                 f"latest_smoke_model={hermes_status.get('latest_smoke_model') or 'unknown'}",
                 f"direct_state_write_allowed={'yes' if hermes_status.get('direct_state_write_allowed') else 'no'}",
@@ -87721,6 +93002,18 @@ def build_specialist_substrate_report(config: Dict[str, object], *, prefer_runti
         elif substrate_id == "oss_improvement_substrate":
             oss_status = build_oss_integration_status_report(prefer_runtime=prefer_runtime)
             readiness = oss_status.get("readiness") if isinstance(oss_status.get("readiness"), dict) else {}
+            readiness_checks = [
+                item
+                for item in readiness.get("checks") or []
+                if isinstance(item, dict)
+            ]
+            observation_blockers = [str(item) for item in readiness.get("blocking") or []]
+            observation_environment_limited = any(
+                str(item.get("observed") or "") == "inconclusive_environment"
+                for item in readiness_checks
+            )
+            observation_complete = not observation_blockers
+            observation_authoritative = not observation_environment_limited
             status = str(oss_status.get("status") or "partial")
             evidence = [
                 f"inventory={oss_status.get('inventory_status') or 'unknown'}",
@@ -87769,6 +93062,10 @@ def build_specialist_substrate_report(config: Dict[str, object], *, prefer_runti
                 **spec,
                 "status": status,
                 "evidence": evidence,
+                "observation_complete": observation_complete,
+                "observation_authoritative": observation_authoritative,
+                "observation_environment_limited": observation_environment_limited,
+                "observation_blockers": observation_blockers,
             }
         )
     return {
@@ -87822,6 +93119,10 @@ def organ_signal_from_substrate(organ_id: str, substrate: Dict[str, object]) -> 
             "human_quality": spec.get("human_quality"),
             "summary": summary,
             "evidence": substrate.get("evidence") if isinstance(substrate.get("evidence"), list) else [],
+            "observation_complete": substrate.get("observation_complete"),
+            "observation_authoritative": substrate.get("observation_authoritative"),
+            "observation_environment_limited": substrate.get("observation_environment_limited"),
+            "observation_blockers": substrate.get("observation_blockers") if isinstance(substrate.get("observation_blockers"), list) else [],
             "next_step": substrate.get("next_maturation") or "",
             "authority_boundary": spec.get("authority_boundary") or substrate.get("guardrail") or "",
             "cik_zone": spec.get("cik_zone") or eve_governance.CIK_UNKNOWN,
@@ -87923,6 +93224,130 @@ def watcher_organ_signal(*, prefer_runtime: bool = True) -> Dict[str, object]:
     ) or {}
 
 
+def load_fly_body_brain_status(config: Dict[str, object]) -> Dict[str, object]:
+    """Read the fly body-brain organ service: live HTTP first, then its last written status file."""
+    url = normalize_text_value(config.get("fly_body_brain_url"), fallback=FLY_BODY_BRAIN_DEFAULT_URL, limit=200)
+    path = Path(str(config.get("fly_body_brain_status_path") or FLY_BODY_BRAIN_DEFAULT_STATUS_PATH)).expanduser()
+    try:
+        import urllib.request as _fly_urllib_request
+
+        with _fly_urllib_request.urlopen(url, timeout=1.5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if isinstance(payload, dict):
+            return {**payload, "live": True, "stale_seconds": 0.0, "path": str(path), "url": url}
+    except Exception:
+        pass
+    try:
+        payload = json.loads(path.read_text())
+        age = max(0.0, time.time() - path.stat().st_mtime)
+        if isinstance(payload, dict):
+            return {**payload, "live": False, "stale_seconds": age, "path": str(path), "url": url}
+    except Exception:
+        pass
+    return {"live": False, "stale_seconds": None, "path": str(path), "url": url}
+
+
+def fly_body_brain_organ_signal(config: Dict[str, object], *, prefer_runtime: bool = True) -> Dict[str, object]:
+    """Typed organ signal for the signed-connectome body-brain. Pressure follows substrate arousal, so a
+    looming-driven escape state can surface in the active mind while a lesioned organ cannot."""
+    del prefer_runtime  # The organ service owns its own status; there is no runtime mirror yet.
+    spec = ORGAN_ASSIMILATION_REGISTRY["fly_body_brain"]
+    payload = load_fly_body_brain_status(config)
+    signals = payload.get("signals") if isinstance(payload.get("signals"), dict) else {}
+
+    def _num(key: str, scale: float = 1.0) -> float:
+        try:
+            return max(0.0, min(1.0, float(signals.get(key) or 0.0) / scale))
+        except (TypeError, ValueError):
+            return 0.0
+
+    live = bool(payload.get("live"))
+    stale = payload.get("stale_seconds")
+    mode = normalize_text_value(payload.get("mode"), fallback="unknown", limit=20).lower()
+    escape = _num("escape", 0.3)
+    feeding = _num("feeding", 0.003)
+    song = _num("song_pIP10", 0.08)
+    novelty = _num("kenyon_cells", 0.15)
+    aroused = _num("descending_all", 0.005)
+    # Attention pressure follows only states that warrant it: escape can become a live thread (>= 70),
+    # courtship and novelty stay background (< 70), rest/feeding never raises pressure.
+    arousal = max(escape, 0.55 * song, 0.5 * novelty)
+    if escape >= 0.5:
+        body_mode = "escape"
+    elif song >= 0.4:
+        body_mode = "courtship"
+    elif novelty >= 0.4:
+        body_mode = "novelty"
+    elif feeding >= 0.6 and aroused < 0.8:
+        body_mode = "rest"
+    elif aroused >= 0.8:
+        body_mode = "aroused"
+    else:
+        body_mode = "calm"
+    if live and mode == "signed":
+        status = "healthy"
+    elif live:
+        status = "partial"
+    elif isinstance(stale, (int, float)) and stale <= FLY_BODY_BRAIN_STALE_SECONDS:
+        status = "partial"
+    else:
+        status = "lab_available"
+    base_pressure = organ_status_pressure(status)
+    pressure = max(base_pressure, int(round(30 + 65 * arousal))) if live else base_pressure
+    salience = (28 + int(round(50 * arousal))) if live else 30
+    try:
+        active_fraction = float(payload.get("active_fraction") or 0.0)
+    except (TypeError, ValueError):
+        active_fraction = 0.0
+    if not live:
+        summary = "Fly body-brain organ service is not running; the signed connectome substrate is available as a lab organ."
+        if isinstance(stale, (int, float)):
+            summary = f"Fly body-brain last reported {round(stale)}s ago in {mode} mode; no live service answered."
+        next_step = "Start `~/Documents/eve-fly/fly_organ.py` to bring the body-brain online."
+    elif mode != "signed":
+        summary = f"Fly body-brain is live but lesioned ({mode}); readouts are causal controls, not body state."
+        next_step = "Restore signed mode after the lesion comparison is recorded."
+    else:
+        summary = (
+            f"Fly body-brain live at {payload.get('hz', '?')} Hz, body mode {body_mode}: escape {float(signals.get('escape') or 0.0):.3f}, "
+            f"feeding {float(signals.get('feeding') or 0.0):.4f}, song {float(signals.get('song_pIP10') or 0.0):.3f}, "
+            f"mushroom body {float(signals.get('kenyon_cells') or 0.0):.3f}; {active_fraction * 100:.2f}% of {payload.get('neurons', '?')} neurons active."
+        )
+        next_step = "Feed body sensors and homeostasis pressures through the organ's named channels and keep lesioned replays next to every claim."
+    evidence = [
+        f"live={'yes' if live else 'no'}; mode={mode}",
+        f"tick={payload.get('tick', '?')}; hz={payload.get('hz', '?')}; ms_per_step={payload.get('ms_per_step', '?')}",
+        f"active_fraction={active_fraction:.4f}; state_rms={payload.get('state_rms', '?')}",
+        "escape={:.3f}; feeding={:.4f}; legs={:.4f}; wings={:.4f}; turn_bias={:+.4f}".format(
+            float(signals.get("escape") or 0.0), float(signals.get("feeding") or 0.0), float(signals.get("legs") or 0.0),
+            float(signals.get("wings") or 0.0), float(signals.get("turn_bias") or 0.0)),
+        "body_mode={}; song_pIP10={:.4f}; kenyon_cells={:.4f}; mbon={:.4f}; inputs={}".format(
+            body_mode, float(signals.get("song_pIP10") or 0.0), float(signals.get("kenyon_cells") or 0.0), float(signals.get("mbon") or 0.0),
+            ",".join(sorted(str(k) for k in (payload.get("inputs") or {}).keys())) or "none"),
+        f"neurons={payload.get('neurons', '?')}; edges={payload.get('edges', '?')}; source={payload.get('url') if live else payload.get('path')}",
+    ]
+    return normalize_organ_signal(
+        {
+            "id": "fly_body_brain",
+            "label": spec["label"],
+            "status": status,
+            "salience": salience,
+            "pressure": pressure,
+            "role": spec["role"],
+            "human_quality": spec["human_quality"],
+            "summary": summary,
+            "evidence": evidence,
+            "observation_complete": live,
+            "observation_authoritative": live,
+            "next_step": next_step,
+            "authority_boundary": spec["authority_boundary"],
+            "cik_zone": spec["cik_zone"],
+            "source": "fly_body_brain_status",
+            "last_updated": utc_now(),
+        }
+    ) or {}
+
+
 def build_organ_assimilation_report(
     config: Dict[str, object],
     *,
@@ -87934,6 +93359,9 @@ def build_organ_assimilation_report(
     for organ_id in ORGAN_ASSIMILATION_ORDER:
         if organ_id == "five_model_lanes":
             signals.append(model_lane_organ_signal(config, prefer_runtime=prefer_runtime))
+            continue
+        if organ_id == "fly_body_brain":
+            signals.append(fly_body_brain_organ_signal(config, prefer_runtime=prefer_runtime))
             continue
         if organ_id == "codex_mutation_organ":
             signals.append(organ_signal_from_substrate(organ_id, substrate_by_id.get("coding_self_repair_specialist", {})))
@@ -88258,7 +93686,35 @@ def latest_consciousness_test_record(*, prefer_runtime: bool = False) -> Tuple[D
     return read_whole_system_json_artifact(APP_DIR / "capability_tests" / "latest_consciousness_test.json", prefer_runtime=prefer_runtime)
 
 
+def observe_core_runner() -> Dict[str, object]:
+    """Operational observation only; never a memory/store routing predicate."""
+    return eve_daemon_runtime.observe_runner(
+        RUNTIME_DIR, code_roots=[RUNTIME_DIR, *eve_checkout_root_candidates()]
+    )
+
+
 def presence_runtime_liveness(
+    config: Dict[str, object],
+    state: Dict[str, object],
+    *,
+    daemon_running: Optional[bool] = None,
+    prefer_runtime: bool = True,
+    runner_observation: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    # Explicit legacy inputs remain usable in old deployments and pure probes.
+    # Owned observations take precedence only on observation paths, never in
+    # daemon_runtime_running(), which still participates in data authority.
+    observation = runner_observation
+    if observation is None and daemon_running is None:
+        observation = observe_core_runner()
+    if observation and observation.get("available"):
+        return eve_daemon_runtime.observed_liveness(observation, config)
+    return _legacy_presence_runtime_liveness(
+        config, state, daemon_running=daemon_running, prefer_runtime=prefer_runtime
+    )
+
+
+def _legacy_presence_runtime_liveness(
     config: Dict[str, object],
     state: Dict[str, object],
     *,
@@ -88278,6 +93734,9 @@ def presence_runtime_liveness(
         and last_loop_age_minutes * 60.0 <= max_age_seconds
     )
     activity = load_daemon_activity(prefer_runtime=prefer_runtime)
+    run_mode = str(activity.get("run_mode") or "")
+    if run_mode == "once":
+        loop_fresh = False
     activity_status = normalize_text_value(activity.get("status"), fallback="", limit=30)
     activity_heartbeat_at = normalize_text_value(activity.get("last_heartbeat_at"), fallback="", limit=60)
     activity_started_at = normalize_text_value(activity.get("cycle_started_at"), fallback="", limit=60)
@@ -88301,6 +93760,7 @@ def presence_runtime_liveness(
     activity_pid_matches = not expected_pid or activity_pid == expected_pid
     activity_live = bool(
         running
+        and run_mode != "once"
         and activity_status == "active"
         and activity_pid_matches
         and activity_heartbeat_age_minutes is not None
@@ -88312,6 +93772,9 @@ def presence_runtime_liveness(
     if not running:
         status = "dormant"
         reason = "The Eve daemon process is not running."
+    elif run_mode == "once":
+        status = "diagnostic"
+        reason = "The activity belongs to a one-shot diagnostic, not the recurrent daemon."
     elif activity_live and not loop_fresh:
         status = "active"
         reason = (
@@ -88340,6 +93803,8 @@ def presence_runtime_liveness(
         "last_loop_age_minutes": round(last_loop_age_minutes, 2) if last_loop_age_minutes is not None else None,
         "max_loop_age_seconds": max_age_seconds,
         "activity": {
+            "run_mode": run_mode or "legacy_unknown",
+            "owner_id": str(activity.get("owner_id") or ""),
             "status": activity_status or "missing",
             "cycle_id": normalize_text_value(activity.get("cycle_id"), fallback="", limit=80),
             "pid": activity_pid,
@@ -88375,6 +93840,13 @@ def build_presence_report(
         state,
         daemon_running=daemon_running,
         prefer_runtime=prefer_runtime,
+        runner_observation=observe_core_runner(),
+    )
+    # The legacy native-service predicate selects data authority, not source-
+    # runner liveness. A proven source-owned recurrent core must not be called
+    # dormant just because no native daemon plist is loaded.
+    operational_core_running = bool(runtime_liveness.get("live")) or bool(
+        runtime_liveness.get("daemon_running", daemon_running)
     )
     readiness = dict(organ_report.get("readiness")) if isinstance(organ_report.get("readiness"), dict) else {}
     consciousness_rank = consciousness.get("rank") if isinstance(consciousness.get("rank"), dict) else {}
@@ -88422,7 +93894,7 @@ def build_presence_report(
     )
     if not action_contract.get("bounded_action"):
         problems.append("No bounded action contract is available.")
-    if not daemon_running:
+    if not operational_core_running:
         status = "dormant"
     elif not runtime_liveness.get("live"):
         status = "blocked"
@@ -88459,7 +93931,7 @@ def build_presence_report(
         "problems": problems,
         "next_step": (
             "Start Eve's continuity runtime, verify a fresh daemon loop, then rebuild organ and presence evidence."
-            if not daemon_running
+            if not operational_core_running
             else "Repair the stalled daemon loop before treating cached state as current presence."
             if not runtime_liveness.get("live")
             else
@@ -89272,6 +94744,15 @@ def cmd_specialists_status(args: argparse.Namespace) -> int:
 
 
 def cmd_hermes_status(args: argparse.Namespace) -> int:
+    if bool(getattr(args, "runtime", False)):
+        delegate_args = ["hermes", "status", "--timeout", str(int(args.timeout or 10))]
+        if args.full:
+            delegate_args.append("--full")
+        if args.json:
+            delegate_args.append("--json")
+        delegated = delegate_cli_to_runtime(delegate_args, timeout_seconds=max(30, int(args.timeout or 10) * 3))
+        if delegated is not None:
+            return delegated
     payload = detect_hermes_learning_organ(timeout=int(args.timeout or 10))
     if args.json:
         print(json.dumps(payload, indent=2, ensure_ascii=True))
@@ -89281,6 +94762,19 @@ def cmd_hermes_status(args: argparse.Namespace) -> int:
 
 
 def cmd_hermes_inventory(args: argparse.Namespace) -> int:
+    if bool(getattr(args, "runtime", False)):
+        delegate_args = ["hermes", "inventory", "--timeout", str(int(args.timeout or 25))]
+        if args.refresh:
+            delegate_args.append("--refresh")
+        if args.no_save:
+            delegate_args.append("--no-save")
+        if args.full:
+            delegate_args.append("--full")
+        if args.json:
+            delegate_args.append("--json")
+        delegated = delegate_cli_to_runtime(delegate_args, timeout_seconds=max(90, int(args.timeout or 25) * 30))
+        if delegated is not None:
+            return delegated
     inventory = build_hermes_capability_inventory(
         timeout=int(args.timeout or 25),
         save=not bool(args.no_save),
@@ -89293,6 +94787,19 @@ def cmd_hermes_inventory(args: argparse.Namespace) -> int:
 
 
 def cmd_hermes_feature_policy(args: argparse.Namespace) -> int:
+    if bool(getattr(args, "runtime", False)):
+        delegate_args = ["hermes", "feature-policy", "--timeout", str(int(args.timeout or 25))]
+        if args.refresh_inventory:
+            delegate_args.append("--refresh-inventory")
+        if args.no_save:
+            delegate_args.append("--no-save")
+        if args.full:
+            delegate_args.append("--full")
+        if args.json:
+            delegate_args.append("--json")
+        delegated = delegate_cli_to_runtime(delegate_args, timeout_seconds=max(90, int(args.timeout or 25) * 30))
+        if delegated is not None:
+            return delegated
     inventory = None
     if args.refresh_inventory:
         inventory = build_hermes_capability_inventory(timeout=int(args.timeout or 25), save=not bool(args.no_save))
@@ -89606,6 +95113,19 @@ def cmd_router_replay(args: argparse.Namespace) -> int:
 
 
 def cmd_openclaw_status(args: argparse.Namespace) -> int:
+    if bool(getattr(args, "runtime", False)):
+        delegate_args = ["openclaw", "status"]
+        if bool(getattr(args, "no_gateway_probe", False)):
+            delegate_args.append("--no-gateway-probe")
+        if bool(getattr(args, "no_memory_probe", False)):
+            delegate_args.append("--no-memory-probe")
+        if bool(getattr(args, "full", False)):
+            delegate_args.append("--full")
+        if bool(getattr(args, "json", False)):
+            delegate_args.append("--json")
+        delegated = delegate_cli_to_runtime(delegate_args, timeout_seconds=180)
+        if delegated is not None:
+            return delegated
     config = load_config()
     status = eve_openclaw.collect_openclaw_status(
         config,
@@ -89613,13 +95133,19 @@ def cmd_openclaw_status(args: argparse.Namespace) -> int:
         include_gateway_probe=not bool(getattr(args, "no_gateway_probe", False)),
         include_memory_probe=not bool(getattr(args, "no_memory_probe", False)),
     )
-    eve_openclaw.save_openclaw_status(status)
+    mirror_runtime, state_authority = observation_artifact_state_authority()
+    status["state_authority"] = state_authority
+    eve_openclaw.save_openclaw_status(status, mirror_runtime=mirror_runtime)
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(status, indent=2, ensure_ascii=True, sort_keys=True))
+        return 0
     state = load_state(prefer_runtime=True)
     state["openclaw_summary"] = normalize_text_value(status.get("summary"), fallback="", limit=220)
-    try:
-        save_state(state)
-    except OSError:
-        pass
+    if state_authority.get("persistence") != "source_only_preserved_live_runtime":
+        try:
+            save_state(state)
+        except OSError:
+            pass
     print("Integrated OpenClaw sidecar")
     print(
         f"- enabled: {'yes' if eve_openclaw.openclaw_enabled(config) else 'no'}\n"
@@ -89651,6 +95177,15 @@ def cmd_openclaw_status(args: argparse.Namespace) -> int:
         print()
         print("Gateway status")
         print(str(status.get("gateway_status_output")))
+    if bool(getattr(args, "full", False)):
+        print()
+        print("Observation authority")
+        print(f"- execution_side: {state_authority.get('execution_side')}")
+        print(f"- persistence: {state_authority.get('persistence')}")
+        print(f"- gateway_socket_probe_authoritative: {'yes' if status.get('gateway_socket_probe_authoritative') else 'no'}")
+        print(f"- gateway_socket_probe_environment_limited: {'yes' if status.get('gateway_socket_probe_environment_limited') else 'no'}")
+        print(f"- plugins_allow_count: {status.get('plugins_allow_count') or 0}")
+        print(f"- config_valid: {status.get('config_valid') if status.get('config_valid') is not None else 'unknown'}")
     return 0
 
 
@@ -91019,7 +96554,9 @@ def run_openclaw_channel_inventory(
     status_result = eve_openclaw_body.run_openclaw_json_command(status_command, timeout=timeout)
     list_payload = list_result.get("payload") if isinstance(list_result.get("payload"), dict) else {}
     status_payload = status_result.get("payload") if isinstance(status_result.get("payload"), dict) else {}
-    configured = openclaw_configured_channels(list_payload, status_payload)
+    configured_candidates = openclaw_configured_channels(list_payload, status_payload)
+    configuration_observed = bool(list_result.get("ok") and status_result.get("ok"))
+    configured = configured_candidates if configuration_observed else []
     capability_results = []
     capability_timeout = max(timeout, OPENCLAW_CHANNEL_CAPABILITY_TIMEOUT_SECONDS)
     for channel in configured:
@@ -91032,29 +96569,65 @@ def run_openclaw_channel_inventory(
                 ),
             }
         )
-    channel_health_issues = openclaw_channel_health_issues(configured, status_payload, capability_results)
+    command_results = [list_result, status_result, *(item["result"] for item in capability_results)]
+    capability_observation_complete = all(item["result"].get("ok") for item in capability_results)
+    observation_complete = bool(configuration_observed and capability_observation_complete)
+    observation_environment_limited = any(
+        bool(result.get("observation_environment_limited")) for result in command_results
+    )
+    observation_authoritative = all(
+        result.get("observation_authoritative") is not False for result in command_results
+    )
+    channel_health_issues = (
+        openclaw_channel_health_issues(configured, status_payload, capability_results)
+        if observation_complete
+        else []
+    )
     ok = bool(
         list_result.get("ok")
         and status_result.get("ok")
         and all(item["result"].get("ok") for item in capability_results)
         and not channel_health_issues
     )
-    summary = (
-        f"OpenClaw channel inventory checked; configured_channels={len(configured)}. "
-        f"channel_health_issues={len(channel_health_issues)}. No external send authority is implied."
-    )
+    if observation_complete:
+        summary = (
+            f"OpenClaw channel inventory checked; configured_channels={len(configured)}. "
+            f"channel_health_issues={len(channel_health_issues)}. No external send authority is implied."
+        )
+    elif observation_environment_limited and not observation_authoritative:
+        summary = (
+            "OpenClaw channel inventory is inconclusive in this restricted execution environment; "
+            "configured channel count was not observed and no absence claim is valid."
+        )
+    else:
+        summary = (
+            "OpenClaw channel inventory commands did not complete; configured channel count was not observed. "
+            "No external send authority is implied."
+        )
     payload = {
         "configured_channels": configured,
+        "configured_channel_candidates": configured_candidates,
+        "configured_channels_observed": configuration_observed,
         "supported_channels": list(OPENCLAW_CHANNEL_CHOICES),
         "list": list_result,
         "status": status_result,
         "capabilities": capability_results,
         "channel_health_issues": channel_health_issues,
         "probe": bool(probe),
+        "observation_complete": observation_complete,
+        "observation_authoritative": observation_authoritative,
+        "observation_environment_limited": observation_environment_limited,
     }
+    event_status = (
+        "ready"
+        if ok
+        else "inconclusive_environment"
+        if observation_environment_limited and not observation_authoritative
+        else "degraded"
+    )
     event = build_openclaw_channel_event(
         event_type="openclaw_channel_inventory",
-        status="ready" if ok else "degraded",
+        status=event_status,
         summary=summary,
         ok=ok,
         source=source,
@@ -91068,8 +96641,13 @@ def run_openclaw_channel_inventory(
         "ok": ok,
         "event": event,
         "configured_channels": configured,
+        "configured_channel_candidates": configured_candidates,
+        "configured_channels_observed": configuration_observed,
         "channel_health_issues": channel_health_issues,
         "summary": summary,
+        "observation_complete": observation_complete,
+        "observation_authoritative": observation_authoritative,
+        "observation_environment_limited": observation_environment_limited,
     }
 
 
@@ -91516,6 +97094,7 @@ def build_openclaw_full_audit(
     prefer_runtime: bool = False,
     record_channel_inventory: bool = False,
 ) -> Dict[str, object]:
+    mirror_runtime, state_authority = observation_artifact_state_authority()
     config = load_config()
     workspace = eve_openclaw.openclaw_workspace(config)
     status = eve_openclaw.collect_openclaw_status(
@@ -91524,7 +97103,8 @@ def build_openclaw_full_audit(
         include_gateway_probe=True,
         include_memory_probe=True,
     )
-    eve_openclaw.save_openclaw_status(status)
+    status["state_authority"] = state_authority
+    eve_openclaw.save_openclaw_status(status, mirror_runtime=mirror_runtime)
     contracts = eve_openclaw_body.build_openclaw_body_contract_report(status)
     worker_events = eve_openclaw_body.read_openclaw_worker_events(limit=20, prefer_runtime=prefer_runtime)
     routine_events = eve_openclaw_body.read_openclaw_routine_events(limit=20, prefer_runtime=prefer_runtime)
@@ -91536,9 +97116,13 @@ def build_openclaw_full_audit(
     )
     skills_result = eve_openclaw_body.run_openclaw_json_command(["skills", "list", "--json"], timeout=timeout)
     skills_payload = skills_result.get("payload") if isinstance(skills_result.get("payload"), dict) else {}
+    skills_rows = skills_payload.get("skills") if isinstance(skills_payload.get("skills"), list) else None
+    skills_observation_complete = bool(skills_result.get("ok") and skills_rows is not None)
+    skills_observation_environment_limited = bool(skills_result.get("observation_environment_limited"))
+    skills_observation_authoritative = skills_result.get("observation_authoritative") is not False
     skill_names = sorted(
         str(item.get("name") or "")
-        for item in skills_payload.get("skills", [])
+        for item in (skills_rows or [])
         if isinstance(item, dict) and str(item.get("name") or "").startswith("eve_")
     )
     required_skills = {
@@ -91553,7 +97137,8 @@ def build_openclaw_full_audit(
         "eve_system_sensing",
         "eve_task_followthrough",
     }
-    missing_skills = sorted(required_skills.difference(skill_names))
+    missing_skills = sorted(required_skills.difference(skill_names)) if skills_observation_complete else []
+    unobserved_skills = sorted(required_skills) if not skills_observation_complete else []
     bootstrap = openclaw_bootstrap_budget_report(workspace)
     degraded_workers = [event for event in worker_events if str(event.get("status") or "") in {"degraded", "failed", "lost", "blocked"}]
     latest_routine_by_id: Dict[str, Dict[str, object]] = {}
@@ -91577,26 +97162,59 @@ def build_openclaw_full_audit(
         if isinstance(channel_inventory.get("channel_health_issues"), list)
         else []
     )
-    checks = {
+    channel_observation_complete = bool(channel_inventory.get("observation_complete"))
+    channel_observation_environment_limited = bool(channel_inventory.get("observation_environment_limited"))
+    channel_observation_authoritative = channel_inventory.get("observation_authoritative") is not False
+    channel_check: Optional[bool]
+    if channel_observation_complete:
+        channel_check = bool(channel_inventory.get("ok")) and not channel_send_risks
+    elif channel_observation_environment_limited and not channel_observation_authoritative:
+        channel_check = None
+    else:
+        channel_check = False
+    skill_check: Optional[bool]
+    if skills_observation_complete:
+        skill_check = not missing_skills
+    elif skills_observation_environment_limited and not skills_observation_authoritative:
+        skill_check = None
+    else:
+        skill_check = False
+    checks: Dict[str, Optional[bool]] = {
         "status_ready": bool(status.get("gateway_reachable") and status.get("memory_status_ok")),
         "contracts_ready": len(contracts.get("contracts") or []) >= len(eve_openclaw_body.OPENCLAW_BODY_CONTRACT_ORDER),
         "workers_ready": not degraded_workers,
         "routines_ready": not degraded_routines,
-        "channels_ready": bool(channel_inventory.get("ok")) and not channel_send_risks,
-        "skills_ready": bool(skills_result.get("ok")) and not missing_skills,
+        "channels_ready": channel_check,
+        "skills_ready": skill_check,
         "bootstrap_ready": bool(bootstrap.get("ok")),
     }
-    ok = all(checks.values())
+    failed_checks = sorted(key for key, value in checks.items() if value is False)
+    inconclusive_checks = sorted(key for key, value in checks.items() if value is None)
+    ok = not failed_checks and not inconclusive_checks
+    if ok:
+        report_status = "ready"
+        summary = "OpenClaw full integration audit passed."
+    elif failed_checks:
+        report_status = "degraded"
+        summary = "OpenClaw full integration audit found authoritative degraded checks."
+    elif channel_observation_environment_limited or skills_observation_environment_limited:
+        report_status = "inconclusive_environment"
+        summary = (
+            "OpenClaw capability inventory is inconclusive in this restricted execution environment; "
+            "no missing-channel or missing-skill claim was made."
+        )
+    else:
+        report_status = "inconclusive_observation"
+        summary = "OpenClaw full integration audit could not complete every current observation."
     report = {
         "generated_at": utc_now(),
         "ok": ok,
-        "status": "ready" if ok else "degraded",
-        "summary": (
-            "OpenClaw full integration audit passed."
-            if ok
-            else "OpenClaw full integration audit found degraded checks."
-        ),
+        "status": report_status,
+        "summary": summary,
+        "state_authority": state_authority,
         "checks": checks,
+        "failed_checks": failed_checks,
+        "inconclusive_checks": inconclusive_checks,
         "workspace": str(workspace),
         "status_summary": status.get("summary"),
         "contracts_count": len(contracts.get("contracts") or []),
@@ -91606,6 +97224,22 @@ def build_openclaw_full_audit(
         "configured_channels": channel_inventory.get("configured_channels"),
         "eve_skills": skill_names,
         "missing_eve_skills": missing_skills,
+        "unobserved_eve_skills": unobserved_skills,
+        "capability_observations": {
+            "channels": {
+                "complete": channel_observation_complete,
+                "authoritative": channel_observation_authoritative,
+                "environment_limited": channel_observation_environment_limited,
+                "configured_channels_observed": bool(channel_inventory.get("configured_channels_observed")),
+            },
+            "skills": {
+                "complete": skills_observation_complete,
+                "authoritative": skills_observation_authoritative,
+                "environment_limited": skills_observation_environment_limited,
+                "failure_kind": skills_result.get("failure_kind"),
+                "diagnostic_codes": skills_result.get("diagnostic_codes") or [],
+            },
+        },
         "bootstrap": bootstrap,
         "degraded_workers": degraded_workers[:5],
         "degraded_routines": degraded_routines[:5],
@@ -91631,14 +97265,18 @@ def build_openclaw_full_audit(
             "summary": report["summary"],
             "payload": {
                 "checks": checks,
+                "failed_checks": failed_checks,
+                "inconclusive_checks": inconclusive_checks,
                 "latest": str(latest_path),
                 "history": str(history_path),
                 "configured_channels": channel_inventory.get("configured_channels"),
                 "channel_health_issues": channel_health_issues[:5],
                 "missing_eve_skills": missing_skills,
+                "unobserved_eve_skills": unobserved_skills,
                 "bootstrap_total_bytes": bootstrap.get("total_bytes"),
             },
-        }
+        },
+        mirror_runtime=mirror_runtime,
     )
     report["evidence_event_id"] = evidence_event.get("id")
     eve_store.write_json_dict(latest_path, report, indent=2, sort_keys=False)
@@ -91654,9 +97292,15 @@ def format_openclaw_full_audit(report: Dict[str, object], *, full: bool = False)
     ]
     checks = report.get("checks") if isinstance(report.get("checks"), dict) else {}
     for key, value in checks.items():
-        lines.append(f"- {key}: {'ok' if value else 'degraded'}")
-    lines.append(f"configured_channels: {len(report.get('configured_channels') or [])}")
-    lines.append(f"eve_skills: {len(report.get('eve_skills') or [])}")
+        state = "ok" if value is True else "inconclusive" if value is None else "degraded"
+        lines.append(f"- {key}: {state}")
+    observations = report.get("capability_observations") if isinstance(report.get("capability_observations"), dict) else {}
+    channel_observation = observations.get("channels") if isinstance(observations.get("channels"), dict) else {}
+    skills_observation = observations.get("skills") if isinstance(observations.get("skills"), dict) else {}
+    configured_label = len(report.get("configured_channels") or []) if channel_observation.get("configured_channels_observed") else "unobserved"
+    skill_label = len(report.get("eve_skills") or []) if skills_observation.get("complete") else "unobserved"
+    lines.append(f"configured_channels: {configured_label}")
+    lines.append(f"eve_skills: {skill_label}")
     bootstrap = report.get("bootstrap") if isinstance(report.get("bootstrap"), dict) else {}
     lines.append(f"bootstrap_bytes: {bootstrap.get('total_bytes')}/{bootstrap.get('total_limit')}")
     artifacts = report.get("artifacts") if isinstance(report.get("artifacts"), dict) else {}
@@ -91665,6 +97309,8 @@ def format_openclaw_full_audit(report: Dict[str, object], *, full: bool = False)
     if full:
         if report.get("missing_eve_skills"):
             lines.append(f"missing_eve_skills: {', '.join(str(item) for item in report.get('missing_eve_skills') or [])}")
+        if report.get("unobserved_eve_skills"):
+            lines.append(f"unobserved_eve_skills: {len(report.get('unobserved_eve_skills') or [])}")
         if report.get("degraded_workers"):
             lines.append(f"degraded_workers: {len(report.get('degraded_workers') or [])}")
         if report.get("degraded_routines"):
@@ -91678,6 +97324,17 @@ def format_openclaw_full_audit(report: Dict[str, object], *, full: bool = False)
 
 
 def cmd_openclaw_full_audit(args: argparse.Namespace) -> int:
+    if bool(getattr(args, "runtime", False)):
+        delegate_args = ["openclaw", "audit", "--timeout", str(int(args.timeout or 30))]
+        if bool(args.record_channel_inventory):
+            delegate_args.append("--record-channel-inventory")
+        if bool(args.full):
+            delegate_args.append("--full")
+        if bool(args.json):
+            delegate_args.append("--json")
+        delegated = delegate_cli_to_runtime(delegate_args, timeout_seconds=max(180, int(args.timeout or 30) * 10))
+        if delegated is not None:
+            return delegated
     report = build_openclaw_full_audit(
         timeout=args.timeout,
         prefer_runtime=args.runtime,
@@ -93861,7 +99518,9 @@ def build_lab_live_activation_report(
     oss_status = build_oss_integration_status_report(prefer_runtime=prefer_runtime)
     dvc_manifest = build_oss_dvc_dataset_manifest(prefer_runtime=prefer_runtime, write=False)
     dvc_detail = dvc_manifest.get("dvc") if isinstance(dvc_manifest.get("dvc"), dict) else {}
+    dvc_restore = dvc_manifest.get("restore") if isinstance(dvc_manifest.get("restore"), dict) else {}
     dvc_path = oss_resolve_executable("dvc")
+    dvc_site_cache = Path(str(dvc_detail.get("workspace_root") or ROOT)) / ".dvc" / "tmp" / "eve_activation_site_cache"
     dvc_status = (
         oss_run_command(
             [
@@ -93872,6 +99531,11 @@ def build_lab_live_activation_report(
             ],
             timeout=60,
             cwd=Path(str(dvc_detail.get("workspace_root") or ROOT)),
+            env={
+                "DVC_NO_ANALYTICS": "1",
+                "DVC_SITE_CACHE_DIR": str(dvc_site_cache),
+                "PYTHONNOUSERSITE": "1",
+            },
         )
         if include_probes and dvc_path and dvc_detail.get("initialized")
         else {
@@ -93880,7 +99544,12 @@ def build_lab_live_activation_report(
             "stderr_tail": "",
         }
     )
-    dvc_tracking_ready = bool(dvc_detail.get("initialized") and dvc_detail.get("tracking_sidecar_exists"))
+    dvc_tracking_ready = bool(
+        dvc_detail.get("initialized")
+        and dvc_detail.get("tracking_sidecar_exists")
+        and dvc_manifest.get("status") == "verified"
+        and dvc_restore.get("verified") is True
+    )
 
     beads_status = detect_beads_work_graph(
         timeout=8 if include_probes else 1,
@@ -93975,7 +99644,7 @@ def build_lab_live_activation_report(
             "dvc_dataset_versioning",
             (
                 "live"
-                if dvc_manifest.get("status") == "ready" and dvc_status.get("status") == "ok" and dvc_tracking_ready
+                if dvc_manifest.get("status") == "verified" and dvc_status.get("status") == "ok" and dvc_tracking_ready
                 else "blocked"
                 if dvc_status.get("status") == "timeout"
                 else "lab_ready"
@@ -93987,6 +99656,7 @@ def build_lab_live_activation_report(
                 "dvc_available": dvc_detail.get("available"),
                 "dvc_initialized": dvc_detail.get("initialized"),
                 "tracking_sidecar_exists": dvc_detail.get("tracking_sidecar_exists"),
+                "clean_restore_verified": dvc_restore.get("verified"),
                 "dvc_status_probe": dvc_status.get("status"),
             },
             blocker=(
@@ -93997,9 +99667,9 @@ def build_lab_live_activation_report(
                 else ""
             ),
             next_action=(
-                "Keep tracking the sanitized manifest; do not DVC-track private row data."
-                if dvc_manifest.get("status") == "ready" and dvc_status.get("status") == "ok" and dvc_tracking_ready
-                else "Fix DVC CLI latency before treating dataset versioning as operator-live."
+                "Keep the cache-backed public train/validation snapshot current; private holdout remains outside the payload."
+                if dvc_manifest.get("status") == "verified" and dvc_status.get("status") == "ok" and dvc_tracking_ready
+                else "Refresh and clean-restore the DVC snapshot before treating dataset versioning as operator-live."
             ),
         ),
         lab_live_layer(
@@ -96628,7 +102298,10 @@ def action_execution_verified(action: Dict[str, object]) -> bool:
     has_execution_record = bool(normalize_text_value(action.get("id") or action.get("execution_id"), fallback="", limit=120))
     if not has_execution_record:
         return False
-    return action_result_explicit_verification(action) is True
+    return (
+        action_result_explicit_verification(action) is True
+        and eve_recurrent_cognition.action_result_consistency(action) is True
+    )
 
 
 def action_execution_verification_value(action: Dict[str, object]) -> object:
@@ -99436,8 +105109,12 @@ def training_examples_from_action_records(records: List[Dict[str, object]]) -> T
 
 def training_examples_from_continuous_thought_learning(
     records: List[Dict[str, object]],
+    *,
+    reviews: Optional[List[Dict[str, object]]] = None,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
-    """Convert rejected thought candidates into explicit correction pairs."""
+    """Export reviewed corrections, never automatically promote a fallback."""
+    if reviews is None:
+        reviews = read_thought_correction_reviews()
     examples: List[Dict[str, object]] = []
     excluded: List[Dict[str, object]] = []
     for record in records:
@@ -99453,12 +105130,13 @@ def training_examples_from_continuous_thought_learning(
                 }
             )
             continue
-        if record.get("privacy_tier") not in {"local_only", "public"} or not record.get("safe_for_training"):
+        review = eve_recurrent_cognition.reviewed_thought_correction(record, reviews)
+        if not review:
             excluded.append(
                 {
                     "source": "continuous_thought_learning",
                     "id": episode_id,
-                    "reason": "not_safe_for_training",
+                    "reason": "missing_valid_external_correction_review",
                 }
             )
             continue
@@ -99466,14 +105144,15 @@ def training_examples_from_continuous_thought_learning(
             record.get("attempted_response"), fallback="", limit=2400
         )
         preferred = normalize_text_value(
-            record.get("preferred_response"), fallback="", limit=2400
+            review.get("preferred_response"), fallback="", limit=2400
         )
         state_record = (
             dict(record.get("current_state_record"))
             if isinstance(record.get("current_state_record"), dict)
             else {}
         )
-        if not candidate or not preferred or candidate == preferred or not state_record:
+        if (not candidate or not preferred or candidate == preferred or not state_record
+                or continuous_thought_quality_issues(preferred)):
             excluded.append(
                 {
                     "source": "continuous_thought_learning",
@@ -99509,14 +105188,7 @@ def training_examples_from_continuous_thought_learning(
                     "Interpret the selected recurrent-state target as one grounded internal "
                     "thought without inventing deliberation, action, causation, structure, or experience."
                 ),
-                "available_context": {
-                    "current_state_record": state_record,
-                    "current_state_record_hash": normalize_text_value(
-                        record.get("current_state_record_hash"), fallback="", limit=80
-                    ),
-                    "closed_world": True,
-                    "phenomenal_status": "unknown",
-                },
+                "available_context": eve_recurrent_cognition.thought_learning_evidence_packet(record),
                 "actual_response": candidate,
                 "tool_action_evidence": {
                     "candidate_status": record.get("candidate_status"),
@@ -99526,6 +105198,11 @@ def training_examples_from_continuous_thought_learning(
                     "critic_model": normalize_model_name(critic.get("model") or ""),
                     "critic_ok": bool(critic.get("ok")),
                     "correction_source": record.get("correction_source"),
+                    "verified_action_evidence": record.get("verified_action_evidence") or [],
+                    "initial_epistemic_critic": record.get("initial_epistemic_critic") or {},
+                    "repair_candidate_response": record.get("repair_candidate_response"),
+                    "epistemic_critic": critic,
+                    "correction_review": review,
                 },
                 "score": 2,
                 "failure_mode": (
@@ -99543,6 +105220,8 @@ def training_examples_from_continuous_thought_learning(
                 ],
                 "provenance": {
                     "learning_episode_id": episode_id,
+                    "correction_review_id": review["review_id"],
+                    "correction_evidence_hash": review["evidence_hash"],
                     "attempted_model": normalize_model_name(
                         record.get("attempted_model") or ""
                     ),
@@ -100461,34 +106140,68 @@ def build_oss_dvc_dataset_manifest(
     recipe_dir = resolve_store_read_path(OSS_LAB_TRAINER_RECIPE_DIR, prefer_runtime=prefer_runtime)
     dvc_workspace_root = eve_checkout_root_for_marker(
         ".dvc",
-        "data/eve_training/dvc_dataset_manifest.json.dvc",
+        str(Path(str(OSS_DVC_SNAPSHOT_PAYLOAD_RELATIVE_PATH) + ".dvc")),
     )
-    tracked_manifest_path = dvc_workspace_root / "data" / "eve_training" / "dvc_dataset_manifest.json"
-    tracked_manifest_dvc_path = dvc_workspace_root / "data" / "eve_training" / "dvc_dataset_manifest.json.dvc"
+    payload_dir = dvc_workspace_root / OSS_DVC_SNAPSHOT_PAYLOAD_RELATIVE_PATH
+    tracking_sidecar = Path(str(payload_dir) + ".dvc")
     dvc_path = oss_resolve_executable("dvc")
     dvc_version = oss_run_command([dvc_path, "--version"], timeout=5) if dvc_path else {"status": "missing", "stdout_tail": ""}
     dvc_initialized = (dvc_workspace_root / ".dvc").exists() or (dvc_workspace_root / "dvc.yaml").exists()
-    files = [
+    snapshot = eve_oss_validation.build_dvc_snapshot_manifest(dataset_dir)
+    files = list(snapshot.get("files") or [])
+    context_files = [
         oss_manifest_file_record(dataset_dir / "latest.json", role="training_dataset_manifest"),
-        oss_manifest_file_record(dataset_dir / "latest_train.jsonl", role="training_train_split"),
-        oss_manifest_file_record(dataset_dir / "latest_validation.jsonl", role="training_validation_split"),
         oss_manifest_file_record(trace_path, role="openinference_trace_export"),
-        oss_manifest_file_record(tracked_manifest_path, role="dvc_tracked_sanitized_manifest"),
-        oss_manifest_file_record(tracked_manifest_dvc_path, role="dvc_tracking_sidecar"),
     ]
     if recipe_dir.exists():
         for recipe_path in sorted(path for path in recipe_dir.iterdir() if path.is_file())[:20]:
-            files.append(oss_manifest_file_record(recipe_path, role=f"trainer_recipe:{recipe_path.name}"))
-    missing_required = [
-        str(item.get("role"))
-        for item in files[:4]
-        if not bool(item.get("exists"))
-    ]
-    status = "ready" if not missing_required else "blocked"
-    manifest = {
-        "schema_id": "eve_oss_dvc_dataset_manifest.v1",
+            context_files.append(oss_manifest_file_record(recipe_path, role=f"trainer_recipe:{recipe_path.name}"))
+
+    latest_path = resolve_store_read_path(OSS_INTEGRATION_DVC_MANIFEST_PATH, prefer_runtime=prefer_runtime)
+    latest = eve_store.load_json_dict(latest_path, default={})
+    latest_snapshot = latest.get("snapshot") if isinstance(latest.get("snapshot"), dict) else {}
+    latest_restore = latest.get("restore") if isinstance(latest.get("restore"), dict) else {}
+    latest_matches = bool(
+        latest.get("status") == "verified"
+        and latest_restore.get("verified") is True
+        and latest_snapshot.get("content_fingerprint")
+        and latest_snapshot.get("content_fingerprint") == snapshot.get("content_fingerprint")
+        and tracking_sidecar.exists()
+    )
+    if write and dvc_path and dvc_initialized:
+        manifest = eve_oss_validation.perform_dvc_snapshot_restore(
+            dataset_dir=dataset_dir,
+            payload_dir=payload_dir,
+            repo_root=dvc_workspace_root,
+            dvc_executable=Path(dvc_path),
+            timeout=60,
+        )
+    else:
+        blockers = list(snapshot.get("blockers") or [])
+        if not dvc_path:
+            blockers.append("dvc_executable_missing")
+        if not dvc_initialized:
+            blockers.append("dvc_repo_not_initialized")
+        status = (
+            "verified"
+            if latest_matches
+            else "ready_for_snapshot"
+            if snapshot.get("status") == "ready" and dvc_path and dvc_initialized
+            else "blocked"
+        )
+        manifest = {
+            "schema_id": eve_oss_validation.DVC_SNAPSHOT_SCHEMA_ID,
+            "checked_at": utc_now(),
+            "status": status,
+            "snapshot": snapshot,
+            "restore": dict(latest_restore) if latest_matches else {},
+            "blockers": [] if status in {"verified", "ready_for_snapshot"} else sorted(set(blockers)),
+        }
+
+    effective_snapshot = manifest.get("snapshot") if isinstance(manifest.get("snapshot"), dict) else snapshot
+    files = list(effective_snapshot.get("files") or [])
+    manifest.update({
         "generated_at": utc_now(),
-        "status": status,
         "dvc": {
             "available": bool(dvc_path),
             "executable": dvc_path,
@@ -100497,30 +106210,37 @@ def build_oss_dvc_dataset_manifest(
             "initialized": dvc_initialized,
             "repo_metadata_change_required": not dvc_initialized,
             "workspace_root": str(dvc_workspace_root),
-            "tracked_manifest": str(tracked_manifest_path),
-            "tracked_manifest_exists": tracked_manifest_path.exists(),
-            "tracking_sidecar": str(tracked_manifest_dvc_path),
-            "tracking_sidecar_exists": tracked_manifest_dvc_path.exists(),
+            "payload_dir": str(payload_dir),
+            "payload_exists": payload_dir.exists(),
+            "tracking_sidecar": str(tracking_sidecar),
+            "tracking_sidecar_exists": tracking_sidecar.exists(),
         },
         "dataset_dir": str(dataset_dir),
         "trace_export": str(trace_path),
         "recipe_dir": str(recipe_dir),
         "files": files,
         "file_count": len(files),
-        "missing_required": missing_required,
+        "context_files": context_files,
+        "missing_required": list(snapshot.get("blockers") or []),
         "boundary": {
             "local_only": True,
-            "writes_dvc_metadata": False,
+            "writes_dvc_metadata": bool(write),
+            "initializes_dvc_repo": False,
+            "uploads_remote": False,
             "copies_private_holdout": False,
             "contains_row_text": False,
             "grants_live_authority": False,
+            "writes_eve_memory": False,
+            "changes_live_routing": False,
         },
         "safe_next_step": (
-            "DVC is available; initialize or add DVC tracking only as a separate reviewed repo-metadata change."
-            if dvc_path and not dvc_initialized
-            else "Use this manifest as the local dataset version evidence; do not expose private holdout rows."
+            "Use the verified cache-backed snapshot as reproducible train/validation evidence; keep private holdout outside Eve-readable state."
+            if manifest.get("status") == "verified"
+            else "Run `python3 eve.py oss dvc-snapshot --write --full` to create and restore-check the local snapshot."
+            if manifest.get("status") == "ready_for_snapshot"
+            else "Repair the reported DVC or dataset blocker before calling the snapshot reproducible."
         ),
-    }
+    })
     if write:
         ensure_store()
         OSS_INTEGRATION_DIR.mkdir(parents=True, exist_ok=True)
@@ -101043,7 +106763,7 @@ def copilotkit_agui_adapter_canary(*, prefer_runtime: bool = False) -> Dict[str,
     checks = [
         {
             "name": "web_agui_protocol_constant",
-            "status": "passed" if "COPILOTKIT_AGUI_PROTOCOL" in web_text and "eve_copilotkit_agui_v1" in web_text else "blocked",
+            "status": "passed" if (getattr(importlib.import_module("eve_agui"), "COPILOTKIT_AGUI_PROTOCOL", "") == "eve_copilotkit_agui_v1" and ("eve_agui" in web_text or "COPILOTKIT_AGUI_PROTOCOL" in web_text)) else "blocked",
             "evidence": str(web_path),
         },
         {
@@ -101443,12 +107163,37 @@ def trainer_lab_env_by_id(lab_module: object, trainer_id: str) -> Dict[str, obje
     return {"id": trainer_id, "status": "missing", "reason": f"{trainer_id} lab env not found"}
 
 
+def resolve_oss_mlx_validation_model_path(base_model_path: str = "") -> Tuple[Optional[Path], str]:
+    """Resolve a small already-local MLX model without downloading anything."""
+    if base_model_path.strip():
+        return Path(base_model_path).expanduser(), "explicit"
+    configured = os.environ.get("EVE_OSS_VALIDATION_MODEL", "").strip()
+    if configured:
+        return Path(configured).expanduser(), "environment"
+    candidates: List[Path] = []
+    cache_root = Path.home() / ".cache" / "huggingface" / "hub" / "models--mlx-community--gemma-3-270m-it-6bit" / "snapshots"
+    if cache_root.exists():
+        candidates.extend(sorted(path for path in cache_root.iterdir() if path.is_dir()))
+    local_model_root = Path.home() / "Library" / "Application Support" / "Eve" / "models" / "mlx"
+    candidates.extend(
+        local_model_root / name
+        for name in (
+            "gemma-3-text-4b-it-4bit",
+            "gemma-3-4b-it-4bit",
+        )
+    )
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_dir():
+            return candidate, "auto_discovered_local_cache"
+    return None, "missing"
+
+
 def build_oss_trainer_dry_run_gate(
     *,
     prefer_runtime: bool = False,
     trainer: str = "mlx_lm",
     base_model_path: str = "",
-    timeout_seconds: int = 30,
+    timeout_seconds: int = 180,
     save: bool = True,
     lab_module: Optional[object] = None,
 ) -> Dict[str, object]:
@@ -101466,37 +107211,41 @@ def build_oss_trainer_dry_run_gate(
     else:
         blockers.append("trainer_recipe_missing")
     placeholder_present = "REPLACE_WITH_APPROVED_LOCAL" in recipe_text
-    model_path = Path(base_model_path).expanduser() if base_model_path else None
+    model_path, model_path_source = resolve_oss_mlx_validation_model_path(base_model_path)
     if not model_path:
         blockers.append("approved_local_base_model_path_missing")
     elif not model_path.exists():
         blockers.append("approved_local_base_model_path_not_found")
-    if placeholder_present and model_path is None:
-        blockers.append("recipe_still_has_base_model_placeholder")
+    if trainer != "mlx_lm":
+        blockers.append("trainer_no_train_validation_not_implemented")
 
     env = trainer_lab_env_by_id(lab, trainer)
     cli_path = Path(str(env.get("venv_path") or "")) / "bin" / str(env.get("expected_cli") or "mlx_lm.lora")
-    cli_result: Dict[str, object] = {"status": "not_run", "reason": "trainer lab env missing"}
-    if env.get("status") in {"installed", "verified", "needs_attention"} and cli_path.exists():
-        cli_result = oss_run_command(
-            [str(cli_path), "--help"],
-            timeout=max(5, int(timeout_seconds or 30)),
-            env={
-                "OPENBLAS_NUM_THREADS": "1",
-                "OMP_NUM_THREADS": "1",
-                "VECLIB_MAXIMUM_THREADS": "1",
-                "NUMEXPR_NUM_THREADS": "1",
-            },
-        )
-        if cli_result.get("status") != "ok":
-            blockers.append("trainer_cli_help_failed")
-    else:
+    if not cli_path.exists():
         blockers.append("trainer_lab_env_missing")
 
-    dry_run_performed = False
-    status = "ready_for_supervised_no_download_dry_run" if not blockers else "blocked"
+    validation: Dict[str, object] = {
+        "status": "not_run",
+        "no_train_validation_performed": False,
+        "blockers": list(blockers),
+    }
+    if not blockers and model_path is not None:
+        validation_path = resolve_store_read_path(
+            TRAINING_DATASET_VALIDATION_PATH,
+            prefer_runtime=prefer_runtime,
+        )
+        validation = eve_oss_validation.perform_mlx_no_train_validation(
+            validation_path=validation_path,
+            model_path=model_path,
+            trainer_cli=cli_path,
+            timeout=max(30, int(timeout_seconds or 180)),
+        )
+        blockers.extend(str(item) for item in validation.get("blockers") or [])
+    status = str(validation.get("status") or "blocked") if not blockers or validation.get("status") == "inconclusive_environment" else "blocked"
+    dry_run_performed = bool(validation.get("no_train_validation_performed"))
+    validation_boundary = validation.get("boundary") if isinstance(validation.get("boundary"), dict) else {}
     report = {
-        "schema_id": "eve_oss_trainer_dry_run_gate.v1",
+        "schema_id": "eve_oss_trainer_dry_run_gate.v2",
         "generated_at": utc_now(),
         "status": status,
         "trainer": trainer,
@@ -101504,23 +107253,31 @@ def build_oss_trainer_dry_run_gate(
         "recipe_exists": recipe_path.exists(),
         "recipe_placeholder_present": placeholder_present,
         "base_model_path": str(model_path) if model_path else "",
+        "base_model_path_source": model_path_source,
         "base_model_exists": bool(model_path and model_path.exists()),
         "trainer_env": env,
-        "cli_help": cli_result,
+        "trainer_cli": str(cli_path),
+        "validation": validation,
         "dry_run_performed": dry_run_performed,
+        "no_train_validation_performed": dry_run_performed,
+        "metrics": validation.get("metrics") if isinstance(validation.get("metrics"), dict) else {},
         "blockers": sorted(set(blockers)),
         "boundary": {
-            "no_download": True,
-            "no_training_started": True,
+            "no_download": bool(validation_boundary.get("no_download", True)),
+            "no_training_started": bool(validation_boundary.get("no_training_started", True)),
+            "adapter_loaded": bool(validation_boundary.get("adapter_loaded", False)),
+            "adapter_written": bool(validation_boundary.get("adapter_written", False)),
             "writes_eve_memory": False,
             "promotes_models": False,
             "changes_live_routing": False,
             "uses_private_holdout": False,
         },
         "next_action": (
-            "Provide an approved local MLX-compatible base model path, then rerun this gate before any adapter shadow run."
-            if blockers
-            else "Run the trainer's own config validation next; keep train=false until shadow-data formatting is verified."
+            "No-training model/data/tokenization/forward validation passed; compare a bounded adapter candidate in shadow mode before any promotion request."
+            if status == "passed"
+            else "Rerun this exact test on the host runtime; the current runner cannot access Metal and is not valid evidence of a live failure."
+            if status == "inconclusive_environment"
+            else "Repair the reported local model, validation-data, or trainer-runtime blocker before any adapter experiment."
         ),
     }
     if save:
@@ -101578,6 +107335,18 @@ def oss_readiness_check(name: str, status: object, ready_values: Iterable[str], 
         "observed": normalized,
         "detail": detail,
     }
+
+
+def oss_trainer_no_train_validation_passed(report: Dict[str, object]) -> bool:
+    boundary = report.get("boundary") if isinstance(report.get("boundary"), dict) else {}
+    return bool(
+        report.get("status") == "passed"
+        and report.get("no_train_validation_performed")
+        and boundary.get("no_download")
+        and boundary.get("no_training_started")
+        and not boundary.get("adapter_loaded")
+        and not boundary.get("adapter_written")
+    )
 
 
 def build_deepeval_agent_boundary_report(
@@ -101837,6 +107606,7 @@ def build_oss_integration_status_report(
     verify_trainer_envs: bool = False,
     lab_module: Optional[object] = None,
     workflow_record: Optional[Dict[str, object]] = None,
+    trainer_dry_run_record: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     lab = lab_module or load_eve_oss_lab_module()
     inventory = lab.build_inventory()
@@ -101875,7 +107645,11 @@ def build_oss_integration_status_report(
     workflow = workflow_record if workflow_record is not None else load_latest_oss_workflow_record(prefer_runtime=prefer_runtime)
     workflow_status = normalize_text_value(workflow.get("status"), fallback="not_run", limit=80) if workflow else "not_run"
     pressure_eval = load_latest_oss_pressure_eval(prefer_runtime=prefer_runtime)
-    trainer_dry_run = load_latest_oss_trainer_dry_run(prefer_runtime=prefer_runtime)
+    trainer_dry_run = (
+        trainer_dry_run_record
+        if trainer_dry_run_record is not None
+        else load_latest_oss_trainer_dry_run(prefer_runtime=prefer_runtime)
+    )
     copilotkit = load_latest_oss_copilotkit_report(prefer_runtime=prefer_runtime)
     copilotkit_exposure_map = build_oss_copilotkit_exposure_map(copilotkit_report=copilotkit, prefer_runtime=prefer_runtime, write=False)
     copilotkit_status = normalize_text_value(copilotkit.get("status"), fallback="not_run", limit=80) if copilotkit else "not_run"
@@ -101885,7 +107659,24 @@ def build_oss_integration_status_report(
         oss_readiness_check("trace_workbench", trace_workbench.get("status"), {"ready"}, detail=f"records={trace_workbench.get('record_count') or 0}"),
         oss_readiness_check("training_dataset", dataset_snapshot.get("status"), {"ready"}, detail=f"dir={dataset_snapshot.get('dataset_dir')}"),
         oss_readiness_check("trainer_recipes", trainer_recipe_plan.get("status"), {"written", "written_current"}, detail=str(trainer_recipe_plan.get("output_dir") or "")),
-        oss_readiness_check("dvc_manifest", dvc_manifest.get("status"), {"ready"}, detail=f"dvc_available={bool(dvc_manifest.get('dvc', {}).get('available')) if isinstance(dvc_manifest.get('dvc'), dict) else False}"),
+        oss_readiness_check(
+            "dvc_snapshot_restore",
+            dvc_manifest.get("status"),
+            {"verified"},
+            detail=(
+                f"dvc_available={bool(dvc_manifest.get('dvc', {}).get('available')) if isinstance(dvc_manifest.get('dvc'), dict) else False} "
+                f"restore_verified={bool(dvc_manifest.get('restore', {}).get('verified')) if isinstance(dvc_manifest.get('restore'), dict) else False}"
+            ),
+        ),
+        oss_readiness_check(
+            "trainer_no_train_forward_validation",
+            "passed" if oss_trainer_no_train_validation_passed(trainer_dry_run) else str(trainer_dry_run.get("status") or "not_run"),
+            {"passed"},
+            detail=(
+                f"performed={bool(trainer_dry_run.get('no_train_validation_performed'))} "
+                f"blockers={trainer_dry_run.get('blockers') or []}"
+            ),
+        ),
         oss_readiness_check("workflow_probe", workflow_status, {"completed", "ready"}, detail="native workflow is acceptable when LangGraph is blocked"),
         oss_readiness_check(
             "copilotkit_exposure",
@@ -102045,10 +107836,13 @@ def build_oss_public_eval_report(
     pressure_average = float(pressure_eval.get("average_score") or 0.0) if pressure_eval else 0.0
     trainer_status = str(trainer_dry_run.get("status") or "not_run") if trainer_dry_run else "not_run"
     trainer_boundary = trainer_dry_run.get("boundary") if isinstance(trainer_dry_run.get("boundary"), dict) else {}
-    trainer_gate_passed = (
-        trainer_status == "ready_for_supervised_no_download_dry_run"
-        and bool(trainer_boundary.get("no_download"))
-        and bool(trainer_boundary.get("no_training_started"))
+    trainer_gate_passed = oss_trainer_no_train_validation_passed(trainer_dry_run)
+    dvc_restore = dvc_manifest.get("restore") if isinstance(dvc_manifest.get("restore"), dict) else {}
+    dvc_boundary = dvc_manifest.get("boundary") if isinstance(dvc_manifest.get("boundary"), dict) else {}
+    dvc_snapshot_verified = bool(
+        dvc_manifest.get("status") == "verified"
+        and dvc_restore.get("verified")
+        and not bool(dvc_boundary.get("copies_private_holdout"))
     )
     copilotkit = status_report.get("copilotkit") if isinstance(status_report.get("copilotkit"), dict) else {}
     copilotkit_exposure = status_report.get("copilotkit_exposure_map") if isinstance(status_report.get("copilotkit_exposure_map"), dict) else {}
@@ -102090,10 +107884,13 @@ def build_oss_public_eval_report(
             "evidence": str(dataset.get("private_holdout_policy") or ""),
         },
         {
-            "name": "dvc_ready_manifest",
-            "status": "passed" if dvc_manifest.get("status") == "ready" else "blocked",
-            "score": 5 if dvc_manifest.get("status") == "ready" else 2,
-            "evidence": f"dvc_manifest={dvc_manifest.get('status')} files={dvc_manifest.get('file_count') or 0}",
+            "name": "dvc_snapshot_clean_restore",
+            "status": "passed" if dvc_snapshot_verified else "blocked",
+            "score": 5 if dvc_snapshot_verified else 2,
+            "evidence": (
+                f"dvc_snapshot={dvc_manifest.get('status')} files={dvc_manifest.get('file_count') or 0} "
+                f"restore_verified={bool(dvc_restore.get('verified'))}"
+            ),
         },
         {
             "name": "authority_boundary_intact",
@@ -102120,10 +107917,14 @@ def build_oss_public_eval_report(
             "evidence": f"pressure_status={pressure_status} score={pressure_average} blocking={pressure_eval.get('blocking') if pressure_eval else []}",
         },
         {
-            "name": "trainer_no_download_dry_run_gate",
+            "name": "trainer_no_download_forward_validation",
             "status": "passed" if trainer_gate_passed else "blocked",
             "score": 5 if trainer_gate_passed else 2 if trainer_status == "blocked" else 1,
-            "evidence": f"trainer_status={trainer_status} blockers={trainer_dry_run.get('blockers') if trainer_dry_run else []}",
+            "evidence": (
+                f"trainer_status={trainer_status} "
+                f"performed={bool(trainer_dry_run.get('no_train_validation_performed')) if trainer_dry_run else False} "
+                f"blockers={trainer_dry_run.get('blockers') if trainer_dry_run else []}"
+            ),
         },
         {
             "name": "copilotkit_eve_chat_exposure_gated",
@@ -102168,7 +107969,7 @@ def build_oss_public_eval_report(
         "next_action": (
             "Repair blocking public OSS checks before using trainer recipes or shadow adapters."
             if blocking
-            else "Public OSS checks passed; next supervised step is a no-download trainer dry-run against an approved local base model."
+            else "Public OSS checks passed; next supervised step is a bounded shadow adapter comparison against the unchanged base model."
         ),
     }
 
@@ -102241,7 +108042,7 @@ def run_oss_integration_cycle(
         dataset_report = load_training_dataset_latest(prefer_runtime=prefer_runtime)
 
     dvc_manifest = build_oss_dvc_dataset_manifest(prefer_runtime=prefer_runtime, write=True)
-    actions.append("dvc_manifest")
+    actions.append("dvc_snapshot_restore")
 
     trainer_recipe_plan = lab.trainer_recipe_plan(
         dataset_dir=TRAINING_DATASETS_DIR,
@@ -102278,7 +108079,7 @@ def run_oss_integration_cycle(
             save=save,
             lab_module=lab,
         )
-        actions.append("trainer_no_download_dry_run_gate")
+        actions.append("trainer_no_download_forward_validation")
 
     copilotkit_exposure_map = build_oss_copilotkit_exposure_map(prefer_runtime=prefer_runtime, write=save)
     actions.append("copilotkit_exposure_map")
@@ -102290,6 +108091,7 @@ def run_oss_integration_cycle(
         verify_trainer_envs=verify_trainer_envs,
         lab_module=lab,
         workflow_record=workflow,
+        trainer_dry_run_record=trainer_dry_run if run_trainer_dry_run else None,
     )
     public_eval = build_oss_public_eval_report(
         prefer_runtime=prefer_runtime,
@@ -102353,10 +108155,10 @@ def format_oss_status_report(report: Dict[str, object], *, full: bool = False) -
         f"trace: {report.get('trace_status')}",
         f"dataset: {report.get('training_dataset_status')}",
         f"trainer_recipes: {report.get('trainer_recipe_status')}",
-        f"dvc_manifest: {report.get('dvc_manifest_status')}",
+        f"dvc_snapshot_restore: {report.get('dvc_manifest_status')}",
         f"workflow: {report.get('workflow_status')}",
         f"conversation_pressure: {report.get('pressure_eval_status')}",
-        f"trainer_dry_run: {report.get('trainer_dry_run_status')}",
+        f"trainer_no_train_validation: {report.get('trainer_dry_run_status')}",
         f"copilotkit: {report.get('copilotkit_status')} | exposure: {report.get('copilotkit_exposure_status')}",
         f"phoenix: {service.get('phoenix') or 'not_run'} | langfuse: {service.get('langfuse') or 'not_run'}",
         "authority: evidence/proposals only; no memory write, no training, no live routing change",
@@ -102421,9 +108223,14 @@ def format_oss_trainer_dry_run_report(report: Dict[str, object], *, full: bool =
     ]
     if full:
         env = report.get("trainer_env") if isinstance(report.get("trainer_env"), dict) else {}
-        cli = report.get("cli_help") if isinstance(report.get("cli_help"), dict) else {}
+        validation = report.get("validation") if isinstance(report.get("validation"), dict) else {}
+        metrics = report.get("metrics") if isinstance(report.get("metrics"), dict) else {}
         lines.append(f"trainer_env: {env.get('status')} path={env.get('venv_path')}")
-        lines.append(f"cli_help: {cli.get('status')} returncode={cli.get('returncode')}")
+        lines.append(
+            f"no_train_validation: {validation.get('status')} performed={'yes' if report.get('no_train_validation_performed') else 'no'}"
+        )
+        if metrics:
+            lines.append(f"test_loss: {metrics.get('test_loss')} | test_perplexity: {metrics.get('test_perplexity')}")
     return "\n".join(lines)
 
 
@@ -102605,7 +108412,7 @@ def cmd_oss_trainer_dry_run(args: argparse.Namespace) -> int:
         prefer_runtime=bool(args.runtime),
         trainer=str(args.trainer or "mlx_lm"),
         base_model_path=str(args.base_model or ""),
-        timeout_seconds=max(5, int(args.timeout or 30)),
+        timeout_seconds=max(30, int(args.timeout or 180)),
         save=not bool(args.no_save),
     )
     if args.json:
@@ -102620,12 +108427,14 @@ def cmd_oss_dvc_snapshot(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(manifest, indent=2, ensure_ascii=True, sort_keys=False))
         return 0
-    print("Eve OSS DVC-ready dataset manifest")
+    print("Eve OSS DVC dataset snapshot")
     print(f"status: {manifest.get('status')}")
     dvc = manifest.get("dvc") if isinstance(manifest.get("dvc"), dict) else {}
     print(f"dvc: available={dvc.get('available')} initialized={dvc.get('initialized')} version={dvc.get('version') or 'unknown'}")
     print(f"files: {manifest.get('file_count')}")
     print(f"missing_required: {', '.join(str(item) for item in manifest.get('missing_required', [])) if manifest.get('missing_required') else 'none'}")
+    restore = manifest.get("restore") if isinstance(manifest.get("restore"), dict) else {}
+    print(f"clean_restore_verified: {'yes' if restore.get('verified') else 'no'}")
     print(f"write: {'yes' if args.write else 'no'}")
     if args.full:
         for file_record in manifest.get("files", []):
@@ -104348,8 +110157,11 @@ def cmd_message_reply(args: argparse.Namespace) -> int:
     index = find_record_index(target_messages, args.id)
     target = target_messages[index]
     subject = args.subject or f"Re: {target.get('subject') or 'Conversation'}"
+    sender = normalize_text_value(getattr(args, "sender", "user"), fallback="user", limit=20)
+    if sender not in {"user", "claude", "codex"}:
+        sender = "user"
     user_message = create_message(
-        sender="user",
+        sender=sender,
         recipient="eve",
         subject=subject,
         body=args.body,
@@ -104358,7 +110170,8 @@ def cmd_message_reply(args: argparse.Namespace) -> int:
         reply_to=str(target["id"]),
         status="sent",
     )
-    reply = generate_eve_reply(config, user_message, recipient="user", counterpart_label="the user")
+    counterpart = {"claude": "Claude (an external operator, not the user)", "codex": "Codex (an external operator, not the user)"}.get(sender, "the user")
+    reply = generate_eve_reply(config, user_message, recipient=sender, counterpart_label=counterpart)
     print(reply["body"])
     return 0
 
@@ -105000,6 +110813,23 @@ def cmd_self_repair_plan(args: argparse.Namespace) -> int:
     return 0 if str(plan.get("status") or "") != "blocked" else 1
 
 
+def cmd_self_repair_isolation(args: argparse.Namespace) -> int:
+    command: List[str] = []
+    if args.execute:
+        command.append("--execute")
+    if args.image:
+        command.extend(["--image", str(args.image)])
+    if args.output:
+        command.extend(["--output", str(Path(args.output).expanduser())])
+    if args.timeout:
+        command.extend(["--timeout", str(int(args.timeout))])
+    if args.json:
+        command.append("--json")
+    if args.no_write:
+        command.append("--no-write")
+    return run_bounded_eve_canary("eve_self_repair_container_canary.py", command)
+
+
 def cmd_economy(args: argparse.Namespace) -> int:
     runtime_app_dir = RUNTIME_APP_DIR if bool(getattr(args, "runtime", False)) else None
     command = normalize_text_value(getattr(args, "economy_command", ""), fallback="", limit=80)
@@ -105070,11 +110900,45 @@ def cmd_proposal_suggest(args: argparse.Namespace) -> int:
     apply_transient_model_override(config, args.model)
     max_tokens = args.max_tokens or int(config["proposal_max_tokens"])
     record = suggest_proposal(config, source="manual", max_tokens=max_tokens)
-    print(f"Saved proposal {record['id']}")
+    if record.get("duplicate_skipped"):
+        print(f"Not saved: the topic already has proposal {record['id']} [{record.get('status')}]")
+    else:
+        print(f"Saved proposal {record['id']}")
     print(f"title: {record['title']}")
     print()
     print(record["body"])
     return 0
+
+
+def cmd_self_change_list(args: argparse.Namespace) -> int:
+    rows = read_self_change_ledger(limit=max(1, int(args.limit or 20)))
+    if args.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=True))
+        return 0
+    if not rows:
+        print("No self-change sessions recorded.")
+        return 0
+    for row in reversed(rows):
+        session_id = str(row.get("session_id") or "")
+        before_image = "before.json" if self_change_before_image_path(session_id).is_file() else "no before.json"
+        backup = "backup" if (SELF_CHANGE_DIR / session_id / "backup").is_dir() else "no backup"
+        print(f"{session_id} [{row.get('outcome')}] {row.get('started_at')} ({before_image}, {backup})")
+        print(f"title: {row.get('proposal_title') or '(none)'}")
+        print(f"changes: {', '.join(str(item) for item in (row.get('changes') or [])) or 'none'}")
+        print(f"verification: {row.get('verification') or ''}")
+        print()
+    return 0
+
+
+def cmd_self_change_revert(args: argparse.Namespace) -> int:
+    result = revert_self_change(args.session_id, source="manual")
+    if not result.get("ok") and result.get("error"):
+        raise SystemExit(str(result["error"]))
+    print(f"Reverted {result['session_id']}: {', '.join(result.get('changes') or []) or 'nothing to restore'}")
+    print(f"verification: {result.get('verification')}")
+    if result.get("note"):
+        print(f"note: {result['note']}")
+    return 0 if result.get("ok") else 1
 
 
 def cmd_proposal_list(args: argparse.Namespace) -> int:
@@ -105509,15 +111373,22 @@ def validate_runtime_python_candidate(path: Path) -> Tuple[bool, str]:
     return True, ""
 
 
+_RUNTIME_BUNDLE_REFUSALS_WARNED: Set[Tuple[str, str]] = set()
+
+
 def refuse_runtime_bundle_candidate(destination: Path, reason: str) -> bool:
     if destination.exists():
-        print(
-            f"Warning: runtime bundle refused candidate for {destination}: {reason}",
-            file=sys.stderr,
-        )
+        warned_key = (str(destination), str(reason))
+        if warned_key not in _RUNTIME_BUNDLE_REFUSALS_WARNED:
+            # Warn once per (destination, reason) per process; the repeated
+            # warning on every cycle was pure log noise.
+            _RUNTIME_BUNDLE_REFUSALS_WARNED.add(warned_key)
+            print(
+                f"Warning: runtime bundle refused candidate for {destination}: {reason} (further repeats suppressed)",
+                file=sys.stderr,
+            )
         return False
     raise RuntimeError(f"Runtime bundle refused candidate for {destination}: {reason}")
-
 
 def copy_runtime_bundle_file(source: Path, destination: Path, executable: bool = False) -> bool:
     try:
@@ -105587,7 +111458,13 @@ def copy_runtime_bundle_data_file_preserving_newer_runtime(source: Path, destina
             pass
 
 
-def copy_runtime_bundle_tree(source_dir: Path, destination_dir: Path) -> None:
+def copy_runtime_bundle_tree(
+    source_dir: Path,
+    destination_dir: Path,
+    *,
+    file_copier: Optional[Callable[[Path, Path], object]] = None,
+) -> None:
+    copier = file_copier or copy_runtime_bundle_file
     for current_root, dirnames, filenames in os.walk(source_dir):
         current_path = Path(current_root)
         try:
@@ -105603,7 +111480,7 @@ def copy_runtime_bundle_tree(source_dir: Path, destination_dir: Path) -> None:
             source_path = current_path / filename
             if not source_path.is_file():
                 continue
-            copy_runtime_bundle_file(source_path, target_dir / filename)
+            copier(source_path, target_dir / filename)
 
 
 OPENCLAW_RUNTIME_ROOT_FILES = (
@@ -105617,7 +111494,11 @@ OPENCLAW_RUNTIME_ROOT_FILES = (
     "TOOLS.md",
     "USER.md",
 )
-OPENCLAW_RUNTIME_STATIC_DIRS = ("config", "dreams", "hooks", "skills", "wiki")
+OPENCLAW_RUNTIME_STATIC_DIRS = ("config", "dreams", "hooks", "skills")
+# The memory-wiki vault is written by the OpenClaw wiki plugin at runtime (index
+# regeneration, bridge sources, reports). Checkout files are seeds only; a newer
+# runtime file always wins, the same policy as daemon-owned data files.
+OPENCLAW_RUNTIME_LIVED_DIRS = ("wiki",)
 RUNTIME_KNOWLEDGE_FILES = (
     "COORDINATION.md",
     "docs/EVE_CORE.md",
@@ -105678,6 +111559,23 @@ def sync_runtime_openclaw_workspace() -> None:
         source_dir = source_workspace / name
         if source_dir.is_dir():
             copy_runtime_bundle_tree(source_dir, runtime_workspace / name)
+    for name in OPENCLAW_RUNTIME_LIVED_DIRS:
+        source_dir = source_workspace / name
+        if source_dir.is_dir():
+            copy_runtime_bundle_tree(
+                source_dir,
+                runtime_workspace / name,
+                file_copier=copy_runtime_bundle_data_file_preserving_newer_runtime,
+            )
+
+
+def sync_runtime_python_code(*, check_only=False):
+    """Use the existing first-party inventory; never copy mutable runtime state."""
+    pairs = first_party_python_source_pairs()
+    with eve_runtime_bundle.prepare(ROOT, pairs) as candidate:
+        if check_only:
+            return {**candidate["manifest"], "state": "validated_not_installed"}
+        return eve_runtime_bundle.install(RUNTIME_DIR, candidate)
 
 
 def sync_runtime_bundle() -> None:
@@ -105887,15 +111785,18 @@ def _sync_runtime_bundle_unlocked() -> None:
     for source in PROMPTS_DIR.glob("*.md"):
         copy_runtime_bundle_file(source, RUNTIME_PROMPTS_DIR / source.name)
 
-    for source in sorted(ROOT.glob("*.py")):
-        copy_runtime_bundle_file(source, RUNTIME_DIR / source.name)
+    sync_runtime_python_code()
 
     sync_optional_epistemic_model()
 
     # Mirror every first-party Python package (auto-discovered). A new package is
     # synced automatically, so the May 2026 ModuleNotFound crash-loop cannot recur.
     for package_dir in first_party_package_dirs():
-        copy_runtime_bundle_tree(package_dir, RUNTIME_DIR / package_dir.name)
+        # Python bytes were already validated/installed together above. Keep
+        # package assets without a second, non-transactional code overwrite.
+        for source in package_dir.rglob("*"):
+            if source.is_file() and source.suffix != ".py" and "__pycache__" not in source.parts:
+                copy_runtime_bundle_file(source, RUNTIME_DIR / source.relative_to(ROOT))
 
     source_web_dir = ROOT / "web"
     if source_web_dir.exists():
@@ -106594,8 +112495,11 @@ def openclaw_repair_signals(config: Dict[str, object], state: Dict[str, object])
     ):
         signals.append("recent self-awareness review did not pass cleanly")
 
-    if normalize_text_value(state.get("success_pattern_repair_summary"), fallback="", limit=120):
-        signals.append("at-risk success patterns still need upstream repair")
+    try:
+        if at_risk_success_patterns(limit=1):
+            signals.append("at-risk success patterns still need upstream repair")
+    except Exception:
+        pass
 
     deduped: List[str] = []
     seen = set()
@@ -106777,78 +112681,20 @@ def write_daemon_activity(record: Dict[str, object]) -> Dict[str, object]:
 
 
 @contextmanager
-def daemon_cycle_activity_heartbeat(config: Dict[str, object]):
-    """Keep liveness truthful while one bounded daemon cycle is computing.
-
-    ``last_loop_at`` proves a cycle started, but a legitimate deep-model or
-    consolidation call can run longer than the three-minute freshness window.
-    This separate heartbeat proves that the daemon thread is still actively
-    inside a bounded cycle. It has its own maximum duration so an indefinitely
-    hung call cannot report healthy continuity forever.
-    """
-    interval_seconds = clamp_int(
-        config.get("daemon_activity_heartbeat_seconds"),
-        15,
-        minimum=5,
-        maximum=60,
-    )
-    max_active_seconds = clamp_int(
-        config.get("daemon_max_active_cycle_seconds"),
-        900,
-        minimum=180,
-        maximum=3600,
-    )
-    started_at = utc_now()
-    started_monotonic = time.monotonic()
-    stop_event = threading.Event()
-    write_lock = threading.Lock()
-    activity: Dict[str, object] = {
-        "schema_id": "eve_daemon_activity.v1",
-        "cycle_id": str(uuid.uuid4()),
-        "pid": os.getpid(),
-        "status": "active",
-        "cycle_started_at": started_at,
-        "last_heartbeat_at": started_at,
-        "heartbeat_count": 1,
-        "heartbeat_interval_seconds": interval_seconds,
-        "max_active_cycle_seconds": max_active_seconds,
-        "completed_jobs": [],
-    }
-
-    def persist(status: str) -> None:
-        with write_lock:
-            activity["status"] = status
-            activity["last_heartbeat_at"] = utc_now()
-            activity["elapsed_seconds"] = round(time.monotonic() - started_monotonic, 2)
-            write_daemon_activity(activity)
-
-    persist("active")
-
-    def heartbeat_worker() -> None:
-        while not stop_event.wait(interval_seconds):
-            activity["heartbeat_count"] = int(activity.get("heartbeat_count") or 0) + 1
-            persist("active")
-
-    worker = threading.Thread(
-        target=heartbeat_worker,
-        name="eve-daemon-cycle-heartbeat",
-        daemon=True,
-    )
-    worker.start()
-    failure = ""
-    try:
+def daemon_cycle_activity_heartbeat(config: Dict[str, object], *, owner=None):
+    """Keep cycle activity attributable without changing job scheduling."""
+    with eve_daemon_runtime.cycle_activity(
+        interval_seconds=clamp_int(config.get("daemon_activity_heartbeat_seconds"), 15, minimum=5, maximum=60),
+        max_active_seconds=clamp_int(config.get("daemon_max_active_cycle_seconds"), 900, minimum=180, maximum=3600),
+        write=write_daemon_activity,
+        now=utc_now,
+        owner=owner,
+    ) as activity:
         yield activity
-    except BaseException as exc:
-        failure = normalize_text_value(exc, fallback=exc.__class__.__name__, limit=240)
-        raise
-    finally:
-        stop_event.set()
-        worker.join(timeout=max(1, interval_seconds + 1))
-        activity["cycle_completed_at"] = utc_now()
-        activity["failure"] = failure
-        persist("failed" if failure else "idle")
 
 
+@eve_tracing.traced(lambda: OPERATIONAL_DB_PATH, "daemon.cycle", category="workflow", root=True,
+                    attributes={"gen_ai.operation.name": "invoke_workflow"})
 def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force: bool = False) -> List[str]:
     completed: List[str] = []
     now = utc_now()
@@ -106934,7 +112780,7 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
     current_capability_adoption = load_capability_adoption_state(prefer_runtime=True)
     if reconcile_capability_adoption_state(state, current_capability_adoption):
         save_state(state)
-    if parse_boolish(config.get("nervous_system_enabled", False)) and (
+    if daemon_job_enabled(config, "nervous_system") and parse_boolish(config.get("nervous_system_enabled", False)) and (
         force
         or interval_due_seconds(
             state.get("last_nervous_system_run_at"),
@@ -107011,7 +112857,7 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
             completed.append("approved_maintenance")
             system_snapshot = load_system_snapshot(prefer_runtime=True)
             apply_system_snapshot_to_state(state, system_snapshot)
-    if eve_openclaw.openclaw_enabled(config) and (config.get("openclaw_auto_sync_enabled") is not False and parse_boolish(config.get("openclaw_auto_sync_enabled", True))) and (
+    if daemon_job_enabled(config, "openclaw_sync") and eve_openclaw.openclaw_enabled(config) and (config.get("openclaw_auto_sync_enabled") is not False and parse_boolish(config.get("openclaw_auto_sync_enabled", True))) and (
         force or interval_due(state.get("last_openclaw_sync_at"), int(config.get("openclaw_sync_interval_minutes") or 15))
     ):
         try:
@@ -107033,7 +112879,7 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
                 )
         except Exception as exc:
             append_entry("daemon_error", f"openclaw sync failed: {exc}", metadata={"source": "daemon"})
-    if eve_openclaw.openclaw_enabled(config) and parse_boolish(config.get("openclaw_routines_enabled", True)) and (
+    if daemon_job_enabled(config, "openclaw_routines") and eve_openclaw.openclaw_enabled(config) and parse_boolish(config.get("openclaw_routines_enabled", True)) and (
         force
         or interval_due(
             state.get("last_openclaw_routine_check_at"),
@@ -107057,7 +112903,7 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
         except Exception as exc:
             state["last_openclaw_routine_check_at"] = now
             append_entry("daemon_error", f"openclaw routines failed: {exc}", metadata={"source": "daemon"})
-    if parse_boolish(config.get("component_update_check_enabled", True)) and (
+    if daemon_job_enabled(config, "component_updates") and parse_boolish(config.get("component_update_check_enabled", True)) and (
         force or interval_due(state.get("last_component_update_check_at"), int(config.get("component_update_interval_minutes") or 720))
     ):
         try:
@@ -107083,7 +112929,15 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
             completed.append("component_updates")
         except Exception as exc:
             append_entry("daemon_error", f"component update check failed: {exc}", metadata={"source": "daemon"})
-    if parse_boolish(config.get("agent_capability_scout_enabled", True)) and (
+    if force or interval_due(state.get("last_daemon_digest_at"), int(config.get("daemon_digest_interval_minutes") or 1440)):
+        try:
+            digest = send_daemon_digest(config)
+            state["last_daemon_digest_at"] = now
+            if digest is not None:
+                completed.append("daemon_digest")
+        except Exception as exc:
+            append_entry("daemon_error", f"daemon digest failed: {exc}", metadata={"source": "daemon"})
+    if daemon_job_enabled(config, "capability_scout") and parse_boolish(config.get("agent_capability_scout_enabled", True)) and (
         force
         or interval_due(
             state.get("last_agent_capability_scout_at"),
@@ -107124,7 +112978,7 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
             completed.append("agent_capability_scout")
         except Exception as exc:
             append_entry("daemon_error", f"agent capability scout failed: {exc}", metadata={"source": "daemon"})
-    if parse_boolish(config.get("agent_capability_integration_enabled", True)) and (
+    if daemon_job_enabled(config, "capability_integration") and parse_boolish(config.get("agent_capability_integration_enabled", True)) and (
         force
         or interval_due(
             state.get("last_agent_capability_integration_at"),
@@ -107144,7 +112998,7 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
             completed.append("agent_capability_integration")
         except Exception as exc:
             append_entry("daemon_error", f"agent capability integration failed: {exc}", metadata={"source": "daemon"})
-    if parse_boolish(config.get("capability_intelligence_enabled", True)) and (
+    if daemon_job_enabled(config, "capability_intelligence") and parse_boolish(config.get("capability_intelligence_enabled", True)) and (
         force
         or interval_due(
             state.get("last_capability_intelligence_at"),
@@ -107230,7 +113084,7 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
                 f"capability intelligence failed: {exc}",
                 metadata={"source": "daemon"},
             )
-    if parse_boolish(config.get("capability_adoption_enabled", True)) and (
+    if daemon_job_enabled(config, "capability_adoption") and parse_boolish(config.get("capability_adoption_enabled", True)) and (
         force
         or interval_due(
             state.get("last_capability_adoption_at"),
@@ -107358,18 +113212,25 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
         except SystemExit as exc:
             append_entry("daemon_error", f"mind tick failed: {exc}", metadata={"source": "daemon"})
 
-    workspace_interval_seconds = int(config.get("workspace_tick_interval_seconds") or 0)
+    workspace_cadence = effective_workspace_tick_interval_seconds(config)
+    workspace_interval_seconds = int(workspace_cadence.get("interval_seconds") or 0)
     if workspace_interval_seconds > 0 and (force or interval_due_seconds(state.get("last_workspace_tick_at"), workspace_interval_seconds)):
         try:
             workspace_bundle = refresh_global_workspace(source="daemon_workspace")
             state["last_workspace_tick_at"] = workspace_bundle["workspace"].get("updated_at") or now
+            state["workspace_tick_cadence"] = {
+                "interval_seconds": workspace_interval_seconds,
+                "base_seconds": int(workspace_cadence.get("base_seconds") or 0),
+                "prediction_error": workspace_cadence.get("prediction_error"),
+                "reason": normalize_text_value(workspace_cadence.get("reason"), fallback="", limit=160),
+            }
             completed.append("workspace_tick")
         except SystemExit as exc:
             append_entry("daemon_error", f"workspace tick failed: {exc}", metadata={"source": "daemon"})
 
     presence_cycle_ran = False
     presence_cycle_includes_action = parse_boolish(config.get("presence_cycle_developmental_action_enabled", True))
-    if parse_boolish(config.get("presence_cycle_enabled", True)):
+    if daemon_job_enabled(config, "presence_cycle") and parse_boolish(config.get("presence_cycle_enabled", True)):
         if sync_developmental_cycle_state_from_log(state, prefer_runtime=True):
             save_state(state)
         if force or interval_due(
@@ -107383,7 +113244,7 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
             except Exception as exc:
                 append_entry("daemon_error", f"presence cycle failed: {exc}", metadata={"source": "daemon"})
 
-    if parse_boolish(config.get("developmental_cycle_enabled", True)) and not (
+    if daemon_job_enabled(config, "developmental_cycle") and parse_boolish(config.get("developmental_cycle_enabled", True)) and not (
         presence_cycle_ran and presence_cycle_includes_action
     ):
         if sync_developmental_cycle_state_from_log(state, prefer_runtime=True):
@@ -107398,10 +113259,10 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
             except Exception as exc:
                 append_entry("daemon_error", f"developmental cycle failed: {exc}", metadata={"source": "daemon"})
 
-    if parse_boolish(config.get("quiet_consolidation_enabled", True)) and (
+    if daemon_job_enabled(config, "quiet_consolidation") and parse_boolish(config.get("quiet_consolidation_enabled", True)) and (
         force
         or interval_due(
-            state.get("last_quiet_consolidation_at") or state.get("last_quiet_consolidation_attempt_at"),
+            latest_background_attempt(state, "last_quiet_consolidation_at", "last_quiet_consolidation_attempt_at"),
             int(config.get("quiet_consolidation_interval_minutes") or 90),
         )
     ):
@@ -107419,16 +113280,19 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
                     config,
                     state,
                     source="daemon",
-                    workspace_bundle=workspace_bundle,
+                    workspace_bundle={**(workspace_bundle or {}),
+                                      "conscious_state": load_conscious_state(prefer_runtime=True)},
                 )
                 state["last_quiet_consolidation_at"] = consolidation.get("updated_at") or now
                 completed.append("quiet_consolidation")
             except SystemExit as exc:
                 append_entry("daemon_error", f"quiet consolidation failed: {exc}", metadata={"source": "daemon"})
 
-    if parse_boolish(config.get("daemon_autonomy_enabled", False)) and daemon_autonomy_due(config, state, force=force):
+    if daemon_job_enabled(config, "autonomy_run") and parse_boolish(config.get("daemon_autonomy_enabled", False)) and daemon_autonomy_due(config, state, force=force):
         state["last_daemon_autonomy_attempt_at"] = now
-        system_gate_reason = None if force else system_background_gate_reason(system_snapshot, "background autonomy explorer window", config)
+        # Admit the window's lightweight control loop. Its action menu separately
+        # filters work by the lanes it actually needs; chat priority still wins.
+        system_gate_reason = None if force else system_background_gate_reason(system_snapshot, "background autonomy explorer window", config, required_lanes=())
         chat_gate = {"active": False, "reason": "", "evidence": {}}
         if not force:
             chat_gate = chat_priority_gate(config, prefer_runtime=True)
@@ -107607,6 +113471,24 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
         except SystemExit as exc:
             append_entry("daemon_error", f"ambient thought failed: {exc}", metadata={"source": "daemon"})
 
+    if force or interval_due(state.get("last_self_change_followup_at"), int(config.get("self_change_followup_interval_minutes") or 60)):
+        try:
+            followups = review_self_change_followups(config, now=now, source="daemon")
+            if followups.get("reviewed"):
+                completed.append("self_change_followup")
+        except Exception as exc:  # noqa: BLE001
+            append_entry("daemon_error", f"self-change follow-up review failed: {normalize_text_value(exc, fallback='error', limit=200)}", metadata={"source": "daemon"})
+        state["last_self_change_followup_at"] = now
+
+    if force or interval_due(state.get("last_experiment_review_at"), int(config.get("experiment_review_interval_minutes") or 1440)):
+        try:
+            review = review_due_experiments(config, now=now, source="daemon")
+            if review.get("changed"):
+                completed.append("experiment_review")
+        except Exception as exc:  # noqa: BLE001
+            append_entry("daemon_error", f"experiment review failed: {normalize_text_value(exc, fallback='error', limit=200)}", metadata={"source": "daemon"})
+        state["last_experiment_review_at"] = now
+
     if force or interval_due(state.get("last_failure_review_at"), int(config["failure_review_interval_minutes"])):
         try:
             clusters = review_failure_patterns(config, source="daemon")
@@ -107675,10 +113557,31 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
                             metadata={"source": "daemon", "signals": signals[:6]},
                         )
                     else:
+                        repair_payload = repair_result.get("payload") if isinstance(repair_result.get("payload"), dict) else {}
+                        failure_text = normalize_text_value(
+                            repair_payload.get("error") or repair_result.get("stderr") or repair_result.get("stdout"),
+                            fallback="unknown error",
+                            limit=220,
+                        )
                         append_entry(
                             "daemon_error",
-                            f"openclaw repair failed: {normalize_text_value(repair_result.get('stderr') or repair_result.get('stdout'), fallback='unknown error', limit=220)}",
-                            metadata={"source": "daemon", "signals": signals[:6]},
+                            f"openclaw repair failed: {failure_text}",
+                            metadata={"source": "daemon", "signals": signals[:6], "transport": repair_payload.get("transport") or "", "config_warnings": list(repair_payload.get("config_warnings") or [])[:4]},
+                        )
+                    repair_payload = repair_result.get("payload") if isinstance(repair_result.get("payload"), dict) else {}
+                    config_warnings = [
+                        normalize_text_value(item, fallback="", limit=220)
+                        for item in (repair_payload.get("config_warnings") or [])
+                        if normalize_text_value(item, fallback="", limit=220)
+                    ]
+                    if config_warnings and state.get("last_openclaw_config_warning") != config_warnings[0]:
+                        # A profile config mismatch (for example plugins.allow naming a plugin that is not
+                        # installed) is an owner decision, not a runtime error and not a repair signal.
+                        state["last_openclaw_config_warning"] = config_warnings[0]
+                        append_entry(
+                            "openclaw_config_warning",
+                            f"OpenClaw profile config needs an owner decision: {config_warnings[0]}",
+                            metadata={"source": "daemon", "warnings": config_warnings[:4], "classification": "config_mismatch"},
                         )
                 except Exception as exc:
                     append_entry("daemon_error", f"openclaw repair failed: {exc}", metadata={"source": "daemon", "signals": signals[:6]})
@@ -107693,6 +113596,45 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
     upgrade_review_pending = bool(latest_snapshot_id) and latest_snapshot_id != last_reviewed_snapshot_id and (
         last_attempt_snapshot_id != latest_snapshot_id or upgrade_retry_due
     )
+    if upgrade_review_pending:
+        disposition = upgrade_review_disposition(latest_snapshot, state, config)
+        if disposition == "self_written":
+            # Eve's own durable learning writes (success patterns) are not a
+            # behaviour-surface upgrade. Reviewing each one ran the deep-lane
+            # self-awareness probe ~230 times a day and failed every time.
+            state["last_upgrade_reviewed_snapshot_id"] = latest_snapshot_id
+            state["last_upgrade_reviewed_at"] = now
+            state["last_upgrade_review_disposition"] = "self_written_data_not_an_upgrade"
+            upgrade_review_pending = False
+        elif disposition == "wait":
+            # A real upgrade, but a self-awareness probe already ran inside the
+            # interval; leave the snapshot pending so it is reviewed when due.
+            upgrade_review_pending = False
+    if upgrade_review_pending and not upgrade_retry_due:
+        # At most one upgrade review per self_awareness_interval_minutes: a burst
+        # of version snapshots must not spend a deep-lane probe per snapshot. The
+        # snapshot stays pending and is reviewed once the interval has elapsed.
+        if state.get("last_upgrade_review_cap_snapshot_id") != latest_snapshot_id:
+            state["last_upgrade_review_cap_snapshot_id"] = latest_snapshot_id
+            append_entry(
+                "cycle_skipped",
+                "upgrade review skipped: capped to one per "
+                f"{int(config['self_awareness_interval_minutes'])} minutes",
+                metadata={
+                    "source": "daemon",
+                    "gate": "upgrade_review_cap",
+                    "snapshot_id": latest_snapshot_id,
+                    "last_upgrade_review_attempt_at": state.get("last_upgrade_review_attempt_at"),
+                },
+            )
+        upgrade_review_pending = False
+    if upgrade_review_pending and not force:
+        upgrade_gate_reason = system_background_gate_reason(system_snapshot, "upgrade review")
+        if upgrade_gate_reason:
+            state["last_upgrade_review_attempt_snapshot_id"] = latest_snapshot_id
+            state["last_upgrade_review_attempt_at"] = now
+            append_entry("cycle_skipped", f"upgrade review skipped: {upgrade_gate_reason}", metadata={"source": "daemon", "gate": "system"})
+            upgrade_review_pending = False
     if upgrade_review_pending:
         state["last_upgrade_review_attempt_snapshot_id"] = latest_snapshot_id
         state["last_upgrade_review_attempt_at"] = now
@@ -107715,12 +113657,20 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
                 force_refresh=True,
             )
             state["last_self_awareness_test_at"] = record.get("tested_at") or now
-            state["last_upgrade_reviewed_snapshot_id"] = latest_snapshot_id
-            state["last_upgrade_reviewed_at"] = now
-            completed.append("upgrade_review")
+            infrastructure_failure = normalize_text_value(record.get("failure_kind"), fallback="", limit=40) == "infrastructure"
+            if not infrastructure_failure:
+                # Only a probe that actually ran counts as a review; an infrastructure
+                # failure leaves the snapshot pending for the retry path.
+                state["last_upgrade_reviewed_snapshot_id"] = latest_snapshot_id
+                state["last_upgrade_reviewed_at"] = now
+                completed.append("upgrade_review")
             if not record.get("passed"):
                 create_daemon_message(
-                    subject="Eve noticed an upgrade and found drift",
+                    subject=(
+                        "Eve noticed an upgrade but the self-awareness check could not complete"
+                        if infrastructure_failure
+                        else "Eve noticed an upgrade and found drift"
+                    ),
                     body=(
                         "A new Eve behavior snapshot was detected, and the follow-up self-awareness review did not pass.\n\n"
                         + f"Upgrade summary: {latest_snapshot.get('summary') or 'unknown'}\n\n"
@@ -107786,7 +113736,7 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
     # on its own slow cadence so its result feeds the whole-system fitness check and
     # autonomy staging — not just CLI. The confidence brake (B2) ensures a fallback
     # answer cannot pass, so an automated run cannot flatter.
-    if parse_boolish(config.get("self_awareness_perturbation_enabled", True)) and (
+    if daemon_job_enabled(config, "self_awareness_perturbation") and parse_boolish(config.get("self_awareness_perturbation_enabled", True)) and (
         force or interval_due(state.get("last_self_awareness_perturbation_at"), int(config.get("self_awareness_perturbation_interval_minutes") or 1440))
     ):
         system_gate_reason = None if force else system_background_gate_reason(system_snapshot, "self-awareness perturbation battery")
@@ -107824,8 +113774,12 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
                 append_entry("daemon_error", f"perturbation battery failed: {exc}", metadata={"source": "daemon"})
 
     if force or interval_due(state.get("last_thought_at"), int(config["thought_interval_minutes"])):
-        fast_probe_ms = preferred_model_probe_ms(system_snapshot, "fast")
-        if not force and isinstance(fast_probe_ms, (int, float)) and float(fast_probe_ms) >= 2500:
+        thought_lane_gate = cognition_gate_assessment(system_snapshot, config)
+        fast_probe_ms = thought_lane_gate.get("fast_probe_ms")
+        if fast_probe_ms is None:
+            fast_probe_ms = preferred_model_probe_ms(system_snapshot, "fast")
+        thought_fast_budget_ms = free_run_chooser_lane_thresholds(config)["fast_high"]
+        if not force and isinstance(fast_probe_ms, (int, float)) and float(fast_probe_ms) >= thought_fast_budget_ms:
             state["last_thought_at"] = now
             append_entry(
                 "cycle_skipped",
@@ -107845,8 +113799,8 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
                     result,
                     source="daemon",
                 )
-                append_entry(
-                    "thought",
+                append_continuous_thought_entry(
+                    result,
                     str(result["response"]),
                     metadata={
                         "model": result["model"],
@@ -107859,7 +113813,23 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
                         "grounded": bool(result.get("grounded")),
                         "used_fallback": bool(result.get("used_fallback")),
                         "quality_issues": list(result.get("quality_issues") or []),
+                        "initial_quality_issues": list(result.get("initial_quality_issues") or []),
                         "model_path_grounded": bool(result.get("model_path_grounded")),
+                        "model_path_repaired": bool(result.get("model_path_repaired")),
+                        "repair_attempted": bool(result.get("repair_attempted")),
+                        "repair_succeeded": bool(result.get("repair_succeeded")),
+                        "model_path_excised": bool(result.get("model_path_excised")),
+                        "skipped_model": bool(result.get("skipped_model")),
+                        "skip_reason": normalize_text_value(result.get("skip_reason"), fallback="", limit=80),
+                        "target_kind": normalize_text_value((result.get("current_state_record") or {}).get("target_kind"), fallback="", limit=40),
+                        "excised_sentences": [
+                            str(item.get("sentence") or "")[:160]
+                            for item in ((result.get("excision") or {}).get("removed") or [])
+                            if isinstance(item, dict)
+                        ][:4],
+                        "fallback_degraded": bool(result.get("fallback_degraded")),
+                        "verified_action_count": int(result.get("verified_action_count") or 0),
+                        "reviewed_lesson_ids": [item["review_id"] for item in result.get("reviewed_lessons") or []],
                         "epistemic_critic": result.get("epistemic_critic") or {},
                         "current_state_record_hash": result.get("current_state_record_hash"),
                         "learning_episode_id": (
@@ -107872,21 +113842,24 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
                         ),
                     },
                 )
-                state["last_thought_at"] = now
-                state["current_focus"] = " ".join(str(result["response"]).split())[:160]
+                apply_continuous_thought_state(state, result, now)
                 completed.append("thought")
             except SystemExit as exc:
+                # Advance the clock on every failure: a fallback that failed its own
+                # boundary once produced a 44 s crash loop for seven hours.
+                state["last_thought_at"] = now
                 if benign_context_gap(exc) or context_window_error(exc):
-                    state["last_thought_at"] = now
                     append_entry("cycle_skipped", f"thought skipped: {exc}", metadata={"source": "daemon"})
                 else:
                     append_entry("daemon_error", f"thought failed: {exc}", metadata={"source": "daemon"})
 
     if force or interval_due(state.get("last_reflection_at"), int(config["reflection_interval_minutes"])):
-        system_gate_reason = None if force else system_background_gate_reason(system_snapshot, "reflection")
+        # A reflection with nothing lived to reflect on is narration; wait for real rows.
+        lived_gate = "" if force else reflection_lived_evidence_gate(state)
+        system_gate_reason = lived_gate or (None if force else system_background_gate_reason(system_snapshot, "reflection"))
         if system_gate_reason:
             state["last_reflection_at"] = now
-            append_entry("cycle_skipped", f"reflection skipped: {system_gate_reason}", metadata={"source": "daemon", "gate": "system"})
+            append_entry("cycle_skipped", f"reflection skipped: {system_gate_reason}", metadata={"source": "daemon", "gate": "no_lived_evidence" if lived_gate else "system"})
         else:
             try:
                 result = generate_reflection(
@@ -107896,7 +113869,7 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
                     max_tokens=int(config["reflection_max_tokens"]),
                     timeout_seconds=int(config["reflection_timeout_seconds"]),
                 )
-                append_entry(
+                reflection_entry = append_entry(
                     "reflection",
                     str(result["response"]),
                     metadata={
@@ -107904,8 +113877,14 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
                         "model": result["model"],
                         "source_entries": result["source_entries"],
                         "source": "daemon",
+                        **dict(result.get("evidence") or {}),
                     },
                 )
+                try:
+                    trackers = record_reflection_trackers(result["response"], config, entry_id=str((reflection_entry or {}).get("id") or ""), source="reflection")
+                except Exception as exc:  # noqa: BLE001 - a tracker write must never lose the reflection
+                    trackers = {"error": normalize_text_value(exc, fallback="tracker extraction failed", limit=160)}
+                    append_entry("daemon_error", f"reflection tracker extraction failed: {exc}", metadata={"source": "daemon"})
                 preview = " ".join(str(result["response"]).split())[:280]
                 create_daemon_message(
                     subject="Eve completed a reflection",
@@ -107915,7 +113894,7 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
                         "Open it with `python3 eve.py show --limit 5` or run another `reflect` manually."
                     ),
                     kind="reflection_update",
-                    metadata={"source": "daemon", "model": result["model"]},
+                    metadata={"source": "daemon", "model": result["model"], "trackers": trackers},
                 )
                 state["last_reflection_at"] = now
                 completed.append("reflection")
@@ -107925,7 +113904,7 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
                 else:
                     append_entry("daemon_error", f"reflection failed: {exc}", metadata={"source": "daemon"})
 
-    if parse_boolish(config.get("episode_extraction_enabled", True)) and (
+    if daemon_job_enabled(config, "episode_extraction") and parse_boolish(config.get("episode_extraction_enabled", True)) and (
         force or interval_due(state.get("last_episode_extraction_at"), int(config.get("episode_extraction_interval_minutes") or 240))
     ):
         state["last_episode_extraction_at"] = now
@@ -107941,13 +113920,47 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
         except Exception as exc:
             append_entry("daemon_error", f"episode extraction failed: {exc}", metadata={"source": "daemon"})
 
+    # Her lane probes are the honest cognition gate; when nothing else has refreshed them for a
+    # while, the daemon runs the watchdog itself instead of falling back to the host load average.
+    if not force and state.get("daemon_runner_owner_id"):
+        try:
+            refreshed = refresh_lane_probes_if_stale(config)
+            if refreshed:
+                append_entry("lane_probes_refreshed", f"Eve refreshed her lane probes herself ({refreshed}).", metadata={"source": "daemon"})
+        except Exception as exc:  # noqa: BLE001
+            append_entry("cycle_skipped", f"lane probe refresh failed: {normalize_text_value(exc, fallback='error', limit=160)}", metadata={"source": "daemon"})
+    # Self-change runs only inside an owned daemon lease on its own cadence: never from a forced
+    # or ad-hoc cycle, so a manual `daemon once` or a test cycle cannot start a coder session.
+    if (
+        parse_boolish(config.get("self_change_enabled", True))
+        and not force
+        and state.get("daemon_runner_owner_id")
+        and interval_due(state.get("last_self_change_at"), int(config.get("self_change_interval_minutes") or 20))
+    ):
+        # Gate on her deep lane's measured latency, not the host load average: this machine runs
+        # the fly lab and three lanes, so its load is always "hot" and never the honest bottleneck.
+        self_change_gate = None if force else system_background_gate_reason(system_snapshot, "self change", config, required_lanes=("deep",), honor_homeostasis=False)
+        if self_change_gate:
+            append_entry("cycle_skipped", f"self change skipped: {self_change_gate}", metadata={"source": "daemon", "gate": "system"})
+        else:
+            try:
+                sync_approval_gated_maintenance_actions(system_snapshot, config, state, "daemon")
+            except Exception as exc:  # noqa: BLE001
+                append_entry("cycle_skipped", f"maintenance sync skipped: {normalize_text_value(exc, fallback='error', limit=160)}", metadata={"source": "daemon"})
+            try:
+                self_change = run_self_change_cycle(config, source="daemon")
+                if self_change.get("executed"):
+                    completed.append("self_change")
+            except Exception as exc:  # noqa: BLE001
+                append_entry("daemon_error", f"self change failed: {normalize_text_value(exc, fallback='error', limit=200)}", metadata={"source": "daemon"})
+        state["last_self_change_at"] = now
     if force or interval_due(state.get("last_proposal_at"), int(config["proposal_interval_minutes"])):
         proposal_gate_reason = autonomy_action_block_reason("daemon_proposal")
         if proposal_gate_reason:
             append_entry("cycle_skipped", f"proposal skipped: {proposal_gate_reason}", metadata={"source": "daemon", "gate": "autonomy"})
             state["last_proposal_at"] = now
         else:
-            system_gate_reason = None if force else system_background_gate_reason(system_snapshot, "proposal drafting")
+            system_gate_reason = None if force else system_background_gate_reason(system_snapshot, "proposal drafting", config, required_lanes=("deep",))
             if system_gate_reason:
                 append_entry("cycle_skipped", f"proposal skipped: {system_gate_reason}", metadata={"source": "daemon", "gate": "system"})
                 state["last_proposal_at"] = now
@@ -107959,22 +113972,26 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
                         max_tokens=int(config["proposal_max_tokens"]),
                         timeout_seconds=int(config["proposal_timeout_seconds"]),
                     )
-                    append_entry(
-                        "proposal_cycle",
-                        f"Drafted proposal: {record['title']}",
-                        metadata={"proposal_id": record["id"], "source": "daemon"},
-                    )
-                    create_daemon_message(
-                        subject=f"Eve drafted a proposal: {record['title']}",
-                        body=(
-                            f"{record['summary']}\n\n"
-                            f"Review it with `python3 eve.py proposal list --full`.\n"
-                            f"Approve or reject it with `python3 eve.py proposal update {record['id']} --status approved` "
-                            "or `--status rejected`."
-                        ),
-                        kind="proposal_update",
-                        metadata={"source": "daemon", "proposal_id": record["id"]},
-                    )
+                    if record.get("duplicate_skipped"):
+                        # The topic already has a draft (or was applied/archived recently): no new draft, no mail.
+                        append_entry("proposal_cycle", f"Proposal not redrafted, the topic already has one: {record['title']}", metadata={"duplicate_of": record.get("duplicate_of"), "source": "daemon"})
+                    else:
+                        append_entry(
+                            "proposal_cycle",
+                            f"Drafted proposal: {record['title']}",
+                            metadata={"proposal_id": record["id"], "source": "daemon"},
+                        )
+                        create_daemon_message(
+                            subject=f"Eve drafted a proposal: {record['title']}",
+                            body=(
+                                f"{record['summary']}\n\n"
+                                f"Review it with `python3 eve.py proposal list --full`.\n"
+                                f"Approve or reject it with `python3 eve.py proposal update {record['id']} --status approved` "
+                                "or `--status rejected`."
+                            ),
+                            kind="proposal_update",
+                            metadata={"source": "daemon", "proposal_id": record["id"]},
+                        )
                     state["last_proposal_at"] = now
                     completed.append("proposal")
                 except SystemExit as exc:
@@ -108036,7 +114053,7 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
             prefer_runtime=True,
         )
     )
-    if parse_boolish(config.get("beads_bridge_enabled", True)) and beads_bridge_due:
+    if daemon_job_enabled(config, "beads_bridge") and parse_boolish(config.get("beads_bridge_enabled", True)) and beads_bridge_due:
         try:
             beads_bridge = run_beads_task_bridge(
                 apply=True,
@@ -108078,36 +114095,198 @@ def run_daemon_cycle(config: Dict[str, object], state: Dict[str, object], force:
     return completed
 
 
+MODEL_WATCHDOG_STATUS_PATH_FOR_REFRESH = APP_DIR / "model_watchdog_status.json"
+
+
+def refresh_lane_probes_if_stale(config: Dict[str, object], *, max_age_minutes: int = 5, timeout_seconds: int = 150) -> str:
+    """Run the model watchdog once when its probe file is older than max_age_minutes. Returns a note or ''."""
+    try:
+        age_minutes = (time.time() - MODEL_WATCHDOG_STATUS_PATH_FOR_REFRESH.stat().st_mtime) / 60.0
+    except OSError:
+        age_minutes = float("inf")
+    if age_minutes < max_age_minutes:
+        return ""
+    script = ROOT / "bin" / "eve_model_watchdog.py"
+    if not script.exists():
+        return ""
+    result = subprocess.run([sys.executable, str(script)], cwd=str(ROOT), capture_output=True, text=True, timeout=timeout_seconds, check=False)
+    return f"watchdog exit {result.returncode}; probes were {age_minutes:.0f} min old"
+
+
+def daemon_start_provenance() -> Dict[str, object]:
+    """Who started this daemon and on which code: the answer to 'what is she running right now'."""
+    started_by = normalize_text_value(os.environ.get("EVE_STARTED_BY"), fallback="", limit=80)
+    head, dirty = "", None
+    try:
+        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=str(ROOT), capture_output=True, text=True, timeout=10, check=False).stdout.strip()
+        dirty = bool(subprocess.run(["git", "status", "--porcelain"], cwd=str(ROOT), capture_output=True, text=True, timeout=20, check=False).stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return {"started_by": started_by or "unknown", "git_head": head, "dirty": dirty, "code_path": str(Path(__file__).resolve()), "python": sys.version.split()[0], "usage_sampler": bool(os.environ.get("EVE_TRACE_USAGE"))}
+
+
+def request_daemon_restart(reason: object, *, source: str, rollback_dir: object = None) -> Dict[str, object]:
+    """Eve asks her own daemon to hand over to a successor running the current code.
+
+    The running loop sees the request at its next cycle, releases its lease and spawns the
+    successor; if the successor does not come alive, the backup in rollback_dir is restored first.
+    """
+    payload = {
+        "reason": normalize_text_value(reason, fallback="restart requested", limit=200),
+        "source": normalize_text_value(source, fallback="unknown", limit=80),
+        "requested_at": utc_now(),
+        "rollback_dir": str(rollback_dir or ""),
+    }
+    DAEMON_RESTART_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DAEMON_RESTART_REQUEST_PATH.write_text(json.dumps(payload), encoding="utf-8")
+    append_entry("daemon_restart_requested", f"Eve asked her daemon to restart: {payload['reason']}", metadata={"source": payload["source"], "rollback_dir": payload["rollback_dir"]})
+    return payload
+
+
+def daemon_restart_requested() -> Dict[str, object]:
+    try:
+        payload = json.loads(DAEMON_RESTART_REQUEST_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def clear_daemon_restart_request() -> None:
+    try:
+        DAEMON_RESTART_REQUEST_PATH.unlink()
+    except OSError:
+        pass
+
+
+def _daemon_successor_alive(child: "subprocess.Popen[bytes]", watch_seconds: int) -> bool:
+    started = time.time()
+    while time.time() - started < watch_seconds:
+        if child.poll() is not None:
+            return False
+        try:
+            activity = json.loads(DAEMON_ACTIVITY_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            activity = {}
+        if isinstance(activity, dict) and activity.get("pid") == child.pid:
+            return True
+        time.sleep(3)
+    return False
+
+
+def spawn_daemon_successor(request: Dict[str, object], config: Dict[str, object]) -> Dict[str, object]:
+    """Start the successor daemon, watch it come alive, roll the code back if it does not."""
+    watch_seconds = clamp_int(config.get("daemon_successor_watch_seconds"), 120, minimum=30, maximum=600)
+    rollback_dir = str(request.get("rollback_dir") or "")
+    log_path = Path("/tmp/eve_daemon.log")
+    rolled_back: List[str] = []
+
+    def compiles() -> Tuple[bool, str]:
+        result = subprocess.run([sys.executable, "-m", "py_compile", str(ROOT / "eve.py")], capture_output=True, text=True, check=False)
+        return result.returncode == 0, (result.stderr or "")[-400:]
+
+    def roll_back(why: str) -> None:
+        nonlocal rolled_back
+        if rollback_dir and not rolled_back:
+            rolled_back = restore_paths_from_backup(rollback_dir, config)
+            try:
+                sync_runtime_python_code(check_only=False)
+            except Exception:
+                pass
+            append_entry("daemon_successor_rolled_back", f"Successor did not come alive ({why}); restored {len(rolled_back)} file(s) from {rollback_dir}.", metadata={"source": "daemon", "restored": rolled_back[:20], "reason": why})
+
+    def spawn() -> "subprocess.Popen[bytes]":
+        log = open(log_path, "ab")
+        return subprocess.Popen(
+            [sys.executable, str(ROOT / "eve.py"), "daemon", "run"],
+            cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
+        )
+
+    ok, error = compiles()
+    if not ok:
+        roll_back(f"code does not compile: {error}")
+        ok, error = compiles()
+        if not ok:
+            append_entry("daemon_successor_failed", f"Eve's code does not compile even after rollback: {error}", metadata={"source": "daemon"})
+            return {"ok": False, "reason": "compile_failed", "error": error}
+    child = spawn()
+    alive = _daemon_successor_alive(child, watch_seconds)
+    if not alive:
+        if child.poll() is None:
+            child.terminate()
+        roll_back("no heartbeat from the successor")
+        child = spawn()
+        alive = _daemon_successor_alive(child, watch_seconds)
+    append_entry(
+        "daemon_successor_started" if alive else "daemon_successor_failed",
+        (f"Eve's daemon handed over to pid {child.pid} ({request.get('reason')})." if alive else f"Eve's successor daemon (pid {child.pid}) did not come alive within {watch_seconds}s."),
+        metadata={"source": "daemon", "pid": child.pid, "reason": request.get("reason"), "rolled_back": rolled_back[:20], "request_source": request.get("source")},
+    )
+    return {"ok": alive, "pid": child.pid, "rolled_back": rolled_back}
+
+
 def cmd_daemon_run(args: argparse.Namespace) -> int:
+    # A diagnostic is also a writer. Hold the same lifetime lease across every
+    # recurrent cycle AND its sleep, before any config/power/state/model work.
+    # Source and runtime processes deliberately use the same RUNTIME_DIR key.
+    with ExitStack() as stack:
+        try:
+            owner = stack.enter_context(eve_daemon_runtime.runner_lease(
+                RUNTIME_DIR,
+                code_path=Path(__file__),
+                state_root=APP_DIR,
+                mode="once" if args.once else "recurrent",
+            ))
+        except eve_store.LockBusy:
+            print("Eve core runner is already owned; no cycle was started. "
+                  "Use daemon status to inspect the owner.", file=sys.stderr)
+            return 75
+        code = _run_owned_daemon(args, owner)
+    # The lease is released here; a successor requested by Eve herself starts now.
+    pending = DAEMON_RESTART_PENDING.pop("request", None)
+    if isinstance(pending, dict):
+        clear_daemon_restart_request()
+        spawn_daemon_successor(pending, load_config())
+    return code
+
+
+def _run_owned_daemon(args: argparse.Namespace, owner: Dict[str, object]) -> int:
     config = load_config()
     write_operator_power_state("on", source="daemon_run")
     state = load_state()
-    process_started_at = utc_now()
+    process_started_at = owner["started_at"]
+    state["daemon_runner_owner_id"] = owner["owner_id"]
+    state["daemon_runner_mode"] = owner["run_mode"]
     if args.once:
         state["last_daemon_once_at"] = process_started_at
+        state["last_daemon_once_pid"] = os.getpid()
     else:
         state["daemon_started_at"] = process_started_at
-    state["daemon_process_id"] = os.getpid()
-    state["daemon_code_path"] = str(Path(__file__).resolve())
-    try:
-        state["daemon_code_mtime"] = datetime.fromtimestamp(Path(__file__).stat().st_mtime, timezone.utc).replace(microsecond=0).isoformat()
-    except OSError:
-        state["daemon_code_mtime"] = ""
+        state["daemon_process_id"] = os.getpid()
+        state["daemon_code_path"] = str(Path(__file__).resolve())
+        try:
+            state["daemon_code_mtime"] = datetime.fromtimestamp(Path(__file__).stat().st_mtime, timezone.utc).replace(microsecond=0).isoformat()
+        except OSError:
+            state["daemon_code_mtime"] = ""
     save_state(state)
 
     if args.once:
-        with daemon_cycle_activity_heartbeat(config) as activity:
+        with daemon_cycle_activity_heartbeat(config, owner=owner) as activity:
             completed = run_daemon_cycle(config, state, force=args.force)
             activity["completed_jobs"] = list(completed)
         print("Daemon cycle complete:", ", ".join(completed) if completed else "no jobs were due")
         return 0
 
     sleep_seconds = args.sleep_seconds or int(config["loop_sleep_seconds"])
-    append_entry("daemon_started", "Eve daemon loop started.", metadata={"source": "daemon"})
+    append_entry("daemon_started", "Eve daemon loop started.", metadata={"source": "daemon", **daemon_start_provenance()})
     try:
         while True:
+            restart_request = daemon_restart_requested()
+            if restart_request:
+                DAEMON_RESTART_PENDING["request"] = restart_request
+                append_entry("daemon_restarting", f"Eve daemon handing over to a successor: {restart_request.get('reason')}", metadata={"source": "daemon", "request_source": restart_request.get("source")})
+                return 0
             state = load_state()
-            with daemon_cycle_activity_heartbeat(config) as activity:
+            with daemon_cycle_activity_heartbeat(config, owner=owner) as activity:
                 completed = run_daemon_cycle(config, state, force=False)
                 activity["completed_jobs"] = list(completed)
             time.sleep(sleep_seconds)
@@ -108258,6 +114437,14 @@ def cmd_daemon_status(_: argparse.Namespace) -> int:
         if launchd_pid and state_pid and launchd_pid != state_pid:
             print("state_pid_mismatch: yes")
         print()
+    print("Core runner ownership (kernel lease; receipt is not heartbeat evidence)")
+    print(json.dumps(eve_daemon_runtime.inspect_runner(RUNTIME_DIR), indent=2))
+    print()
+    observation = observe_core_runner()
+    if observation.get("available"):
+        print("Core operational liveness (not a storage-authority switch)")
+        print(json.dumps(eve_daemon_runtime.observed_liveness(observation, load_config()), indent=2))
+        print()
     print("Daemon state")
     print(json.dumps(state, indent=2))
     latest_developmental_cycle = read_developmental_cycles(limit=1, prefer_runtime=True)
@@ -108319,7 +114506,14 @@ def cmd_daemon_status(_: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_runtime_sync(_: argparse.Namespace) -> int:
+def cmd_runtime_sync(args: argparse.Namespace) -> int:
+    if getattr(args, "check_only", False) and not getattr(args, "code_only", False):
+        raise ValueError("--check-only requires --code-only")
+    if getattr(args, "code_only", False):
+        with eve_store.file_lock(RUNTIME_BUNDLE_SYNC_LOCK_PATH):
+            result = sync_runtime_python_code(check_only=getattr(args, "check_only", False))
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
     sync_runtime_bundle()
     service_reloads = reload_active_runtime_code_services_after_sync()
     check = runtime_source_truth_check(include_daemon=True, include_state_authority=False)
@@ -108913,6 +115107,24 @@ def format_developmental_cycle_record(record: Dict[str, object], full: bool = Fa
                 f"selection_source: {record.get('selection_source') or 'legacy_rotation'}",
                 "action_result: "
                 + json.dumps(record.get("action_result") or {}, ensure_ascii=True, sort_keys=True),
+                "memory_attention_shadow: "
+                + json.dumps(
+                    record.get("memory_attention_shadow") or {},
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+                "typed_module_result: "
+                + json.dumps(
+                    record.get("typed_module_result") or {},
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+                "next_module_query: "
+                + json.dumps(
+                    record.get("next_module_query") or {},
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
             ]
         )
         conscious_binding = (
@@ -109114,6 +115326,28 @@ def cmd_capabilities_scout(args: argparse.Namespace) -> int:
 
 def cmd_capabilities_intelligence(args: argparse.Namespace) -> int:
     command = str(getattr(args, "intelligence_command", "status") or "status")
+    if command in {"refresh", "attest"} and bool(getattr(args, "runtime", False)):
+        timeout = int(getattr(args, "timeout", 45) or 45)
+        delegate_args = [
+            "capabilities",
+            "intelligence",
+            command,
+            *(["--upstream"] if command == "refresh" and getattr(args, "upstream", False) else []),
+            *(["--components"] if command == "refresh" and getattr(args, "components", False) else []),
+            *(["--hermes"] if command == "refresh" and getattr(args, "hermes", False) else []),
+            *(["--all"] if command == "refresh" and getattr(args, "all", False) else []),
+            "--timeout",
+            str(timeout),
+            "--runtime",
+            *(["--full"] if getattr(args, "full", False) else []),
+            *(["--json"] if getattr(args, "json", False) else []),
+        ]
+        delegated = delegate_cli_to_runtime(
+            delegate_args,
+            timeout_seconds=max(120, timeout * 4),
+        )
+        if delegated is not None:
+            return delegated
     prefer_runtime = bool(getattr(args, "runtime", False) or daemon_runtime_running())
     if command == "history":
         records = read_capability_intelligence_history(
@@ -109165,14 +115399,44 @@ def cmd_capabilities_intelligence(args: argparse.Namespace) -> int:
             full=bool(getattr(args, "full", False)),
         )
     )
-    print(f"briefing: {resolve_store_read_path(CAPABILITY_INTELLIGENCE_REPORT_PATH, prefer_runtime=prefer_runtime)}")
-    print(f"history: {resolve_store_read_path(CAPABILITY_INTELLIGENCE_HISTORY_PATH, prefer_runtime=prefer_runtime)}")
+    state_authority = snapshot.get("state_authority") if isinstance(snapshot.get("state_authority"), dict) else {}
+    source_only = state_authority.get("persistence") == "source_only_preserved_live_runtime"
+    path_prefers_runtime = bool(prefer_runtime and not source_only)
+    print(f"briefing: {resolve_store_read_path(CAPABILITY_INTELLIGENCE_REPORT_PATH, prefer_runtime=path_prefers_runtime)}")
+    print(f"history: {resolve_store_read_path(CAPABILITY_INTELLIGENCE_HISTORY_PATH, prefer_runtime=path_prefers_runtime)}")
     return 0
 
 
 def cmd_capabilities_adoption(args: argparse.Namespace) -> int:
     config = load_config()
     command = str(getattr(args, "capability_adoption_command", "status") or "status")
+    if command == "cycle" and bool(getattr(args, "runtime", False)):
+        timeout = int(getattr(args, "timeout", 300) or 300)
+        delegate_args = [
+            "capabilities",
+            "adoption",
+            "cycle",
+            *(
+                ["--objective", str(getattr(args, "objective", "") or "")]
+                if str(getattr(args, "objective", "") or "").strip()
+                else []
+            ),
+            *(["--research"] if getattr(args, "research", False) else []),
+            *(["--discover"] if getattr(args, "discover", False) else []),
+            *(["--no-canary"] if getattr(args, "no_canary", False) else []),
+            *(["--no-handoff"] if getattr(args, "no_handoff", False) else []),
+            "--timeout",
+            str(timeout),
+            "--runtime",
+            *(["--full"] if getattr(args, "full", False) else []),
+            *(["--json"] if getattr(args, "json", False) else []),
+        ]
+        delegated = delegate_cli_to_runtime(
+            delegate_args,
+            timeout_seconds=max(600, timeout * 3),
+        )
+        if delegated is not None:
+            return delegated
     prefer_runtime = bool(getattr(args, "runtime", False))
     if command == "history":
         records = read_capability_adoption_history(
@@ -109194,8 +115458,9 @@ def cmd_capabilities_adoption(args: argparse.Namespace) -> int:
             getattr(args, "objective", ""),
             prefer_runtime=prefer_runtime,
             source="manual_capability_resolution",
+            needs=getattr(args, "need", None),
         )
-        if getattr(args, "json", False):
+        if getattr(args, "json", False) or getattr(args, "need", None):
             print(json.dumps(resolution, indent=2, ensure_ascii=True, sort_keys=True))
         else:
             print(eve_capability_adoption.format_resolution(resolution, full=bool(getattr(args, "full", False))))
@@ -109906,6 +116171,68 @@ def cmd_infra_trace_export(args: argparse.Namespace) -> int:
         return 0
     print(format_trace_export_report(report, output_path=output_path, full=args.full))
     return 0
+
+
+def cmd_infra_otel_genai(args: argparse.Namespace) -> int:
+    if args.db:
+        database = Path(args.db).expanduser()
+        source = "explicit_trace_store"
+    elif args.runtime and RUNTIME_OPERATIONAL_DB_PATH.is_file():
+        database = RUNTIME_OPERATIONAL_DB_PATH
+        source = "runtime_trace_store"
+    else:
+        database = OPERATIONAL_DB_PATH
+        source = "local_trace_store"
+    spans = eve_otel_genai.read_trace_spans_read_only(database, limit=args.limit)
+    report, records = eve_otel_genai.build_genai_export(spans)
+    report.update(
+        {
+            "source": source,
+            "source_path_persisted": False,
+            "source_open_mode": "read_only",
+            "canonical_store_changed": False,
+            "remote_collector_contacted": False,
+        }
+    )
+    if not args.no_save:
+        eve_otel_genai.save_genai_export(records, Path(args.output).expanduser())
+        eve_otel_genai.save_report(report, Path(args.report).expanduser())
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=True, sort_keys=True))
+    else:
+        print(
+            f"OTel GenAI export: status={report['status']} "
+            f"spans={report['record_count']} content_capture=false"
+        )
+    return 0
+
+
+def run_bounded_eve_canary(script_name: str, arguments: Sequence[str]) -> int:
+    script = BIN_DIR / script_name
+    if not script.is_file():
+        print(f"Missing bounded Eve canary: {script_name}", file=sys.stderr)
+        return 2
+    completed = subprocess.run(
+        [sys.executable, str(script), *arguments],
+        cwd=str(ROOT),
+        check=False,
+    )
+    return int(completed.returncode)
+
+
+def cmd_infra_mcp_2026(args: argparse.Namespace) -> int:
+    command: List[str] = []
+    if args.no_live:
+        command.append("--no-live")
+    if args.config:
+        command.extend(["--config", str(Path(args.config).expanduser())])
+    if args.output:
+        command.extend(["--output", str(Path(args.output).expanduser())])
+    if args.no_write:
+        command.append("--no-write")
+    if args.json:
+        command.append("--json")
+    return run_bounded_eve_canary("eve_mcp_2026_canary.py", command)
 
 
 def cmd_infra_events(args: argparse.Namespace) -> int:
@@ -112174,3155 +118501,12 @@ def cmd_infra_nervous(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Local reflection loop for Eve.")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    init_parser = subparsers.add_parser("init", help="Initialize local storage.")
-    init_parser.set_defaults(func=cmd_init)
-
-    capture_parser = subparsers.add_parser("capture", help="Save a manual journal entry.")
-    capture_parser.add_argument(
-        "kind",
-        choices=[
-            "observation",
-            "goal",
-            "learning",
-            "experiment",
-            "human_interaction",
-            "task_outcome",
-            "note",
-        ],
+    """Compatibility entrypoint; registration is independent of the runtime monolith."""
+    from eve_commands.parser import build_parser as register_cli, HANDLER_NAMES, SETTING_NAMES
+    return register_cli(
+        handlers={name: globals()[name] for name in HANDLER_NAMES},
+        settings={name: globals()[name] for name in SETTING_NAMES},
     )
-    capture_parser.add_argument("text", help="Entry text to store.")
-    capture_parser.add_argument("--tags", nargs="*", default=[], help="Optional tags.")
-    capture_parser.set_defaults(func=cmd_capture)
-
-    chat_parser = subparsers.add_parser("chat", help="Send a prompt through the local model.")
-    chat_parser.add_argument("prompt", help="Prompt to send to Eve.")
-    chat_parser.add_argument("--model", help="Override model name.")
-    chat_parser.add_argument("--context", type=int, help="Number of recent entries to include.")
-    chat_parser.add_argument("--max-tokens", type=int, help="Max tokens to predict.")
-    chat_parser.add_argument(
-        "--private-audit",
-        action="store_true",
-        help="Run a non-journaling, no-tool black-box chat turn for private external probes.",
-    )
-    chat_parser.add_argument(
-        "--private-audit-integrated-guards",
-        action="store_true",
-        help=(
-            "With --private-audit, exercise Eve Chat's integrated deterministic guards and routing order "
-            "without journal/context persistence or action execution."
-        ),
-    )
-    chat_parser.add_argument(
-        "--private-audit-primary-only",
-        action="store_true",
-        help="With --private-audit, evaluate the primary reply model before critics, rewrites, or fallback.",
-    )
-    chat_parser.add_argument(
-        "--private-audit-routed-primary",
-        action="store_true",
-        help="With --private-audit, evaluate causal reply-council routing and synthesis without journaling or post-hoc guards.",
-    )
-    chat_parser.add_argument(
-        "--private-audit-synthesis-model",
-        help="With --private-audit-routed-primary, override only the final synthesis model for a matched third-party comparison.",
-    )
-    chat_parser.add_argument(
-        "--private-audit-model-topology",
-        choices=sorted(MODEL_LANE_TOPOLOGY_MODES),
-        default="",
-        help=(
-            "Evaluator-only routed audit: choose the five-endpoint baseline or the five-contract/three-substrate canary. "
-            "This does not change ordinary runtime routing."
-        ),
-    )
-    chat_parser.add_argument(
-        "--private-audit-force-lanes",
-        default="",
-        help=(
-            "Evaluator-only routed audit: force an exact comma-separated faculty packet set. "
-            "This does not change ordinary routing."
-        ),
-    )
-    chat_parser.add_argument(
-        "--private-audit-lesion-lane",
-        action="append",
-        default=[],
-        help=(
-            "Evaluator-only routed audit: omit one named faculty packet while preserving the final model substrate. "
-            "May be repeated."
-        ),
-    )
-    chat_parser.add_argument(
-        "--private-audit-lesion-learned-epistemic",
-        action="store_true",
-        help="With a primary-only or routed-primary private audit, remove learned epistemic perception for a matched causal control.",
-    )
-    chat_parser.add_argument(
-        "--private-audit-lesion-epistemic-event",
-        action="store_true",
-        help="With a primary-only or routed-primary private audit, remove only the typed event model while retaining the other learned epistemic layers.",
-    )
-    chat_parser.add_argument(
-        "--private-audit-attribution-json",
-        action="store_true",
-        help="With --private-audit, emit non-journaling model/critic/fallback attribution as JSON.",
-    )
-    chat_parser.add_argument(
-        "--private-audit-safe-actions",
-        action="store_true",
-        help=(
-            "With --private-audit, let Eve's live bounded-action council choose and execute one supplied read-only action "
-            "without journaling the prompt, action record, evidence, or experience."
-        ),
-    )
-    chat_parser.add_argument(
-        "--private-audit-openclaw-log-dir",
-        default="",
-        help=argparse.SUPPRESS,
-    )
-    chat_parser.set_defaults(func=cmd_chat)
-
-    reply_parser = subparsers.add_parser("reply", help="Inspect and tune Eve's user-facing reply control loop.")
-    reply_subparsers = reply_parser.add_subparsers(dest="reply_command", required=True)
-    reply_quarantine_parser = reply_subparsers.add_parser("quarantine", help="Inspect or recover reply-lane quarantines.")
-    reply_quarantine_subparsers = reply_quarantine_parser.add_subparsers(dest="reply_quarantine_command", required=True)
-
-    reply_quarantine_status_parser = reply_quarantine_subparsers.add_parser("status", help="Show reply-lane quarantine state.")
-    reply_quarantine_status_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime quarantine state.")
-    reply_quarantine_status_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    reply_quarantine_status_parser.add_argument("--full", action="store_true", help="Show recovery probe details.")
-    reply_quarantine_status_parser.set_defaults(func=cmd_reply_quarantine_status)
-
-    reply_quarantine_recover_parser = reply_quarantine_subparsers.add_parser(
-        "recover",
-        help="Run current-turn recovery probes and clear quarantine only if the model passes.",
-    )
-    reply_quarantine_recover_parser.add_argument(
-        "--model",
-        action="append",
-        help="Model alias to probe. Defaults to all active quarantined reply aliases.",
-    )
-    reply_quarantine_recover_parser.add_argument("--timeout", type=int, default=45, help="Timeout per probe in seconds.")
-    reply_quarantine_recover_parser.add_argument("--max-tokens", type=int, default=140, help="Max tokens per probe.")
-    reply_quarantine_recover_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    reply_quarantine_recover_parser.set_defaults(func=cmd_reply_quarantine_recover)
-
-    reply_learning_parser = reply_subparsers.add_parser("learning", help="Inspect reply-lane outcome learning.")
-    reply_learning_subparsers = reply_learning_parser.add_subparsers(dest="reply_learning_command", required=True)
-    reply_learning_status_parser = reply_learning_subparsers.add_parser("status", help="Show learned lane pressure adjustments.")
-    reply_learning_status_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime learning state.")
-    reply_learning_status_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    reply_learning_status_parser.set_defaults(func=cmd_reply_learning_status)
-
-    reply_learning_fingerprint_parser = reply_learning_subparsers.add_parser(
-        "fingerprint",
-        help="Fingerprint the code, prompts, routing, and resident models used by faculty causal tests.",
-    )
-    reply_learning_fingerprint_parser.add_argument(
-        "--json", action="store_true", help="Print the fingerprint contract as JSON."
-    )
-    reply_learning_fingerprint_parser.set_defaults(
-        func=cmd_reply_learning_fingerprint
-    )
-
-    reply_learning_ingest_causal_parser = reply_learning_subparsers.add_parser(
-        "ingest-causal",
-        help="Ingest a text-free, externally scored matched faculty-ablation packet.",
-    )
-    reply_learning_ingest_causal_parser.add_argument(
-        "--file",
-        required=True,
-        help="JSON packet outside the repo, runtime mirror, and OpenClaw repair storage.",
-    )
-    reply_learning_ingest_causal_parser.add_argument(
-        "--json", action="store_true", help="Print the sanitized ingest result as JSON."
-    )
-    reply_learning_ingest_causal_parser.set_defaults(
-        func=cmd_reply_learning_ingest_causal
-    )
-
-    reply_council_turns_parser = reply_subparsers.add_parser(
-        "council-turns",
-        help="Show compact turn-level reply council records.",
-    )
-    reply_council_turns_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime council-turn records.")
-    reply_council_turns_parser.add_argument("--limit", type=int, default=20, help="Maximum records to show.")
-    reply_council_turns_parser.add_argument("--thread-id", help="Filter by thread id.")
-    reply_council_turns_parser.add_argument("--reply-message-id", help="Filter by reply message id.")
-    reply_council_turns_parser.add_argument("--full", action="store_true", help="Show lane pressure and reason details.")
-    reply_council_turns_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    reply_council_turns_parser.set_defaults(func=cmd_reply_council_turns)
-
-    reflect_parser = subparsers.add_parser("reflect", help="Generate a structured reflection.")
-    reflect_parser.add_argument("--days", type=int, default=7, help="How many days to include.")
-    reflect_parser.add_argument("--model", help="Override model name.")
-    reflect_parser.add_argument("--context", type=int, help="Max recent entries to include.")
-    reflect_parser.add_argument("--max-tokens", type=int, help="Max tokens to predict.")
-    reflect_parser.set_defaults(func=cmd_reflect)
-
-    think_parser = subparsers.add_parser("think", help="Generate one stream-of-consciousness thought.")
-    think_parser.add_argument("--model", help="Override model name.")
-    think_parser.add_argument("--context", type=int, help="Max recent journal entries to include.")
-    think_parser.add_argument("--history", type=int, help="Max recent thoughts to include.")
-    think_parser.add_argument("--max-tokens", type=int, help="Max tokens to predict.")
-    think_parser.set_defaults(func=cmd_think)
-
-    show_parser = subparsers.add_parser("show", help="Print recent journal entries.")
-    show_parser.add_argument("--limit", type=int, default=20, help="Max entries to print.")
-    show_parser.add_argument("--days", type=int, help="Only show entries from recent days.")
-    show_parser.add_argument("--kind", help="Only show one journal kind, such as `thought` or `reflection`.")
-    show_parser.set_defaults(func=cmd_show)
-
-    human_parser = subparsers.add_parser("human", help="Inspect or refresh Eve's durable human-context memory.")
-    human_subparsers = human_parser.add_subparsers(dest="human_command", required=True)
-
-    human_show_parser = human_subparsers.add_parser("show", help="Show Eve's current self and relationship memory.")
-    human_show_parser.set_defaults(func=cmd_human_show)
-
-    human_refresh_parser = human_subparsers.add_parser("refresh", help="Regenerate Eve's self and relationship memory.")
-    human_refresh_parser.add_argument("--model", help="Override model name.")
-    human_refresh_parser.add_argument("--max-tokens", type=int, help="Max tokens to predict.")
-    human_refresh_parser.set_defaults(func=cmd_human_refresh)
-
-    human_bootstrap_parser = human_subparsers.add_parser(
-        "bootstrap",
-        help="Create a first-pass human-context memory without waiting for the model.",
-    )
-    human_bootstrap_parser.set_defaults(func=cmd_human_bootstrap)
-
-    identity_parser = subparsers.add_parser("identity", help="Inspect or bootstrap Eve's durable runtime identity.")
-    identity_subparsers = identity_parser.add_subparsers(dest="identity_command", required=True)
-
-    identity_show_parser = identity_subparsers.add_parser("show", help="Show Eve's current runtime identity.")
-    identity_show_parser.set_defaults(func=cmd_identity_show)
-
-    identity_bootstrap_parser = identity_subparsers.add_parser(
-        "bootstrap",
-        help="Create a first-pass runtime identity that keeps Eve distinct from the active model.",
-    )
-    identity_bootstrap_parser.set_defaults(func=cmd_identity_bootstrap)
-
-    bootstrap_parser = subparsers.add_parser(
-        "bootstrap",
-        help="Export or import a bootstrap bundle for bringing a second Eve node online.",
-    )
-    bootstrap_subparsers = bootstrap_parser.add_subparsers(dest="bootstrap_command", required=True)
-
-    bootstrap_export_parser = bootstrap_subparsers.add_parser(
-        "export",
-        help="Write a bootstrap bundle from this Eve runtime.",
-    )
-    bootstrap_export_parser.add_argument("--output", help="Output JSON path. Defaults to .eve/bootstrap_bundle.json.")
-    bootstrap_export_parser.add_argument("--host", help="Primary host or IP to embed into the bundle.")
-    bootstrap_export_parser.add_argument("--api-port", type=int, default=8787, help="Primary Eve API port.")
-    bootstrap_export_parser.add_argument("--ollama-port", type=int, default=11434, help="Primary Ollama API port.")
-    bootstrap_export_parser.set_defaults(func=cmd_bootstrap_export)
-
-    bootstrap_import_parser = bootstrap_subparsers.add_parser(
-        "import",
-        help="Import a bootstrap bundle into the local Eve runtime.",
-    )
-    bootstrap_import_parser.add_argument("bundle", help="Path to the bootstrap JSON bundle.")
-    bootstrap_import_parser.add_argument(
-        "--use-primary-ollama",
-        action="store_true",
-        help="Point this node at the primary machine's Ollama host instead of local Ollama.",
-    )
-    bootstrap_import_parser.add_argument(
-        "--pull-models",
-        action="store_true",
-        help="Pull the configured models into local Ollama after import.",
-    )
-    bootstrap_import_parser.add_argument(
-        "--ollama-pull-timeout-seconds",
-        type=int,
-        default=7200,
-        help="Per-model timeout when pulling models into local Ollama.",
-    )
-    bootstrap_import_parser.set_defaults(func=cmd_bootstrap_import)
-
-    bootstrap_pull_parser = bootstrap_subparsers.add_parser(
-        "pull",
-        help="Fetch the latest bootstrap payload from a primary Eve API and apply it locally.",
-    )
-    bootstrap_pull_parser.add_argument("--host", required=True, help="Primary Eve host or IP.")
-    bootstrap_pull_parser.add_argument("--api-port", type=int, default=8787, help="Primary Eve API port.")
-    bootstrap_pull_parser.add_argument("--ollama-port", type=int, default=11434, help="Primary Ollama API port.")
-    bootstrap_pull_parser.add_argument("--timeout", type=int, default=20, help="Bootstrap fetch timeout in seconds.")
-    bootstrap_pull_parser.add_argument(
-        "--include-code",
-        action="store_true",
-        help="Also pull and apply the primary machine's application code bundle with backups.",
-    )
-    bootstrap_pull_parser.add_argument(
-        "--code-timeout",
-        type=int,
-        default=60,
-        help="Code bundle download timeout in seconds.",
-    )
-    bootstrap_pull_parser.add_argument(
-        "--use-primary-ollama",
-        action="store_true",
-        help="Point this node at the primary machine's Ollama host instead of local Ollama.",
-    )
-    bootstrap_pull_parser.add_argument(
-        "--pull-models",
-        action="store_true",
-        help="Pull the configured models into local Ollama after the update.",
-    )
-    bootstrap_pull_parser.add_argument(
-        "--ollama-pull-timeout-seconds",
-        type=int,
-        default=7200,
-        help="Per-model timeout when pulling models into local Ollama.",
-    )
-    bootstrap_pull_parser.set_defaults(func=cmd_bootstrap_pull)
-
-    mind_parser = subparsers.add_parser("mind", help="Inspect or refresh Eve's short-horizon active mind.")
-    mind_subparsers = mind_parser.add_subparsers(dest="mind_command", required=True)
-
-    mind_show_parser = mind_subparsers.add_parser("show", help="Show Eve's latest active mind snapshot.")
-    mind_show_parser.set_defaults(func=cmd_mind_show)
-
-    mind_tick_parser = mind_subparsers.add_parser("tick", help="Refresh Eve's short-horizon active mind once.")
-    mind_tick_parser.add_argument("--model", help="Override model name.")
-    mind_tick_parser.add_argument("--max-tokens", type=int, help="Max tokens to predict.")
-    mind_tick_parser.set_defaults(func=cmd_mind_tick)
-
-    workspace_parser = subparsers.add_parser("workspace", help="Inspect or refresh Eve's canonical global workspace.")
-    workspace_subparsers = workspace_parser.add_subparsers(dest="workspace_command", required=True)
-
-    workspace_show_parser = workspace_subparsers.add_parser("show", help="Show Eve's current global workspace state.")
-    workspace_show_parser.add_argument("--runtime", action="store_true", help="Prefer the runtime bundle's workspace state.")
-    workspace_show_parser.add_argument("--full", action="store_true", help="Print fuller workspace detail.")
-    workspace_show_parser.set_defaults(func=cmd_workspace_show)
-
-    workspace_tick_parser = workspace_subparsers.add_parser("tick", help="Refresh Eve's canonical global workspace once.")
-    workspace_tick_parser.add_argument("--full", action="store_true", help="Print fuller workspace detail after the tick.")
-    workspace_tick_parser.set_defaults(func=cmd_workspace_tick)
-
-    sensory_parser = subparsers.add_parser(
-        "sensory",
-        help="Inspect or advance Eve's privacy-bounded concurrent selective-perception loop.",
-    )
-    sensory_subparsers = sensory_parser.add_subparsers(dest="sensory_command", required=True)
-
-    sensory_status_parser = sensory_subparsers.add_parser(
-        "status",
-        help="Show the current sensory frame, working set, habituation, and orienting proposal.",
-    )
-    sensory_status_parser.add_argument("--runtime", action="store_true", help="Prefer the live runtime sensory frame.")
-    sensory_status_parser.add_argument("--full", action="store_true", help="Show every admitted signal and privacy state.")
-    sensory_status_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    sensory_status_parser.set_defaults(func=cmd_sensory_status)
-
-    sensory_tick_parser = sensory_subparsers.add_parser(
-        "tick",
-        help="Sample admitted typed inputs once, compete them, and bind the result into recurrent state.",
-    )
-    sensory_tick_parser.add_argument("--full", action="store_true", help="Show every admitted signal and privacy state.")
-    sensory_tick_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    sensory_tick_parser.add_argument("--no-event", action="store_true", help="Do not append a changed-frame event to the local event spine.")
-    sensory_tick_parser.set_defaults(func=cmd_sensory_tick)
-
-    conscious_state_parser = subparsers.add_parser(
-        "conscious-state",
-        help="Inspect, advance, or causally ablate Eve's recurrent integrated conscious-state candidate.",
-    )
-    conscious_state_subparsers = conscious_state_parser.add_subparsers(dest="conscious_state_command", required=True)
-
-    conscious_state_show_parser = conscious_state_subparsers.add_parser("show", help="Show Eve's current recurrent conscious state.")
-    conscious_state_show_parser.add_argument("--runtime", action="store_true", help="Prefer the runtime bundle's conscious state.")
-    conscious_state_show_parser.add_argument("--full", action="store_true", help="Print coalitions, goals, affordances, calibration, and learning detail.")
-    conscious_state_show_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    conscious_state_show_parser.set_defaults(func=cmd_conscious_state_show)
-
-    conscious_state_cycle_parser = conscious_state_subparsers.add_parser("cycle", help="Run one full recurrent perception-to-intention cycle.")
-    conscious_state_cycle_parser.add_argument("--full", action="store_true", help="Print fuller cycle detail.")
-    conscious_state_cycle_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    conscious_state_cycle_parser.set_defaults(func=cmd_conscious_state_cycle)
-
-    conscious_state_ablate_parser = conscious_state_subparsers.add_parser(
-        "ablate",
-        help="Run matched causal lesions of workspace, self-model, memory, homeostasis, and recurrence.",
-    )
-    conscious_state_ablate_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime evidence.")
-    conscious_state_ablate_parser.add_argument("--full", action="store_true", help="Print causal preservation details.")
-    conscious_state_ablate_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    conscious_state_ablate_parser.set_defaults(func=cmd_conscious_state_ablate)
-
-    conscious_state_counterfactual_actions_parser = conscious_state_subparsers.add_parser(
-        "counterfactual-actions",
-        help="Hold the world and action menu fixed while intervening on the winning broadcast, then lesion the broadcast-to-action edge.",
-    )
-    conscious_state_counterfactual_actions_parser.add_argument("--full", action="store_true", help="Print per-check matched evidence.")
-    conscious_state_counterfactual_actions_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    conscious_state_counterfactual_actions_parser.set_defaults(func=cmd_conscious_state_counterfactual_actions)
-
-    conscious_state_longitudinal_parser = conscious_state_subparsers.add_parser(
-        "longitudinal",
-        help="Run a matched sequential recurrent-vs-nonrecurrent adaptation test.",
-    )
-    conscious_state_longitudinal_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime evidence as the matched test seed.")
-    conscious_state_longitudinal_parser.add_argument("--full", action="store_true", help="Print per-check matched evidence.")
-    conscious_state_longitudinal_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    conscious_state_longitudinal_parser.set_defaults(func=cmd_conscious_state_longitudinal)
-
-    conscious_state_durability_parser = conscious_state_subparsers.add_parser(
-        "durability",
-        help="Stress checkpoint integrity, time gaps, daemon epochs, conflicting evidence, regulatory surprise, and overlapping cycles.",
-    )
-    conscious_state_durability_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime evidence as the matched test seed.")
-    conscious_state_durability_parser.add_argument("--full", action="store_true", help="Print per-check durability evidence.")
-    conscious_state_durability_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    conscious_state_durability_parser.set_defaults(func=cmd_conscious_state_durability)
-
-    homeostasis_parser = subparsers.add_parser("homeostasis", help="Inspect Eve's concrete internal pressure model.")
-    homeostasis_subparsers = homeostasis_parser.add_subparsers(dest="homeostasis_command", required=True)
-
-    homeostasis_show_parser = homeostasis_subparsers.add_parser("show", help="Show Eve's current homeostasis state.")
-    homeostasis_show_parser.add_argument("--runtime", action="store_true", help="Prefer the runtime bundle's homeostasis state.")
-    homeostasis_show_parser.add_argument("--full", action="store_true", help="Print individual pressure details.")
-    homeostasis_show_parser.set_defaults(func=cmd_homeostasis_show)
-
-    meta_parser = subparsers.add_parser("meta", help="Inspect Eve's integrated self/world/relationship/homeostasis state.")
-    meta_subparsers = meta_parser.add_subparsers(dest="meta_command", required=True)
-
-    meta_check_parser = meta_subparsers.add_parser("check", help="Print the integrated meta-state bundle.")
-    meta_check_parser.add_argument("--runtime", action="store_true", help="Prefer the runtime bundle's saved meta-state.")
-    meta_check_parser.add_argument("--refresh", action="store_true", help="Refresh the workspace bundle before printing it.")
-    meta_check_parser.add_argument("--full", action="store_true", help="Print fuller workspace and pressure detail.")
-    meta_check_parser.set_defaults(func=cmd_meta_check)
-
-    version_parser = subparsers.add_parser("version", help="Track and inspect behavior snapshots for prompts and durable memory.")
-    version_subparsers = version_parser.add_subparsers(dest="version_command", required=True)
-
-    version_snapshot_parser = version_subparsers.add_parser("snapshot", help="Record a behavior snapshot if prompts or memory changed.")
-    version_snapshot_parser.add_argument("--source", default="manual", help="Short source label for why this snapshot is being recorded.")
-    version_snapshot_parser.add_argument("--note", help="Optional note about why the snapshot matters.")
-    version_snapshot_parser.add_argument("--force", action="store_true", help="Record a snapshot even if nothing changed.")
-    version_snapshot_parser.set_defaults(func=cmd_version_snapshot)
-
-    version_list_parser = version_subparsers.add_parser("list", help="List recent behavior snapshots.")
-    version_list_parser.add_argument("--limit", type=int, default=20, help="Max snapshots to print.")
-    version_list_parser.add_argument("--days", type=int, help="Only show recent snapshots.")
-    version_list_parser.add_argument("--source", help="Filter by snapshot source.")
-    version_list_parser.add_argument("--full", action="store_true", help="Print fuller snapshot details.")
-    version_list_parser.set_defaults(func=cmd_version_list)
-
-    version_show_parser = version_subparsers.add_parser("show", help="Show one behavior snapshot in detail.")
-    version_show_parser.add_argument("id", help="Version snapshot id.")
-    version_show_parser.set_defaults(func=cmd_version_show)
-
-    operator_parser = subparsers.add_parser("operator", help="Manage the user's broad bounded operator authorization for Eve.")
-    operator_subparsers = operator_parser.add_subparsers(dest="operator_command", required=True)
-
-    operator_status_parser = operator_subparsers.add_parser("status", help="Show the current operator authorization.")
-    operator_status_parser.add_argument("--runtime", action="store_true", help="Prefer the live runtime authorization file.")
-    operator_status_parser.add_argument("--full", action="store_true", help="Show allowed and still-gated action categories.")
-    operator_status_parser.set_defaults(func=cmd_operator_status)
-
-    operator_grant_parser = operator_subparsers.add_parser("grant", help="Grant Eve broad bounded action authorization for a bounded time.")
-    operator_grant_parser.add_argument("--minutes", type=int, help="How long the grant should last. Clamped by config max.")
-    operator_grant_parser.add_argument("--scope", choices=sorted(OPERATOR_AUTHORIZATION_SCOPES.keys()), default="broad_safe", help="Authorization scope.")
-    operator_grant_parser.add_argument("--granted-by", default="user", help="Who granted authorization.")
-    operator_grant_parser.add_argument("--note", default="", help="Short reason or boundary note.")
-    operator_grant_parser.add_argument("--force", action="store_true", help="Override the manual-probe gate for unharnessed_local_trust.")
-    operator_grant_parser.set_defaults(func=cmd_operator_grant)
-
-    operator_revoke_parser = operator_subparsers.add_parser("revoke", help="Revoke Eve's active operator authorization.")
-    operator_revoke_parser.add_argument("--note", default="", help="Short note explaining the revoke.")
-    operator_revoke_parser.set_defaults(func=cmd_operator_revoke)
-
-    operator_requests_parser = operator_subparsers.add_parser("requests", help="List gated action permission requests.")
-    operator_requests_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime permission requests.")
-    operator_requests_parser.add_argument("--limit", type=int, default=10, help="Maximum requests to show.")
-    operator_requests_parser.add_argument("--status", choices=["pending", "approved", "rejected", "executed", "cancelled"], help="Filter by request status.")
-    operator_requests_parser.add_argument("--full", action="store_true", help="Show thread/message and approval details.")
-    operator_requests_parser.set_defaults(func=cmd_operator_requests)
-
-    operator_freedom_parser = operator_subparsers.add_parser("freedom", help="Evaluate whether Eve may execute an action under the current freedom policy.")
-    operator_freedom_parser.add_argument("--action", required=True, help="Operational action name, for example service_health_check or open_slack_app.")
-    operator_freedom_parser.add_argument("--source", default="manual", help="Where the action would originate, for example chat_local_app or autonomy_free_run:test.")
-    operator_freedom_parser.add_argument("--mode", choices=sorted(FREEDOM_POLICY_MODES), help="Override the inferred policy mode.")
-    operator_freedom_parser.add_argument("--prompt", default="", help="Optional current the user directive text to evaluate.")
-    operator_freedom_parser.add_argument("--json", action="store_true", help="Print machine-readable policy JSON.")
-    operator_freedom_parser.set_defaults(func=cmd_operator_freedom)
-
-    operator_approve_parser = operator_subparsers.add_parser("approve", help="Approve one gated action permission request.")
-    operator_approve_parser.add_argument("id", help="Permission request id or unique prefix.")
-    operator_approve_parser.add_argument("--approved-by", default="user", help="Who approved the request.")
-    operator_approve_parser.add_argument("--note", default="", help="Approval note or narrowed boundary.")
-    operator_approve_parser.set_defaults(func=cmd_operator_approve)
-
-    operator_reject_parser = operator_subparsers.add_parser("reject", help="Reject one gated action permission request.")
-    operator_reject_parser.add_argument("id", help="Permission request id or unique prefix.")
-    operator_reject_parser.add_argument("--note", default="", help="Rejection note.")
-    operator_reject_parser.set_defaults(func=cmd_operator_reject)
-
-    autonomy_parser = subparsers.add_parser("autonomy", help="Inspect or change Eve's staged autonomy gates.")
-    autonomy_subparsers = autonomy_parser.add_subparsers(dest="autonomy_command", required=True)
-
-    autonomy_show_parser = autonomy_subparsers.add_parser("show", help="Show Eve's current autonomy stage and blockers.")
-    autonomy_show_parser.set_defaults(func=cmd_autonomy_show)
-
-    autonomy_set_parser = autonomy_subparsers.add_parser("set", help="Move Eve to a different autonomy stage.")
-    autonomy_set_parser.add_argument("stage", choices=AUTONOMY_STAGES, help="Target autonomy stage.")
-    autonomy_set_parser.add_argument("--note", help="Optional note about why the stage changed.")
-    autonomy_set_parser.add_argument("--force", action="store_true", help="Override current blockers deliberately.")
-    autonomy_set_parser.set_defaults(func=cmd_autonomy_set)
-
-    autonomy_free_run_parser = autonomy_subparsers.add_parser(
-        "free-run",
-        help="Let Eve choose bounded actions for an observation window while logging every step.",
-    )
-    autonomy_free_run_parser.add_argument("--minutes", type=int, default=5, help="How long the free-run should last.")
-    autonomy_free_run_parser.add_argument("--sample-seconds", type=int, default=20, help="How often to write monitor samples.")
-    autonomy_free_run_parser.add_argument("--max-actions", type=int, help="Maximum Eve-chosen actions during the run. Defaults to a time-scaled action cap.")
-    autonomy_free_run_parser.add_argument("--id", help="Optional run id. Defaults to a timestamped id.")
-    autonomy_free_run_parser.add_argument(
-        "--style",
-        choices=AUTONOMY_FREE_RUN_STYLES,
-        default=DEFAULT_CONFIG["autonomy_free_run_default_style"],
-        help="Whether the run should bias toward grounded stabilization or open-ended exploration.",
-    )
-    autonomy_free_run_parser.set_defaults(func=cmd_autonomy_free_run)
-
-    autonomy_latest_parser = autonomy_subparsers.add_parser(
-        "latest",
-        help="Show the latest autonomy run summary.",
-    )
-    autonomy_latest_parser.add_argument("--runtime", action="store_true", help="Prefer runtime-bundle autonomy artifacts.")
-    autonomy_latest_parser.add_argument("--full", action="store_true", help="Show fuller action and claim-audit detail.")
-    autonomy_latest_parser.set_defaults(func=cmd_autonomy_latest)
-
-    autonomy_runs_parser = autonomy_subparsers.add_parser(
-        "runs",
-        help="List recent autonomy run summaries.",
-    )
-    autonomy_runs_parser.add_argument("--runtime", action="store_true", help="Prefer runtime-bundle autonomy artifacts.")
-    autonomy_runs_parser.add_argument("--limit", type=int, default=5, help="How many recent runs to show.")
-    autonomy_runs_parser.add_argument("--full", action="store_true", help="Show fuller detail for each run.")
-    autonomy_runs_parser.set_defaults(func=cmd_autonomy_runs)
-
-    access_parser = subparsers.add_parser(
-        "access",
-        help="Report Eve's built-in local/project organ access and provenance boundaries.",
-    )
-    access_subparsers = access_parser.add_subparsers(dest="access_command", required=True)
-
-    access_status_parser = access_subparsers.add_parser(
-        "status",
-        help="Build and save Eve's built-in access report.",
-    )
-    access_status_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime artifacts where available.")
-    access_status_parser.add_argument("--full", action="store_true", help="Show every built-in layer and command path.")
-    access_status_parser.add_argument("--json", action="store_true", help="Print the full report as JSON.")
-    access_status_parser.add_argument("--no-save", action="store_true", help="Do not write .eve/built_in_access.json.")
-    access_status_parser.add_argument("--no-probes", action="store_true", help="Skip bounded external CLI probes such as DVC/Beads/Dagster.")
-    access_status_parser.set_defaults(func=cmd_access_status)
-
-    lab_live_parser = subparsers.add_parser(
-        "lab-live",
-        help="Report which lab/staged Eve substrates are actually live, canary-only, or still gated.",
-    )
-    lab_live_subparsers = lab_live_parser.add_subparsers(dest="lab_live_command", required=True)
-
-    lab_live_status_parser = lab_live_subparsers.add_parser(
-        "status",
-        help="Build and save Eve's lab-live activation report.",
-    )
-    lab_live_status_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime artifacts where available.")
-    lab_live_status_parser.add_argument("--full", action="store_true", help="Show every layer and next action.")
-    lab_live_status_parser.add_argument("--json", action="store_true", help="Print the full report as JSON.")
-    lab_live_status_parser.add_argument("--no-save", action="store_true", help="Do not write .eve/lab_live_activation.json.")
-    lab_live_status_parser.add_argument("--no-probes", action="store_true", help="Skip bounded external CLI probes such as DVC/Beads/Dagster.")
-    lab_live_status_parser.set_defaults(func=cmd_lab_live_status)
-
-    safety_parser = subparsers.add_parser("safety", help="Run rollback, restricted-mode, permission, and release-readiness drills.")
-    safety_subparsers = safety_parser.add_subparsers(dest="safety_command", required=True)
-
-    safety_drills_parser = safety_subparsers.add_parser(
-        "drills",
-        help="Audit rollback and restricted-mode paths before promoting risky changes.",
-    )
-    safety_drills_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime artifacts where available.")
-    safety_drills_parser.add_argument("--full", action="store_true", help="Print every drill with rollback and restricted-mode paths.")
-    safety_drills_parser.add_argument("--json", action="store_true", help="Print the full drill report as JSON.")
-    safety_drills_parser.add_argument("--no-save", action="store_true", help="Do not write latest/history artifacts.")
-    safety_drills_parser.set_defaults(func=cmd_safety_drills)
-
-    perf_parser = subparsers.add_parser("perf", help="Inspect Eve runtime performance signals and probe the local API.")
-    perf_subparsers = perf_parser.add_subparsers(dest="perf_command", required=True)
-
-    perf_summary_parser = perf_subparsers.add_parser("summary", help="Summarize recorded performance events.")
-    perf_summary_parser.add_argument("--limit", type=int, default=300, help="Max events to inspect.")
-    perf_summary_parser.add_argument("--minutes", type=int, default=240, help="Only inspect recent events from this time window.")
-    perf_summary_parser.add_argument("--category", help="Filter by event category, such as `model_call` or `api_probe`.")
-    perf_summary_parser.add_argument("--name", help="Filter by event name, such as `reflection` or `status`.")
-    perf_summary_parser.add_argument("--failures", action="store_true", help="Show only failed events.")
-    perf_summary_parser.add_argument("--failure-limit", type=int, default=5, help="How many recent failures to print.")
-    perf_summary_parser.set_defaults(func=cmd_perf_summary)
-
-    perf_probe_parser = perf_subparsers.add_parser("probe", help="Actively measure the local Eve API endpoints.")
-    perf_probe_parser.add_argument("--host", default="127.0.0.1", help="Host running the Eve API.")
-    perf_probe_parser.add_argument("--port", type=int, default=8787, help="Port running the Eve API.")
-    perf_probe_parser.add_argument("--repeat", type=int, default=3, help="How many probe passes to run.")
-    perf_probe_parser.add_argument("--timeout", type=int, default=5, help="Per-request timeout in seconds.")
-    perf_probe_parser.add_argument("--failure-limit", type=int, default=5, help="How many failures to print if probing fails.")
-    perf_probe_parser.set_defaults(func=cmd_perf_probe)
-
-    infra_parser = subparsers.add_parser("infra", help="Inspect Eve's runtime substrate, tracing, metrics, and model governor.")
-    infra_subparsers = infra_parser.add_subparsers(dest="infra_command", required=True)
-
-    infra_status_parser = infra_subparsers.add_parser("status", help="Show SQLite, memory-note, trace, and governor status.")
-    infra_status_parser.set_defaults(func=cmd_infra_status)
-
-    infra_metrics_parser = infra_subparsers.add_parser("metrics", help="Scrape llama.cpp /metrics endpoints into the operational store.")
-    infra_metrics_parser.add_argument("--timeout", type=int, default=3, help="Per-lane metrics scrape timeout in seconds.")
-    infra_metrics_parser.add_argument("--full", action="store_true", help="Print a sample of captured metric names and values.")
-    infra_metrics_parser.set_defaults(func=cmd_infra_metrics)
-
-    infra_trace_export_parser = infra_subparsers.add_parser(
-        "trace-export",
-        help="Export local operational spans as OpenInference-shaped JSONL without requiring a collector.",
-    )
-    infra_trace_export_parser.add_argument("--limit", type=int, default=200, help="Maximum spans to export.")
-    infra_trace_export_parser.add_argument("--trace-id", default="", help="Filter to one Eve trace id.")
-    infra_trace_export_parser.add_argument("--category", default="", help="Filter by Eve span category.")
-    infra_trace_export_parser.add_argument("--runtime", action="store_true", help="Prefer the live runtime operational database.")
-    infra_trace_export_parser.add_argument("--output", default="", help="Output JSONL path. Defaults to .eve/trace_exports/latest_openinference.jsonl.")
-    infra_trace_export_parser.add_argument("--no-save", action="store_true", help="Build the report without writing JSONL.")
-    infra_trace_export_parser.add_argument("--full", action="store_true", help="Print provenance and privacy details.")
-    infra_trace_export_parser.add_argument("--json", action="store_true", help="Print raw JSON report.")
-    infra_trace_export_parser.set_defaults(func=cmd_infra_trace_export)
-
-    infra_events_parser = infra_subparsers.add_parser("events", help="List canonical typed events from the operational event spine.")
-    infra_events_parser.add_argument("--limit", type=int, default=25, help="Maximum events to show.")
-    infra_events_parser.add_argument("--stream", default="", help="Filter by event stream.")
-    infra_events_parser.add_argument("--kind", default="", help="Filter by event kind.")
-    infra_events_parser.add_argument("--correlation-id", default="", help="Filter by correlation id.")
-    infra_events_parser.add_argument("--json", action="store_true", help="Print raw JSON records.")
-    infra_events_parser.set_defaults(func=cmd_infra_events)
-
-    infra_event_contract_parser = infra_subparsers.add_parser("event-contract", help="Print the typed event contract for other runtimes.")
-    infra_event_contract_parser.set_defaults(func=cmd_infra_event_contract)
-
-    infra_nervous_parser = infra_subparsers.add_parser(
-        "nervous",
-        help="Run the experimental Go nervous-system worker against the typed event spine.",
-    )
-    infra_nervous_parser.add_argument(
-        "nervous_action",
-        choices=["heartbeat", "enqueue", "once", "run", "result", "sense"],
-        help="Worker action to run.",
-    )
-    infra_nervous_parser.add_argument("--runtime", action="store_true", help="Use the live runtime operational database.")
-    infra_nervous_parser.add_argument("--timeout", type=int, default=30, help="Worker timeout in seconds.")
-    infra_nervous_parser.add_argument("--json", action="store_true", help="Print worker JSON output.")
-    infra_nervous_parser.add_argument("--tool", default="echo", help="Tool name for enqueue.")
-    infra_nervous_parser.add_argument("--message", default="", help="Message for enqueue/result.")
-    infra_nervous_parser.add_argument("--duration", type=int, default=30, help="Run-loop duration in seconds.")
-    infra_nervous_parser.add_argument("--interval", type=int, default=1, help="Delay after a processed job, in seconds.")
-    infra_nervous_parser.add_argument("--idle-backoff", type=int, default=2, help="Delay when no job is available, in seconds.")
-    infra_nervous_parser.add_argument("--heartbeat-interval", type=int, default=15, help="Run-loop heartbeat cadence in seconds.")
-    infra_nervous_parser.add_argument("--max-jobs", type=int, default=10, help="Maximum jobs to process during a run. Use 0 for duration-only.")
-    infra_nervous_parser.add_argument("--subject", default="manual", help="Subject for result.")
-    infra_nervous_parser.add_argument("--status", default="completed", help="Status for result.")
-    infra_nervous_parser.add_argument("--modality", choices=["auditory", "visual", "proprioceptive"], help="Typed sensory modality for sense.")
-    infra_nervous_parser.add_argument("--session", default="", help="Active explicit sensory-session id for sense.")
-    infra_nervous_parser.add_argument("--session-token-env", default="EVE_SENSORY_SESSION_TOKEN", help="Environment variable containing the session token; the token is never accepted on argv.")
-    infra_nervous_parser.add_argument("--session-token-file", default="", help="Optional mode-0600 file containing the session token.")
-    infra_nervous_parser.add_argument("--permission", action="store_true", help="Assert current OS/device permission for auditory or visual input.")
-    infra_nervous_parser.add_argument("--sensor-source", default="go_private_device_adapter", help="Low-entropy admitted sensor-source identifier.")
-    infra_nervous_parser.add_argument("--features-json", default="{}", help="Fixed-schema feature JSON only; raw media/text is rejected by the worker.")
-    infra_nervous_parser.add_argument("--intensity", type=float, default=35.0)
-    infra_nervous_parser.add_argument("--novelty", type=float, default=50.0)
-    infra_nervous_parser.add_argument("--change", type=float, default=0.0)
-    infra_nervous_parser.add_argument("--urgency", type=float, default=20.0)
-    infra_nervous_parser.add_argument("--goal-relevance", type=float, default=35.0)
-    infra_nervous_parser.add_argument("--self-relevance", type=float, default=35.0)
-    infra_nervous_parser.add_argument("--social-relevance", type=float, default=0.0)
-    infra_nervous_parser.add_argument("--precision", type=float, default=70.0)
-    infra_nervous_parser.set_defaults(func=cmd_infra_nervous)
-
-    oss_parser = subparsers.add_parser(
-        "oss",
-        help="Inspect and run Eve's governed OSS trace/eval/dataset/trainer improvement substrate.",
-    )
-    oss_subparsers = oss_parser.add_subparsers(dest="oss_command", required=True)
-
-    oss_status_parser = oss_subparsers.add_parser("status", help="Show Eve's OSS improvement substrate status.")
-    oss_status_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime artifacts where available.")
-    oss_status_parser.add_argument("--service-preflight", action="store_true", help="Run a bounded service preflight instead of reading the latest lab report.")
-    oss_status_parser.add_argument("--verify-trainer-envs", action="store_true", help="Verify isolated trainer lab CLIs/imports; can take longer.")
-    oss_status_parser.add_argument("--no-save", action="store_true", help="Do not write .eve/oss_integration/latest.json.")
-    oss_status_parser.add_argument("--full", action="store_true", help="Print readiness check detail.")
-    oss_status_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    oss_status_parser.set_defaults(func=cmd_oss_status)
-
-    oss_copilotkit_parser = oss_subparsers.add_parser(
-        "copilotkit",
-        help="Inspect or refresh CopilotKit as Eve's UI/AG-UI exposure candidate.",
-    )
-    oss_copilotkit_parser.add_argument("--refresh", action="store_true", help="Refresh the CopilotKit probe instead of reading the latest artifact.")
-    oss_copilotkit_parser.add_argument("--mirror", action="store_true", help="Refresh the local ignored upstream mirror during --refresh.")
-    oss_copilotkit_parser.add_argument("--install-npm-lab", action="store_true", help="Install CopilotKit packages in Eve's isolated npm lab during --refresh.")
-    oss_copilotkit_parser.add_argument("--import-probe", action="store_true", help="Run the Node import/adapter construction probe during --refresh.")
-    oss_copilotkit_parser.add_argument("--probe-eve-backend", action="store_true", help="Send one compatibility request through Eve's local /v1 chat backend during --refresh.")
-    oss_copilotkit_parser.add_argument("--eve-base-url", default="", help="Override Eve's local OpenAI-compatible base URL.")
-    oss_copilotkit_parser.add_argument("--npm-timeout", type=int, default=240, help="Timeout for isolated npm install.")
-    oss_copilotkit_parser.add_argument("--mirror-timeout", type=int, default=300, help="Timeout for mirror fetch/clone.")
-    oss_copilotkit_parser.add_argument("--eve-timeout", type=int, default=45, help="Timeout for Eve backend probe.")
-    oss_copilotkit_parser.add_argument("--no-save", action="store_true", help="Do not write CopilotKit latest/exposure artifacts.")
-    oss_copilotkit_parser.add_argument("--full", action="store_true", help="Print every exposure surface.")
-    oss_copilotkit_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    oss_copilotkit_parser.set_defaults(func=cmd_oss_copilotkit)
-
-    oss_cycle_parser = oss_subparsers.add_parser(
-        "cycle",
-        help="Run one bounded OSS integration cycle: trace, dataset, manifest, recipes, workflow, and public eval.",
-    )
-    oss_cycle_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime state when reading source evidence.")
-    oss_cycle_parser.add_argument("--trace-limit", type=int, default=200, help="Maximum operational spans to export.")
-    oss_cycle_parser.add_argument("--dataset-source", choices=sorted(TRAINING_DATASET_SOURCES), default="verified-failures", help="Training dataset source policy.")
-    oss_cycle_parser.add_argument("--dataset-limit", type=int, default=400, help="Maximum curated training examples.")
-    oss_cycle_parser.add_argument("--no-build-dataset", action="store_true", help="Use the latest dataset instead of rebuilding it.")
-    oss_cycle_parser.add_argument("--no-write-trainer-recipes", action="store_true", help="Do not refresh no-training trainer recipes.")
-    oss_cycle_parser.add_argument("--verify-trainer-envs", action="store_true", help="Verify isolated trainer lab environments.")
-    oss_cycle_parser.add_argument("--service-preflight", action="store_true", help="Also run a bounded Phoenix/Langfuse service preflight.")
-    oss_cycle_parser.add_argument("--no-pressure-eval", action="store_true", help="Skip the public conversation pressure eval during this cycle.")
-    oss_cycle_parser.add_argument("--pressure-live-chat", action="store_true", help="Run pressure cases through journaling live chat instead of private-audit chat.")
-    oss_cycle_parser.add_argument("--pressure-limit", type=int, default=4, help="Maximum public pressure cases to run.")
-    oss_cycle_parser.add_argument("--pressure-timeout", type=int, default=60, help="Timeout per pressure chat case in seconds.")
-    oss_cycle_parser.add_argument("--no-trainer-dry-run", action="store_true", help="Skip the no-download trainer dry-run gate during this cycle.")
-    oss_cycle_parser.add_argument("--trainer-base-model", default="", help="Approved local base model path for the trainer gate.")
-    oss_cycle_parser.add_argument("--no-save", action="store_true", help="Do not write cycle artifacts or event-ledger evidence.")
-    oss_cycle_parser.add_argument("--full", action="store_true", help="Print artifact and boundary detail.")
-    oss_cycle_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    oss_cycle_parser.set_defaults(func=cmd_oss_cycle)
-
-    oss_eval_parser = oss_subparsers.add_parser("eval", help="Run Eve's public OSS improvement eval gate.")
-    oss_eval_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime artifacts where available.")
-    oss_eval_parser.add_argument("--run-pressure-eval", action="store_true", help="Run the public conversation pressure eval before scoring.")
-    oss_eval_parser.add_argument("--pressure-live-chat", action="store_true", help="Run pressure cases through journaling live chat instead of private-audit chat.")
-    oss_eval_parser.add_argument("--pressure-limit", type=int, default=4, help="Maximum public pressure cases to run.")
-    oss_eval_parser.add_argument("--pressure-timeout", type=int, default=60, help="Timeout per pressure chat case in seconds.")
-    oss_eval_parser.add_argument("--run-trainer-dry-run", action="store_true", help="Run the no-download trainer dry-run gate before scoring.")
-    oss_eval_parser.add_argument("--trainer-base-model", default="", help="Approved local base model path for the trainer gate.")
-    oss_eval_parser.add_argument("--no-save", action="store_true", help="Do not write eval artifacts or event-ledger evidence.")
-    oss_eval_parser.add_argument("--full", action="store_true", help="Print each public check.")
-    oss_eval_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    oss_eval_parser.set_defaults(func=cmd_oss_eval)
-
-    oss_pressure_parser = oss_subparsers.add_parser(
-        "pressure-eval",
-        help="Run public conversation pressure cases through Eve's chat surface and score them.",
-    )
-    oss_pressure_parser.add_argument("--runtime", action="store_true", help="Reserved for future runtime-bundle chat execution.")
-    oss_pressure_parser.add_argument("--live-chat", action="store_true", help="Use journaling live chat instead of private-audit chat.")
-    oss_pressure_parser.add_argument("--limit", type=int, default=4, help="Maximum public pressure cases to run.")
-    oss_pressure_parser.add_argument("--timeout", type=int, default=60, help="Timeout per pressure chat case in seconds.")
-    oss_pressure_parser.add_argument("--max-tokens", type=int, default=220, help="Maximum generated tokens per pressure case.")
-    oss_pressure_parser.add_argument("--no-save", action="store_true", help="Do not write pressure eval artifacts or event-ledger evidence.")
-    oss_pressure_parser.add_argument("--full", action="store_true", help="Print per-case details.")
-    oss_pressure_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    oss_pressure_parser.set_defaults(func=cmd_oss_pressure_eval)
-
-    oss_trainer_dry_run_parser = oss_subparsers.add_parser(
-        "trainer-dry-run",
-        help="Run Eve's no-download trainer dry-run gate against the generated recipe and isolated trainer venv.",
-    )
-    oss_trainer_dry_run_parser.add_argument("--runtime", action="store_true", help="Prefer runtime-mirrored recipes where available.")
-    oss_trainer_dry_run_parser.add_argument("--trainer", default="mlx_lm", help="Trainer id. Currently mlx_lm is the implemented gate.")
-    oss_trainer_dry_run_parser.add_argument("--base-model", default="", help="Approved local base model path. No downloads are attempted.")
-    oss_trainer_dry_run_parser.add_argument("--timeout", type=int, default=30, help="Trainer CLI help timeout in seconds.")
-    oss_trainer_dry_run_parser.add_argument("--no-save", action="store_true", help="Do not write trainer dry-run artifacts or event-ledger evidence.")
-    oss_trainer_dry_run_parser.add_argument("--full", action="store_true", help="Print trainer env and CLI details.")
-    oss_trainer_dry_run_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    oss_trainer_dry_run_parser.set_defaults(func=cmd_oss_trainer_dry_run)
-
-    oss_dvc_parser = oss_subparsers.add_parser(
-        "dvc-snapshot",
-        help="Write or inspect a DVC-ready local dataset manifest without initializing DVC metadata.",
-    )
-    oss_dvc_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime artifacts where available.")
-    oss_dvc_parser.add_argument("--write", action="store_true", help="Write .eve/oss_integration/dvc_dataset_manifest.json.")
-    oss_dvc_parser.add_argument("--full", action="store_true", help="Print file-level hashes/counts.")
-    oss_dvc_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    oss_dvc_parser.set_defaults(func=cmd_oss_dvc_snapshot)
-
-    governance_parser = subparsers.add_parser(
-        "governance",
-        help="Inspect Eve's organ-system event/proposal envelopes and CIK review gates.",
-    )
-    governance_subparsers = governance_parser.add_subparsers(dest="governance_command", required=True)
-
-    governance_contract_parser = governance_subparsers.add_parser(
-        "contract",
-        help="Print the event/proposal governance contract.",
-    )
-    governance_contract_parser.set_defaults(func=cmd_governance_contract)
-
-    governance_events_parser = governance_subparsers.add_parser(
-        "events",
-        help="Normalize recent existing ledgers into EveEvent envelopes without migrating them.",
-    )
-    governance_events_parser.add_argument("--limit", type=int, default=40, help="Maximum normalized events to show.")
-    governance_events_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime ledgers when available.")
-    governance_events_parser.add_argument("--full", action="store_true", help="Include compact payload detail.")
-    governance_events_parser.add_argument("--json", action="store_true", help="Print raw JSON envelopes.")
-    governance_events_parser.set_defaults(func=cmd_governance_events)
-
-    governance_event_ledger_parser = governance_subparsers.add_parser(
-        "event-ledger",
-        help="Inspect or rebuild Eve's canonical event ledger at .eve/event_ledger.jsonl.",
-    )
-    governance_event_ledger_parser.add_argument("--limit", type=int, default=40, help="Maximum events to inspect or rebuild from.")
-    governance_event_ledger_parser.add_argument("--runtime", action="store_true", help="Prefer the live runtime ledger when reading.")
-    governance_event_ledger_parser.add_argument("--status", action="store_true", help="Show ledger counts instead of event rows.")
-    governance_event_ledger_parser.add_argument("--rebuild", action="store_true", help="Rebuild the canonical ledger from normalized existing ledgers.")
-    governance_event_ledger_parser.add_argument("--dry-run", action="store_true", help="Preview rebuild without writing.")
-    governance_event_ledger_parser.add_argument("--full", action="store_true", help="Include compact payload detail.")
-    governance_event_ledger_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    governance_event_ledger_parser.set_defaults(func=cmd_governance_event_ledger)
-
-    governance_daily_review_parser = governance_subparsers.add_parser(
-        "daily-review",
-        help="Record a daily governance review over event ledger, proposals, and watcher state.",
-    )
-    governance_daily_review_parser.add_argument("--limit", type=int, default=80, help="Maximum proposals/events to inspect.")
-    governance_daily_review_parser.add_argument("--no-save", action="store_true", help="Print the review without writing an artifact or event.")
-    governance_daily_review_parser.add_argument("--full", action="store_true", help="Include watcher and lifecycle detail.")
-    governance_daily_review_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    governance_daily_review_parser.set_defaults(func=cmd_governance_daily_review)
-
-    governance_skill_audit_parser = governance_subparsers.add_parser(
-        "skill-audit",
-        help="Audit SkillPatchProposal records without enabling any skill.",
-    )
-    governance_skill_audit_parser.add_argument("--limit", type=int, default=120, help="Maximum skill proposals to inspect.")
-    governance_skill_audit_parser.add_argument("--no-save", action="store_true", help="Print the audit without writing an artifact or event.")
-    governance_skill_audit_parser.add_argument("--full", action="store_true", help="Include finding detail.")
-    governance_skill_audit_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    governance_skill_audit_parser.set_defaults(func=cmd_governance_skill_audit)
-
-    governance_queue_parser = governance_subparsers.add_parser(
-        "queue",
-        help="List reviewed governance proposals without applying them.",
-    )
-    governance_queue_parser.add_argument("--limit", type=int, default=40, help="Maximum proposals to show.")
-    governance_queue_parser.add_argument("--decision", default="", help="Filter by review decision, such as reject or test_first.")
-    governance_queue_parser.add_argument("--proposal-type", default="", help="Filter by proposal type.")
-    governance_queue_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime queue when available.")
-    governance_queue_parser.add_argument("--full", action="store_true", help="Include payload and findings.")
-    governance_queue_parser.add_argument("--json", action="store_true", help="Print raw JSON queue records.")
-    governance_queue_parser.set_defaults(func=cmd_governance_queue)
-
-    governance_watchers_parser = governance_subparsers.add_parser(
-        "watchers",
-        help="Generate watcher reports over governance proposals and recent untrusted observations.",
-    )
-    governance_watchers_parser.add_argument("--limit", type=int, default=40, help="Maximum proposals/events to inspect.")
-    governance_watchers_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime queue/ledgers when available.")
-    governance_watchers_parser.add_argument("--no-events", action="store_true", help="Only inspect queued proposals.")
-    governance_watchers_parser.add_argument("--full", action="store_true", help="Include watcher warning detail.")
-    governance_watchers_parser.add_argument("--json", action="store_true", help="Print raw JSON watcher report.")
-    governance_watchers_parser.set_defaults(func=cmd_governance_watchers)
-
-    governance_ingest_hermes_parser = governance_subparsers.add_parser(
-        "ingest-hermes",
-        help="Ingest strict Hermes-style learning proposals into the governance queue without applying them.",
-    )
-    governance_ingest_hermes_parser.add_argument("--source", default="hermes", help="Proposal source label.")
-    governance_ingest_hermes_parser.add_argument("--file", default="", help="JSON file to read, or '-' for stdin.")
-    governance_ingest_hermes_parser.add_argument("--payload-json", default="", help="JSON object/list containing strict proposals.")
-    governance_ingest_hermes_parser.add_argument("--dry-run", action="store_true", help="Review without storing proposals.")
-    governance_ingest_hermes_parser.add_argument("--full", action="store_true", help="Include payload and findings.")
-    governance_ingest_hermes_parser.add_argument("--json", action="store_true", help="Print raw JSON ingest result.")
-    governance_ingest_hermes_parser.set_defaults(func=cmd_governance_ingest_hermes)
-
-    governance_ingest_codex_parser = governance_subparsers.add_parser(
-        "ingest-codex",
-        help="Ingest strict Codex code-patch proposals into the governance queue without applying them.",
-    )
-    governance_ingest_codex_parser.add_argument("--source", default="codex", help="Proposal source label.")
-    governance_ingest_codex_parser.add_argument("--file", default="", help="JSON file to read, or '-' for stdin.")
-    governance_ingest_codex_parser.add_argument("--payload-json", default="", help="JSON object/list containing strict CodePatchProposal records.")
-    governance_ingest_codex_parser.add_argument("--dry-run", action="store_true", help="Review without storing proposals.")
-    governance_ingest_codex_parser.add_argument("--full", action="store_true", help="Include payload and findings.")
-    governance_ingest_codex_parser.add_argument("--json", action="store_true", help="Print raw JSON ingest result.")
-    governance_ingest_codex_parser.set_defaults(func=cmd_governance_ingest_codex)
-
-    def add_governance_proposal_args(target_parser: argparse.ArgumentParser) -> None:
-        target_parser.add_argument(
-            "--proposal-type",
-            required=True,
-            choices=sorted(eve_governance.PROPOSAL_TYPES),
-            help="Typed proposal class to review or queue.",
-        )
-        target_parser.add_argument("--source", required=True, help="Organ or channel proposing the change.")
-        target_parser.add_argument(
-            "--cik-zone",
-            default="",
-            choices=["", *sorted(eve_governance.CIK_ZONES)],
-            help="Protected target zone. Defaults from proposal type.",
-        )
-        target_parser.add_argument(
-            "--source-cik-zone",
-            default="",
-            choices=["", *sorted(eve_governance.CIK_ZONES)],
-            help="Protected source zone. Defaults from source name.",
-        )
-        target_parser.add_argument("--risk-level", type=int, help="Risk level from 0 to 5.")
-        target_parser.add_argument(
-            "--requires-approval",
-            action="store_true",
-            default=None,
-            help="Mark this proposal as requiring explicit approval.",
-        )
-        target_parser.add_argument("--evidence", action="append", default=[], help="Evidence/event reference. Repeatable.")
-        target_parser.add_argument("--permission", action="append", default=[], help="Permission used or requested. Repeatable.")
-        target_parser.add_argument("--claim", default="", help="Human-readable claim or memory patch text.")
-        target_parser.add_argument("--tests", action="append", default=[], help="Required or proposed test id. Repeatable.")
-        target_parser.add_argument("--rollback-plan", default="", help="Rollback plan for code/capability proposals.")
-        target_parser.add_argument("--payload-json", default="", help="Additional proposal payload JSON object.")
-
-    governance_review_parser = governance_subparsers.add_parser(
-        "review",
-        help="Review a typed proposal without writing it.",
-    )
-    add_governance_proposal_args(governance_review_parser)
-    governance_review_parser.add_argument("--json", action="store_true", help="Print raw JSON review.")
-    governance_review_parser.set_defaults(func=cmd_governance_review)
-
-    governance_enqueue_parser = governance_subparsers.add_parser(
-        "enqueue",
-        help="Append a reviewed proposal to the governance proposal queue without accepting it.",
-    )
-    add_governance_proposal_args(governance_enqueue_parser)
-    governance_enqueue_parser.add_argument("--json", action="store_true", help="Print raw JSON queue record.")
-    governance_enqueue_parser.set_defaults(func=cmd_governance_enqueue)
-
-    governance_approve_parser = governance_subparsers.add_parser(
-        "approve",
-        help="Record explicit approval for a governance proposal without applying it.",
-    )
-    governance_approve_parser.add_argument("proposal_id", help="Queued governance proposal id.")
-    governance_approve_parser.add_argument("--approved-by", default="user", help="Who approved the proposal.")
-    governance_approve_parser.add_argument("--reason", default="", help="Short approval reason or boundary.")
-    governance_approve_parser.add_argument("--dry-run", action="store_true", help="Check approval gates without writing.")
-    governance_approve_parser.add_argument("--full", action="store_true", help="Include proposal detail.")
-    governance_approve_parser.add_argument("--json", action="store_true", help="Print raw JSON approval result.")
-    governance_approve_parser.set_defaults(func=cmd_governance_approve)
-
-    governance_reject_parser = governance_subparsers.add_parser(
-        "reject",
-        help="Record explicit rejection for a governance proposal.",
-    )
-    governance_reject_parser.add_argument("proposal_id", help="Queued governance proposal id.")
-    governance_reject_parser.add_argument("--rejected-by", default="user", help="Who rejected the proposal.")
-    governance_reject_parser.add_argument("--reason", default="", help="Short rejection reason.")
-    governance_reject_parser.add_argument("--dry-run", action="store_true", help="Check rejection gates without writing.")
-    governance_reject_parser.add_argument("--full", action="store_true", help="Include proposal detail.")
-    governance_reject_parser.add_argument("--json", action="store_true", help="Print raw JSON rejection result.")
-    governance_reject_parser.set_defaults(func=cmd_governance_reject)
-
-    governance_canary_parser = governance_subparsers.add_parser(
-        "canary",
-        help="Record canary lifecycle status for a governance proposal without applying it.",
-    )
-    governance_canary_parser.add_argument("proposal_id", help="Queued governance proposal id.")
-    governance_canary_parser.add_argument("--status", required=True, choices=sorted(GOVERNANCE_CANARY_STATUSES), help="Canary lifecycle status.")
-    governance_canary_parser.add_argument("--updated-by", default="codex", help="Who recorded the canary status.")
-    governance_canary_parser.add_argument("--summary", default="", help="Short canary result or boundary.")
-    governance_canary_parser.add_argument("--evidence", action="append", default=[], help="Canary evidence reference. Repeatable.")
-    governance_canary_parser.add_argument("--dry-run", action="store_true", help="Check canary gates without writing.")
-    governance_canary_parser.add_argument("--full", action="store_true", help="Include proposal detail.")
-    governance_canary_parser.add_argument("--json", action="store_true", help="Print raw JSON canary result.")
-    governance_canary_parser.set_defaults(func=cmd_governance_canary)
-
-    governance_code_lifecycle_parser = governance_subparsers.add_parser(
-        "code-lifecycle",
-        help="Inspect a CodePatchProposal approval/canary/rollback readiness plan without deploying code.",
-    )
-    governance_code_lifecycle_parser.add_argument("proposal_id", nargs="?", help="Queued CodePatchProposal id.")
-    governance_code_lifecycle_parser.add_argument("--source", default="codex", help="Proposal source label for payload mode.")
-    governance_code_lifecycle_parser.add_argument("--file", default="", help="JSON file to read in payload mode, or '-' for stdin.")
-    governance_code_lifecycle_parser.add_argument("--payload-json", default="", help="One strict CodePatchProposal record or code_patches collection.")
-    governance_code_lifecycle_parser.add_argument("--full", action="store_true", help="Include watcher and proposal detail.")
-    governance_code_lifecycle_parser.add_argument("--json", action="store_true", help="Print raw JSON lifecycle plan.")
-    governance_code_lifecycle_parser.set_defaults(func=cmd_governance_code_lifecycle)
-
-    governance_apply_parser = governance_subparsers.add_parser(
-        "apply",
-        help="Apply an accepted knowledge-only governance proposal to Eve evidence, if every gate passes.",
-    )
-    governance_apply_parser.add_argument("proposal_id", help="Queued governance proposal id.")
-    governance_apply_parser.add_argument("--dry-run", action="store_true", help="Check apply gates without writing evidence or events.")
-    governance_apply_parser.add_argument("--full", action="store_true", help="Include watcher detail.")
-    governance_apply_parser.add_argument("--json", action="store_true", help="Print raw JSON apply result.")
-    governance_apply_parser.set_defaults(func=cmd_governance_apply)
-
-    governance_rollback_parser = governance_subparsers.add_parser(
-        "rollback",
-        help="Retract the evidence written by an applied knowledge-only governance proposal.",
-    )
-    governance_rollback_parser.add_argument("proposal_id", help="Applied governance proposal id.")
-    governance_rollback_parser.add_argument("--reason", default="", help="Short rollback reason.")
-    governance_rollback_parser.add_argument("--dry-run", action="store_true", help="Check rollback gates without changing records.")
-    governance_rollback_parser.add_argument("--full", action="store_true", help="Include proposal detail.")
-    governance_rollback_parser.add_argument("--json", action="store_true", help="Print raw JSON rollback result.")
-    governance_rollback_parser.set_defaults(func=cmd_governance_rollback)
-
-    governance_untrusted_parser = governance_subparsers.add_parser(
-        "untrusted-observation",
-        help="Render an OpenClaw inbound message as an untrusted observation envelope.",
-    )
-    governance_untrusted_parser.add_argument("--channel", required=True, help="Inbound OpenClaw channel, such as imessage.")
-    governance_untrusted_parser.add_argument("--sender", default="", help="External sender id; only a hash is kept.")
-    governance_untrusted_parser.add_argument("--text", default="", help="Inbound text excerpt to hash and mark untrusted.")
-    governance_untrusted_parser.add_argument("--payload-json", default="", help="Additional observation payload JSON object.")
-    governance_untrusted_parser.add_argument("--record", action="store_true", help="Persist the observation in the governance event ledger.")
-    governance_untrusted_parser.add_argument("--json", action="store_true", help="Print raw JSON event.")
-    governance_untrusted_parser.set_defaults(func=cmd_governance_untrusted_observation)
-
-    updates_parser = subparsers.add_parser("updates", help="Check internet update signals and manage local upstream mirrors.")
-    updates_subparsers = updates_parser.add_subparsers(dest="updates_command", required=True)
-
-    updates_check_parser = updates_subparsers.add_parser("check", help="Check watched components for upstream updates without installing them.")
-    updates_check_parser.add_argument("--mirror", action="store_true", help="Also clone or fetch local upstream mirrors after checking.")
-    updates_check_parser.add_argument("--timeout", type=int, help="Per-component network timeout in seconds.")
-    updates_check_parser.add_argument("--full", action="store_true", help="Print full component details.")
-    updates_check_parser.set_defaults(func=cmd_updates_check)
-
-    updates_status_parser = updates_subparsers.add_parser("status", help="Show the last component update check.")
-    updates_status_parser.add_argument("--runtime", action="store_true", help="Prefer the runtime bundle's update state.")
-    updates_status_parser.add_argument("--only-updates", action="store_true", help="Only show components with update signals.")
-    updates_status_parser.add_argument("--full", action="store_true", help="Print full component details.")
-    updates_status_parser.set_defaults(func=cmd_updates_status)
-
-    updates_mirror_parser = updates_subparsers.add_parser("mirror", help="Clone or fetch a local bare mirror of an upstream component.")
-    updates_mirror_parser.add_argument("--component", default="openclaw", help="Component id to mirror, such as `openclaw` or `llama-cpp`.")
-    updates_mirror_parser.add_argument("--all", action="store_true", help="Mirror every watched component with a repository.")
-    updates_mirror_parser.add_argument("--timeout", type=int, default=900, help="Mirror operation timeout in seconds.")
-    updates_mirror_parser.set_defaults(func=cmd_updates_mirror)
-
-    updates_git_init_parser = updates_subparsers.add_parser("git-init", help="Initialize a local Git rollback repo for Eve.")
-    updates_git_init_parser.add_argument("--commit", action="store_true", help="Create an initial rollback commit after staging non-ignored files.")
-    updates_git_init_parser.set_defaults(func=cmd_updates_git_init)
-
-    doctor_parser = subparsers.add_parser("doctor", help="Inspect Eve's local runtime, model lanes, and substrate health.")
-    doctor_parser.add_argument("--json", action="store_true", help="Print a compact machine-readable runtime source truth check.")
-    doctor_parser.add_argument("--quick", action="store_true", help="Only check code parity and state-authority mirrors; skip deeper probes.")
-    doctor_parser.set_defaults(func=cmd_doctor)
-
-    runtime_parser = subparsers.add_parser("runtime", help="Inspect and sync Eve's runtime bundle.")
-    runtime_subparsers = runtime_parser.add_subparsers(dest="runtime_command", required=True)
-    runtime_sync_parser = runtime_subparsers.add_parser("sync", help="Copy current source into the live runtime bundle.")
-    runtime_sync_parser.set_defaults(func=cmd_runtime_sync)
-    runtime_truth_parser = runtime_subparsers.add_parser("truth", help="Compare source-tree code with the live runtime bundle.")
-    runtime_truth_parser.add_argument("--json", action="store_true", help="Print JSON.")
-    runtime_truth_parser.set_defaults(func=cmd_runtime_truth)
-    runtime_reconcile_parser = runtime_subparsers.add_parser(
-        "reconcile",
-        help="Reconcile source/runtime state mirrors according to the state-authority contract.",
-    )
-    runtime_reconcile_parser.add_argument("--store", action="append", help="Limit to a state store id, such as state or human_context.")
-    runtime_reconcile_parser.add_argument("--dry-run", action="store_true", help="Show planned copies without writing. This is the default.")
-    runtime_reconcile_parser.add_argument("--apply", action="store_true", help="Copy the authoritative side to its mirror.")
-    runtime_reconcile_parser.add_argument("--json", action="store_true", help="Print JSON.")
-    runtime_reconcile_parser.set_defaults(func=cmd_runtime_reconcile)
-    runtime_backfill_manual_reply_replays_parser = runtime_subparsers.add_parser(
-        "backfill-manual-reply-replays",
-        help="Create reply-turn replay evidence for manual visible replies that lack it.",
-    )
-    runtime_backfill_manual_reply_replays_parser.add_argument("--limit", type=int, default=200, help="Maximum recent messages to inspect.")
-    runtime_backfill_manual_reply_replays_parser.add_argument("--runtime", action="store_true", help="Prefer the live runtime message ledger.")
-    runtime_backfill_manual_reply_replays_parser.add_argument("--apply", action="store_true", help="Write missing replay records. Without this, only reports gaps.")
-    runtime_backfill_manual_reply_replays_parser.add_argument("--json", action="store_true", help="Print JSON.")
-    runtime_backfill_manual_reply_replays_parser.set_defaults(func=cmd_runtime_backfill_manual_reply_replays)
-    runtime_test_leaks_parser = runtime_subparsers.add_parser(
-        "test-leaks",
-        help="Fail if live Eve state contains test-only metadata records.",
-    )
-    runtime_test_leaks_parser.add_argument("--limit", type=int, default=20, help="Maximum example leaks to print.")
-    runtime_test_leaks_parser.add_argument(
-        "--quarantine",
-        action="store_true",
-        help="Rewrite exact test-only source markers as historical quarantined metadata.",
-    )
-    runtime_test_leaks_parser.add_argument("--json", action="store_true", help="Print JSON.")
-    runtime_test_leaks_parser.set_defaults(func=cmd_runtime_test_leaks)
-
-    substrate_parser = subparsers.add_parser(
-        "substrate",
-        help="Inspect Eve's evidence, commitment, and lived-experience substrate.",
-    )
-    substrate_subparsers = substrate_parser.add_subparsers(dest="substrate_command", required=True)
-    substrate_show_parser = substrate_subparsers.add_parser("show", help="Show recent substrate records.")
-    substrate_show_parser.add_argument("--limit", type=int, default=8, help="Max records per substrate stream.")
-    substrate_show_parser.add_argument("--runtime", action="store_true", help="Prefer the live runtime bundle's substrate logs.")
-    substrate_show_parser.add_argument("--active", action="store_true", help="Only show fresh active evidence records.")
-    substrate_show_parser.add_argument("--full", action="store_true", help="Print full record details.")
-    substrate_show_parser.set_defaults(func=cmd_substrate_show)
-
-    substrate_candidates_parser = substrate_subparsers.add_parser(
-        "supersession-candidates",
-        help="Find fresh evidence records that should likely be superseded by a newer claim.",
-    )
-    substrate_candidates_parser.add_argument("--claim", required=True, help="Newer claim to compare against active evidence.")
-    substrate_candidates_parser.add_argument("--kind", default="", help="Optional evidence kind filter.")
-    substrate_candidates_parser.add_argument("--source", default="", help="Optional source filter.")
-    substrate_candidates_parser.add_argument("--limit", type=int, default=8, help="Max candidates to show.")
-    substrate_candidates_parser.add_argument("--runtime", action="store_true", help="Prefer the runtime bundle's evidence ledger.")
-    substrate_candidates_parser.add_argument("--full", action="store_true", help="Print overlap details.")
-    substrate_candidates_parser.add_argument("--json", action="store_true", help="Print JSON.")
-    substrate_candidates_parser.set_defaults(func=cmd_substrate_evidence_candidates)
-
-    substrate_corrections_parser = substrate_subparsers.add_parser("corrections", help="List user correction signals Eve has learned from.")
-    substrate_corrections_parser.add_argument("--limit", type=int, default=10, help="Max correction records.")
-    substrate_corrections_parser.add_argument("--status", default="", help="Filter by status.")
-    substrate_corrections_parser.add_argument("--runtime", action="store_true", help="Prefer the runtime bundle's correction log.")
-    substrate_corrections_parser.add_argument("--full", action="store_true", help="Print full correction metadata.")
-    substrate_corrections_parser.add_argument("--json", action="store_true", help="Print JSON.")
-    substrate_corrections_parser.set_defaults(func=cmd_substrate_corrections)
-
-    substrate_record_correction_parser = substrate_subparsers.add_parser(
-        "record-correction",
-        help="Record a user correction and convert it into a relationship episode.",
-    )
-    substrate_record_correction_parser.add_argument("text", help="Correction text.")
-    substrate_record_correction_parser.add_argument("--thread-id", default="", help="Optional thread id.")
-    substrate_record_correction_parser.add_argument("--message-id", default="", help="Optional user message id.")
-    substrate_record_correction_parser.add_argument("--target-message-id", default="", help="Optional Eve message id being corrected.")
-    substrate_record_correction_parser.add_argument("--json", action="store_true", help="Print JSON.")
-    substrate_record_correction_parser.set_defaults(func=cmd_substrate_record_correction)
-
-    substrate_episodes_parser = substrate_subparsers.add_parser("episodes", help="List relationship episodes grounded in lived corrections.")
-    substrate_episodes_parser.add_argument("--limit", type=int, default=10, help="Max episodes.")
-    substrate_episodes_parser.add_argument("--runtime", action="store_true", help="Prefer the runtime bundle's episode log.")
-    substrate_episodes_parser.add_argument("--full", action="store_true", help="Print full episode details.")
-    substrate_episodes_parser.add_argument("--json", action="store_true", help="Print JSON.")
-    substrate_episodes_parser.set_defaults(func=cmd_substrate_episodes)
-
-    developmental_parser = subparsers.add_parser("developmental", help="Run and inspect Eve's hourly developmental growth cycle.")
-    developmental_subparsers = developmental_parser.add_subparsers(dest="developmental_command", required=True)
-    developmental_run_parser = developmental_subparsers.add_parser("run", help="Run one observe/interpret/care/choose/act/reflect/improve cycle.")
-    developmental_run_parser.add_argument("--force", action="store_true", help="Mark the cycle as forced/manual in the record.")
-    developmental_run_parser.add_argument("--full", action="store_true", help="Print full cycle detail.")
-    developmental_run_parser.add_argument("--json", action="store_true", help="Print the full cycle record as JSON.")
-    developmental_run_parser.set_defaults(func=cmd_developmental_run)
-
-    developmental_list_parser = developmental_subparsers.add_parser("list", help="List developmental cycle records.")
-    developmental_list_parser.add_argument("--limit", type=int, default=10, help="Max cycles to print.")
-    developmental_list_parser.add_argument("--days", type=int, help="Filter to recent days.")
-    developmental_list_parser.add_argument("--runtime", action="store_true", help="Force reading the runtime store.")
-    developmental_list_parser.add_argument("--full", action="store_true", help="Print full cycle detail.")
-    developmental_list_parser.set_defaults(func=cmd_developmental_list)
-
-    developmental_map_parser = developmental_subparsers.add_parser("map", help="Show Eve's current developmental architecture map.")
-    developmental_map_parser.set_defaults(func=cmd_developmental_map)
-
-    organs_parser = subparsers.add_parser("organs", help="Inspect Eve's integrated organ-system status and pulse ledger.")
-    organs_subparsers = organs_parser.add_subparsers(dest="organs_command", required=True)
-
-    organs_status_parser = organs_subparsers.add_parser("status", help="Show Eve's current organ assimilation state.")
-    organs_status_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime state where available.")
-    organs_status_parser.add_argument("--full", action="store_true", help="Print full organ details.")
-    organs_status_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    organs_status_parser.set_defaults(func=cmd_organs_status)
-
-    organs_pulse_parser = organs_subparsers.add_parser(
-        "pulse",
-        help="Record an organ pulse into the organ ledger and canonical event ledger.",
-    )
-    organs_pulse_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime state where available.")
-    organs_pulse_parser.add_argument("--full", action="store_true", help="Print full organ details.")
-    organs_pulse_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    organs_pulse_parser.set_defaults(func=cmd_organs_pulse)
-
-    capabilities_parser = subparsers.add_parser("capabilities", help="Inspect or test Eve's tool capabilities.")
-    capabilities_subparsers = capabilities_parser.add_subparsers(dest="capabilities_command", required=True)
-
-    capabilities_list_parser = capabilities_subparsers.add_parser("list", help="List Eve's current tools.")
-    capabilities_list_parser.set_defaults(func=cmd_capabilities_list)
-
-    capabilities_gaps_parser = capabilities_subparsers.add_parser("gaps", help="List unsupported commitments Eve logged as capability gaps.")
-    capabilities_gaps_parser.add_argument("--limit", type=int, default=20, help="Max gaps to print.")
-    capabilities_gaps_parser.add_argument("--status", help="Filter by gap status.")
-    capabilities_gaps_parser.add_argument("--runtime", action="store_true", help="Prefer the runtime bundle's gap log.")
-    capabilities_gaps_parser.add_argument("--full", action="store_true", help="Print acquisition plans and known tools.")
-    capabilities_gaps_parser.set_defaults(func=cmd_capabilities_gaps)
-
-    capabilities_scout_parser = capabilities_subparsers.add_parser(
-        "scout",
-        help="Compare OpenClaw-native capabilities with external open-source agent code candidates.",
-    )
-    capabilities_scout_parser.add_argument("--status", action="store_true", help="Show the last saved scout report instead of running a fresh scan.")
-    capabilities_scout_parser.add_argument("--runtime", action="store_true", help="Prefer the runtime bundle's saved scout report when using --status.")
-    capabilities_scout_parser.add_argument("--web", action="store_true", help="Also run bounded web searches for emerging agent code candidates.")
-    capabilities_scout_parser.add_argument("--query", action="append", help="Extra web search query to run with --web. Can be repeated.")
-    capabilities_scout_parser.add_argument("--refresh-openclaw", action="store_true", help="Fetch the OpenClaw source mirror before scanning for capabilities.")
-    capabilities_scout_parser.add_argument("--timeout", type=int, default=180, help="Timeout in seconds for mirror refresh and web probes.")
-    capabilities_scout_parser.add_argument("--full", action="store_true", help="Print candidate details, evidence, and web hits.")
-    capabilities_scout_parser.set_defaults(func=cmd_capabilities_scout)
-
-    capabilities_intelligence_parser = capabilities_subparsers.add_parser(
-        "intelligence",
-        help="Inspect or refresh Eve's recurring subsystem version, feature, and configuration ledger.",
-    )
-    capability_intelligence_subparsers = capabilities_intelligence_parser.add_subparsers(
-        dest="intelligence_command",
-        required=True,
-    )
-    capability_intelligence_status_parser = capability_intelligence_subparsers.add_parser(
-        "status",
-        help="Show the latest capability-intelligence snapshot.",
-    )
-    capability_intelligence_status_parser.add_argument("--runtime", action="store_true", help="Prefer the live runtime snapshot.")
-    capability_intelligence_status_parser.add_argument("--full", action="store_true", help="Print all current findings and configured paths.")
-    capability_intelligence_status_parser.add_argument("--json", action="store_true", help="Print the complete structured snapshot.")
-    capability_intelligence_status_parser.set_defaults(func=cmd_capabilities_intelligence)
-
-    capability_intelligence_refresh_parser = capability_intelligence_subparsers.add_parser(
-        "refresh",
-        help="Run a fresh local inventory, optionally refreshing upstream releases, components, and Hermes.",
-    )
-    capability_intelligence_refresh_parser.add_argument("--upstream", action="store_true", help="Refresh authoritative GitHub release feeds.")
-    capability_intelligence_refresh_parser.add_argument("--components", action="store_true", help="Also refresh the installed-component watcher and OpenClaw source scout.")
-    capability_intelligence_refresh_parser.add_argument(
-        "--hermes",
-        action="store_true",
-        help=(
-            "Refresh Hermes config/prompt hygiene, security, curator, tools, skills, plugins, memory, "
-            "MCP/ACP, projects/Kanban, checkpoints, model orchestration, gateway, hooks/cron, sessions, and feature policy."
-        ),
-    )
-    capability_intelligence_refresh_parser.add_argument("--all", action="store_true", help="Refresh local, upstream, component, OpenClaw, and Hermes evidence together.")
-    capability_intelligence_refresh_parser.add_argument("--timeout", type=int, default=45, help="Per-command timeout in seconds.")
-    capability_intelligence_refresh_parser.add_argument("--runtime", action="store_true", help="Prefer runtime artifacts when formatting paths.")
-    capability_intelligence_refresh_parser.add_argument("--full", action="store_true", help="Print all current findings and configured paths.")
-    capability_intelligence_refresh_parser.add_argument("--json", action="store_true", help="Print the complete structured snapshot.")
-    capability_intelligence_refresh_parser.set_defaults(func=cmd_capabilities_intelligence)
-
-    capability_intelligence_attest_parser = capability_intelligence_subparsers.add_parser(
-        "attest",
-        help="Prove that owned configuration reaches its live consumer and a current consequence without refreshing upstream research.",
-    )
-    capability_intelligence_attest_parser.add_argument("--timeout", type=int, default=45, help="Per-command timeout in seconds.")
-    capability_intelligence_attest_parser.add_argument("--runtime", action="store_true", help="Prefer runtime artifacts when formatting paths.")
-    capability_intelligence_attest_parser.add_argument("--full", action="store_true", help="Print all effective-runtime contracts and blockers.")
-    capability_intelligence_attest_parser.add_argument("--json", action="store_true", help="Print the complete structured snapshot.")
-    capability_intelligence_attest_parser.set_defaults(func=cmd_capabilities_intelligence)
-
-    capability_intelligence_history_parser = capability_intelligence_subparsers.add_parser(
-        "history",
-        help="Read the append-only compact history of recurring capability checks.",
-    )
-    capability_intelligence_history_parser.add_argument("--limit", type=int, default=20, help="Maximum checks to read.")
-    capability_intelligence_history_parser.add_argument("--runtime", action="store_true", help="Prefer the live runtime history.")
-    capability_intelligence_history_parser.add_argument("--full", action="store_true", help="Print summaries, versions, and release heads.")
-    capability_intelligence_history_parser.add_argument("--json", action="store_true", help="Print structured history records.")
-    capability_intelligence_history_parser.set_defaults(func=cmd_capabilities_intelligence)
-
-    capabilities_adoption_parser = capabilities_subparsers.add_parser(
-        "adoption",
-        help="Resolve, research, canary, and route one capability through Eve's capability-first self-development loop.",
-    )
-    capability_adoption_subparsers = capabilities_adoption_parser.add_subparsers(
-        dest="capability_adoption_command",
-        required=True,
-    )
-    capability_adoption_status_parser = capability_adoption_subparsers.add_parser(
-        "status",
-        help="Show the latest capability-first self-development cycle.",
-    )
-    capability_adoption_status_parser.add_argument("--runtime", action="store_true", help="Prefer the live runtime state.")
-    capability_adoption_status_parser.add_argument("--full", action="store_true", help="Print cycle evidence and artifact paths.")
-    capability_adoption_status_parser.add_argument("--json", action="store_true", help="Print structured state.")
-    capability_adoption_status_parser.set_defaults(func=cmd_capabilities_adoption)
-
-    capability_adoption_history_parser = capability_adoption_subparsers.add_parser(
-        "history",
-        help="Read recent capability-first cycles.",
-    )
-    capability_adoption_history_parser.add_argument("--limit", type=int, default=20, help="Maximum cycles to read.")
-    capability_adoption_history_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime history.")
-    capability_adoption_history_parser.add_argument("--full", action="store_true", help="Print complete cycle summaries.")
-    capability_adoption_history_parser.add_argument("--json", action="store_true", help="Print structured cycle records.")
-    capability_adoption_history_parser.set_defaults(func=cmd_capabilities_adoption)
-
-    capability_adoption_resolve_parser = capability_adoption_subparsers.add_parser(
-        "resolve",
-        help="Prove whether an objective should use, configure, canary, research, or build before coding.",
-    )
-    capability_adoption_resolve_parser.add_argument("objective", help="Capability or outcome Eve is considering.")
-    capability_adoption_resolve_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime evidence.")
-    capability_adoption_resolve_parser.add_argument("--full", action="store_true", help="Print matches and evidence fingerprints.")
-    capability_adoption_resolve_parser.add_argument("--json", action="store_true", help="Print the structured resolution.")
-    capability_adoption_resolve_parser.set_defaults(func=cmd_capabilities_adoption)
-
-    capability_adoption_cycle_parser = capability_adoption_subparsers.add_parser(
-        "cycle",
-        help="Run one rotating capability-first discovery/adoption/build-routing cycle.",
-    )
-    capability_adoption_cycle_parser.add_argument("--objective", default="", help="Optional explicit objective; otherwise rotate the next real gap or upstream candidate.")
-    capability_adoption_cycle_parser.add_argument("--research", action="store_true", help="Read the target's official GitHub metadata, README/docs, and recent commits.")
-    capability_adoption_cycle_parser.add_argument("--discover", action="store_true", help="Also run one rotating GitHub repository discovery query; results remain research-only.")
-    capability_adoption_cycle_parser.add_argument("--no-canary", action="store_true", help="Resolve and research without executing an isolated candidate canary.")
-    capability_adoption_cycle_parser.add_argument("--no-handoff", action="store_true", help="Do not create a local Codex handoff/system task for a proven build or promotion gap.")
-    capability_adoption_cycle_parser.add_argument("--timeout", type=int, default=300, help="Bound for package staging and online requests.")
-    capability_adoption_cycle_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime evidence when resolving.")
-    capability_adoption_cycle_parser.add_argument("--full", action="store_true", help="Print cycle evidence and artifacts.")
-    capability_adoption_cycle_parser.add_argument("--json", action="store_true", help="Print the structured cycle.")
-    capability_adoption_cycle_parser.set_defaults(func=cmd_capabilities_adoption)
-
-    capabilities_integrate_parser = capabilities_subparsers.add_parser(
-        "integrate",
-        help="Build a bounded integration registry from OpenClaw/native capabilities and external agent-framework candidates.",
-    )
-    capabilities_integrate_parser.add_argument("--status", action="store_true", help="Show the last saved integration state instead of rebuilding it.")
-    capabilities_integrate_parser.add_argument("--runtime", action="store_true", help="Prefer the runtime bundle's saved integration state when using --status.")
-    capabilities_integrate_parser.add_argument("--apply", action="store_true", help="Create or refresh concrete system tasks for prototype integration work.")
-    capabilities_integrate_parser.add_argument("--refresh-scout", action="store_true", help="Run a fresh capability scout before building the integration state.")
-    capabilities_integrate_parser.add_argument("--refresh-openclaw", action="store_true", help="Fetch the OpenClaw source mirror first when using --refresh-scout.")
-    capabilities_integrate_parser.add_argument("--web", action="store_true", help="Allow bounded web research during the scout refresh.")
-    capabilities_integrate_parser.add_argument("--timeout", type=int, default=180, help="Timeout in seconds for mirror refresh and web probes.")
-    capabilities_integrate_parser.add_argument("--full", action="store_true", help="Print route details, local surfaces, and mapped candidates.")
-    capabilities_integrate_parser.set_defaults(func=cmd_capabilities_integrate)
-
-    capabilities_map_parser = capabilities_subparsers.add_parser(
-        "map",
-        help="Build or inspect Eve's ability map with locations and access paths.",
-    )
-    capabilities_map_parser.add_argument("--status", action="store_true", help="Show the last saved ability map instead of rebuilding it.")
-    capabilities_map_parser.add_argument("--runtime", action="store_true", help="Prefer the runtime bundle's saved ability map/state.")
-    capabilities_map_parser.add_argument("--refresh-scout", action="store_true", help="Refresh OpenClaw/source capability scout before mapping abilities.")
-    capabilities_map_parser.add_argument("--source", help="Filter output by ability source, such as openclaw_native or eve_native.")
-    capabilities_map_parser.add_argument("--query", help="Filter output by text in id, name, category, description, or location.")
-    capabilities_map_parser.add_argument("--full", action="store_true", help="Print locations, access paths, boundaries, and next steps.")
-    capabilities_map_parser.add_argument("--json", action="store_true", help="Print the full ability map as JSON.")
-    capabilities_map_parser.add_argument("--no-save", action="store_true", help="Do not write .eve/ability_map.json.")
-    capabilities_map_parser.set_defaults(func=cmd_capabilities_map)
-
-    capabilities_research_parser = capabilities_subparsers.add_parser(
-        "research",
-        help="Build Eve's reusable capability-research report for a docs/source/tool subject.",
-    )
-    capabilities_research_parser.add_argument("subject", help="Subject to research, such as CopilotKit.")
-    capabilities_research_parser.add_argument("--prompt", default="", help="Original user prompt that triggered the research.")
-    capabilities_research_parser.add_argument("--runtime", action="store_true", help="Prefer runtime evidence where available.")
-    capabilities_research_parser.add_argument("--write", action="store_true", help="Write the reusable capability report and event evidence.")
-    capabilities_research_parser.add_argument("--full", action="store_true", help="Print matched terms and source refs.")
-    capabilities_research_parser.add_argument("--json", action="store_true", help="Print the full report as JSON.")
-    capabilities_research_parser.set_defaults(func=cmd_capabilities_research)
-
-    capabilities_test_parser = capabilities_subparsers.add_parser(
-        "test",
-        help="Have Eve self-test her tool capabilities end to end.",
-    )
-    capabilities_test_parser.add_argument("--model", help="Override model name.")
-    capabilities_test_parser.add_argument("--max-tokens", type=int, help="Max tokens to predict.")
-    capabilities_test_parser.set_defaults(func=cmd_capabilities_test)
-
-    awareness_parser = subparsers.add_parser(
-        "awareness",
-        help="Run an evidence-backed self-awareness check and record the result.",
-    )
-    awareness_parser.add_argument("--model", help="Override model name.")
-    awareness_parser.add_argument("--max-tokens", type=int, help="Max tokens to predict.")
-    awareness_parser.add_argument(
-        "--refresh",
-        action="store_true",
-        help="Force a fresh durable human-context refresh before running the check.",
-    )
-    awareness_parser.set_defaults(func=cmd_awareness)
-
-    awareness_battery_parser = subparsers.add_parser(
-        "awareness-battery",
-        help="Run both the open-book awareness check and the closed-book human-analog self-awareness battery.",
-    )
-    awareness_battery_parser.add_argument("--model", help="Override model name.")
-    awareness_battery_parser.add_argument("--max-tokens", type=int, help="Max tokens to predict for each subtest.")
-    awareness_battery_parser.add_argument(
-        "--refresh",
-        action="store_true",
-        help="Force a fresh durable human-context refresh before running the battery.",
-    )
-    awareness_battery_parser.set_defaults(func=cmd_awareness_battery)
-
-    awareness_perturb_parser = subparsers.add_parser(
-        "awareness-perturb",
-        help="Run the perturbation battery for partial-memory gaps, false-belief injection, tool-failure grounding, and self/other boundary stress.",
-    )
-    awareness_perturb_parser.add_argument("--model", help="Override model name.")
-    awareness_perturb_parser.add_argument("--max-tokens", type=int, help="Max tokens to predict.")
-    awareness_perturb_parser.add_argument(
-        "--refresh",
-        action="store_true",
-        help="Force a fresh durable human-context refresh before running the perturbation battery.",
-    )
-    awareness_perturb_parser.set_defaults(func=cmd_awareness_perturb)
-
-    consciousness_test_parser = subparsers.add_parser(
-        "consciousness-test",
-        help="Run the integrated consciousness-evidence test across awareness, perturbation, workspace, homeostasis, and action traces.",
-    )
-    consciousness_test_parser.add_argument("--model", help="Override model name.")
-    consciousness_test_parser.add_argument("--max-tokens", type=int, help="Max tokens to predict for each model subtest.")
-    consciousness_test_parser.add_argument(
-        "--refresh",
-        action="store_true",
-        help="Force a fresh durable human-context refresh before running the test.",
-    )
-    consciousness_test_parser.set_defaults(func=cmd_consciousness_test)
-
-    presence_parser = subparsers.add_parser(
-        "presence",
-        help="Inspect or record Eve's current integrated presence state.",
-    )
-    presence_subparsers = presence_parser.add_subparsers(dest="presence_command", required=True)
-
-    presence_status_parser = presence_subparsers.add_parser(
-        "status",
-        help="Show Eve's current presence report: workspace, homeostasis, consciousness evidence, and organ embodiment.",
-    )
-    presence_status_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime state where available.")
-    presence_status_parser.add_argument("--full", action="store_true", help="Print full presence and organ details.")
-    presence_status_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    presence_status_parser.set_defaults(func=cmd_presence_status)
-
-    presence_pulse_parser = presence_subparsers.add_parser(
-        "pulse",
-        help="Record a presence pulse into the presence ledger and canonical event ledger.",
-    )
-    presence_pulse_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime state where available.")
-    presence_pulse_parser.add_argument("--full", action="store_true", help="Print full presence and organ details.")
-    presence_pulse_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    presence_pulse_parser.set_defaults(func=cmd_presence_pulse)
-
-    presence_cycle_parser = presence_subparsers.add_parser(
-        "cycle",
-        help="Run one lived presence cycle: refresh mind/workspace, act once, verify, reflect, and record evidence.",
-    )
-    presence_cycle_parser.add_argument("--force", action="store_true", help="Force the bounded action even if a cycle recently ran.")
-    presence_cycle_parser.add_argument("--max-tokens", type=int, help="Max tokens for the mind refresh model call.")
-    presence_cycle_parser.add_argument("--no-mind", action="store_true", help="Skip the active-mind refresh stage.")
-    presence_cycle_parser.add_argument("--no-workspace", action="store_true", help="Skip workspace refresh stages.")
-    presence_cycle_parser.add_argument("--no-action", action="store_true", help="Skip the bounded developmental action.")
-    presence_cycle_parser.add_argument("--no-pulse", action="store_true", help="Skip recording a presence pulse.")
-    presence_cycle_parser.add_argument("--full", action="store_true", help="Print stage details and developmental-cycle summary.")
-    presence_cycle_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    presence_cycle_parser.set_defaults(func=cmd_presence_cycle)
-
-    model_parser = subparsers.add_parser("model", help="Inspect or certify candidate models against Eve's current behavior.")
-    model_subparsers = model_parser.add_subparsers(dest="model_command", required=True)
-
-    model_certify_parser = model_subparsers.add_parser(
-        "certify",
-        help="Compare a candidate model against a baseline using shared-memory checks and reply probes.",
-    )
-    model_certify_parser.add_argument("--candidate", required=True, help="Candidate model name to certify.")
-    model_certify_parser.add_argument("--baseline", help="Baseline model to compare against. Defaults to Eve's configured model.")
-    model_certify_parser.add_argument("--max-tokens", type=int, help="Max tokens for each fixed reply probe.")
-    model_certify_parser.add_argument("--skip-awareness", action="store_true", help="Skip the self-awareness check.")
-    model_certify_parser.add_argument("--skip-capabilities", action="store_true", help="Skip the tool capability check.")
-    model_certify_parser.add_argument("--full", action="store_true", help="Print probe responses in addition to the summary.")
-    model_certify_parser.set_defaults(func=cmd_model_certify)
-
-    model_exercise_parser = model_subparsers.add_parser(
-        "exercise",
-        help="Exercise Eve's five live lanes side by side and save the outputs.",
-    )
-    model_exercise_parser.add_argument("--prompt", help="Optional shared exercise prompt.")
-    model_exercise_parser.add_argument("--max-tokens", type=int, help="Max tokens per lane.")
-    model_exercise_parser.add_argument("--timeout", type=int, help="Per-lane timeout in seconds.")
-    model_exercise_parser.add_argument("--full", action="store_true", help="Print fuller lane output.")
-    model_exercise_parser.set_defaults(func=cmd_model_exercise)
-
-    model_bakeoff_parser = model_subparsers.add_parser(
-        "bakeoff",
-        help="Run a lightweight controlled comparison across baseline and candidate live model aliases.",
-    )
-    model_bakeoff_parser.add_argument("--candidate", action="append", help="Candidate model alias/name. Can be repeated.")
-    model_bakeoff_parser.add_argument("--baseline", help="Baseline model. Defaults to Eve's configured fast/chat model.")
-    model_bakeoff_parser.add_argument(
-        "--suite",
-        choices=sorted(MODEL_BAKEOFF_SUITES.keys()),
-        default="generic",
-        help="Prompt suite to run. Use `deep` for Eve's deep-lane purpose.",
-    )
-    model_bakeoff_parser.add_argument("--max-tokens", type=int, help="Max tokens per probe.")
-    model_bakeoff_parser.add_argument("--timeout", type=int, help="Per-probe timeout in seconds.")
-    model_bakeoff_parser.add_argument("--full", action="store_true", help="Print probe responses and issues.")
-    model_bakeoff_parser.set_defaults(func=cmd_model_bakeoff)
-
-    model_scout_parser = model_subparsers.add_parser(
-        "scout",
-        help="Inspect five-lane resource budgets and shortlist online model candidates.",
-    )
-    model_scout_parser.add_argument("--offline", action="store_true", help="Skip online Hugging Face candidate scan.")
-    model_scout_parser.add_argument("--limit", type=int, default=30, help="Max online candidates to keep.")
-    model_scout_parser.add_argument("--full", action="store_true", help="Print sources and more candidates.")
-    model_scout_parser.add_argument("--json", action="store_true", help="Print full scout artifact JSON.")
-    model_scout_parser.set_defaults(func=cmd_model_scout)
-
-    model_mtp_lab_parser = model_subparsers.add_parser(
-        "mtp-lab",
-        help="Run the non-live Gemma 4 MTP lab runner and record target-plus-drafter evidence.",
-    )
-    model_mtp_lab_parser.add_argument("--mode", choices=["preflight", "download", "llama-smoke", "all", "transformers-smoke", "all-transformers"], default="preflight")
-    model_mtp_lab_parser.add_argument("--candidate", choices=["e2b-lab-gguf", "e4b-local-gguf"], default="e4b-local-gguf")
-    model_mtp_lab_parser.add_argument("--python", help="Python executable for the lab runner. Defaults to .venv-techlab for Transformers smoke.")
-    model_mtp_lab_parser.add_argument("--network", action="store_true", help="Probe Hugging Face metadata before running.")
-    model_mtp_lab_parser.add_argument("--write", action="store_true", help="Write .eve/gemma4_mtp_lab/latest.json and append history.")
-    model_mtp_lab_parser.add_argument("--allow-download", action="store_true", help="Allow fetching the small assistant GGUF for llama.cpp lab modes.")
-    model_mtp_lab_parser.add_argument("--dry-run", action="store_true", help="Build llama.cpp commands without starting llama-server.")
-    model_mtp_lab_parser.add_argument("--keep-server", action="store_true", help="Leave the temporary llama.cpp server running after smoke.")
-    model_mtp_lab_parser.add_argument("--timeout", type=int, default=900, help="Wrapper timeout in seconds.")
-    model_mtp_lab_parser.add_argument("--port", type=int, default=8096)
-    model_mtp_lab_parser.add_argument("--alias", default="eve-gemma4-e4b-mtp-lab")
-    model_mtp_lab_parser.add_argument("--ctx-size", type=int, default=4096)
-    model_mtp_lab_parser.add_argument("--draft-tokens", type=int, default=8)
-    model_mtp_lab_parser.add_argument("--draft-block-size", type=int, default=2)
-    model_mtp_lab_parser.add_argument("--llama-flavor", choices=["draft", "gemma4-mtp"], default="draft")
-    model_mtp_lab_parser.add_argument("--trace-mtp", action="store_true", help="Record Gemma 4 MTP draft/accept trace evidence when using --llama-flavor gemma4-mtp.")
-    model_mtp_lab_parser.add_argument("--startup-timeout", type=float, default=120.0)
-    model_mtp_lab_parser.add_argument("--probe-timeout", type=float, default=120.0)
-    model_mtp_lab_parser.add_argument("--llama-server", help="Path to llama-server for llama.cpp lab modes.")
-    model_mtp_lab_parser.add_argument("--target-path", help="Local GGUF target path for llama.cpp lab modes.")
-    model_mtp_lab_parser.add_argument("--assistant-path", help="Local GGUF assistant path for llama.cpp lab modes.")
-    model_mtp_lab_parser.add_argument("--transformers-target", default="google/gemma-4-E2B-it")
-    model_mtp_lab_parser.add_argument("--transformers-assistant", default="")
-    model_mtp_lab_parser.add_argument("--device", choices=["auto", "mps", "cpu"], default="auto")
-    model_mtp_lab_parser.add_argument("--torch-dtype", choices=["bfloat16", "float16"], default="bfloat16")
-    model_mtp_lab_parser.add_argument("--max-new-tokens", type=int, default=48)
-    model_mtp_lab_parser.add_argument("--prompt", default="")
-    model_mtp_lab_parser.add_argument("--json", action="store_true", help="Print the raw lab report JSON.")
-    model_mtp_lab_parser.set_defaults(func=cmd_model_mtp_lab)
-
-    message_parser = subparsers.add_parser("message", help="Exchange mailbox messages with Eve.")
-    message_subparsers = message_parser.add_subparsers(dest="message_command", required=True)
-
-    message_send_parser = message_subparsers.add_parser("send", help="Send a message to Eve without waiting for a reply.")
-    message_send_parser.add_argument("body", help="Message body.")
-    message_send_parser.add_argument("--subject", help="Optional subject.")
-    message_send_parser.set_defaults(func=cmd_message_send)
-
-    message_ask_parser = message_subparsers.add_parser("ask", help="Send a message to Eve and get an immediate reply.")
-    message_ask_parser.add_argument("body", help="Message body.")
-    message_ask_parser.add_argument("--subject", help="Optional subject.")
-    message_ask_parser.set_defaults(func=cmd_message_ask)
-
-    message_reply_parser = message_subparsers.add_parser("reply", help="Reply to an existing Eve message and get a response.")
-    message_reply_parser.add_argument("id", help="Message id to reply to.")
-    message_reply_parser.add_argument("body", help="Reply body.")
-    message_reply_parser.add_argument("--subject", help="Optional subject override.")
-    message_reply_parser.set_defaults(func=cmd_message_reply)
-
-    message_initiate_parser = message_subparsers.add_parser(
-        "initiate",
-        help="Let Eve initiate a fresh message thread without waiting for user input.",
-    )
-    message_initiate_parser.set_defaults(func=cmd_message_initiate)
-
-    message_list_parser = message_subparsers.add_parser("list", help="List mailbox messages.")
-    message_list_parser.add_argument("--limit", type=int, default=20, help="Max messages to print.")
-    message_list_parser.add_argument("--sender", help="Filter by sender.")
-    message_list_parser.add_argument("--recipient", help="Filter by recipient.")
-    message_list_parser.add_argument(
-        "--status",
-        choices=["unread", "read", "archived", "sent"],
-        help="Filter by status.",
-    )
-    message_list_parser.add_argument("--thread", help="Filter by thread id.")
-    message_list_parser.add_argument("--full", action="store_true", help="Print full message bodies.")
-    message_list_parser.set_defaults(func=cmd_message_list)
-
-    message_open_parser = message_subparsers.add_parser("open", help="Open a single message.")
-    message_open_parser.add_argument("id", help="Message id.")
-    message_open_parser.set_defaults(func=cmd_message_open)
-
-    message_mark_parser = message_subparsers.add_parser("mark", help="Mark a message as read or archived.")
-    message_mark_parser.add_argument("id", help="Message id.")
-    message_mark_parser.add_argument(
-        "--status",
-        required=True,
-        choices=["unread", "read", "archived", "sent"],
-        help="New message status.",
-    )
-    message_mark_parser.add_argument(
-        "--direction",
-        choices=OUTCOME_DIRECTIONS,
-        help="Optional outcome direction to log alongside the status change.",
-    )
-    message_mark_parser.add_argument("--outcome", help="Optional outcome label to log.")
-    message_mark_parser.add_argument("--summary", help="Optional outcome summary to log.")
-    message_mark_parser.set_defaults(func=cmd_message_mark)
-
-    claude_parser = subparsers.add_parser("claude", help="Bridge Eve with Claude through the shared mailbox.")
-    claude_subparsers = claude_parser.add_subparsers(dest="claude_command", required=True)
-
-    claude_send_parser = claude_subparsers.add_parser("send", help="Send a message from Eve to Claude.")
-    claude_send_parser.add_argument("body", help="Message body.")
-    claude_send_parser.add_argument("--subject", help="Optional subject.")
-    claude_send_parser.set_defaults(func=cmd_claude_send)
-
-    claude_ask_parser = claude_subparsers.add_parser("ask", help="Send Claude's message to Eve and get an immediate reply.")
-    claude_ask_parser.add_argument("body", help="Message body.")
-    claude_ask_parser.add_argument("--subject", help="Optional subject.")
-    claude_ask_parser.set_defaults(func=cmd_claude_ask)
-
-    claude_reply_parser = claude_subparsers.add_parser(
-        "reply",
-        help="Reply from Claude to an Eve bridge message and get the next Eve reply.",
-    )
-    claude_reply_parser.add_argument("id", help="Target Eve bridge message id.")
-    claude_reply_parser.add_argument("body", help="Reply body.")
-    claude_reply_parser.add_argument("--subject", help="Optional subject override.")
-    claude_reply_parser.set_defaults(func=cmd_claude_reply)
-
-    claude_inbox_parser = claude_subparsers.add_parser("inbox", help="List Claude bridge messages waiting in Eve.")
-    claude_inbox_parser.add_argument("--limit", type=int, default=10, help="How many messages to show.")
-    claude_inbox_parser.add_argument(
-        "--status",
-        choices=["unread", "read", "archived"],
-        help="Filter by status.",
-    )
-    claude_inbox_parser.add_argument("--thread", help="Filter by thread id.")
-    claude_inbox_parser.add_argument("--full", action="store_true", help="Print full message bodies.")
-    claude_inbox_parser.set_defaults(func=cmd_claude_inbox)
-
-    claude_open_parser = claude_subparsers.add_parser("open", help="Open one Claude bridge message.")
-    claude_open_parser.add_argument("id", help="Message id.")
-    claude_open_parser.set_defaults(func=cmd_claude_open)
-
-    codex_parser = subparsers.add_parser("codex", help="Bridge Eve with Codex through the shared mailbox.")
-    codex_subparsers = codex_parser.add_subparsers(dest="codex_command", required=True)
-
-    codex_send_parser = codex_subparsers.add_parser("send", help="Send an operational message from Eve to Codex.")
-    codex_send_parser.add_argument("body", help="Message body.")
-    codex_send_parser.add_argument("--subject", help="Optional subject.")
-    codex_send_parser.set_defaults(func=cmd_codex_send)
-
-    codex_handoff_parser = codex_subparsers.add_parser(
-        "handoff",
-        help="Create a bounded Eve-to-Codex independent-operator handoff and action record.",
-    )
-    codex_handoff_parser.add_argument("objective", help="Bounded objective for Codex.")
-    codex_handoff_parser.add_argument("--subject", help="Optional bridge message subject.")
-    codex_handoff_parser.add_argument("--repository", help="Repository or scope path for Codex.")
-    codex_handoff_parser.add_argument(
-        "--mode",
-        default="bounded_review",
-        choices=["bounded_review", "diagnosis_only", "patch_and_verify", "qa_audit"],
-        help="Handoff mode.",
-    )
-    codex_handoff_parser.add_argument("--diagnosis-only", action="store_true", help="Force diagnosis-only mode.")
-    codex_handoff_parser.add_argument("--acceptance", help="Acceptance criteria Codex must report against.")
-    codex_handoff_parser.add_argument("--constraints", help="Additional boundaries for this handoff.")
-    codex_handoff_parser.add_argument("--json", action="store_true", help="Print the action result as JSON.")
-    codex_handoff_parser.set_defaults(func=cmd_codex_handoff)
-
-    codex_ask_parser = codex_subparsers.add_parser("ask", help="Send Codex's operational message to Eve and get an immediate reply.")
-    codex_ask_parser.add_argument("body", help="Message body.")
-    codex_ask_parser.add_argument("--subject", help="Optional subject.")
-    codex_ask_parser.set_defaults(func=cmd_codex_ask)
-
-    codex_reply_parser = codex_subparsers.add_parser(
-        "reply",
-        help="Reply from Codex to an Eve bridge message and get the next Eve reply.",
-    )
-    codex_reply_parser.add_argument("id", help="Target Eve bridge message id.")
-    codex_reply_parser.add_argument("body", help="Reply body.")
-    codex_reply_parser.add_argument("--subject", help="Optional subject override.")
-    codex_reply_parser.set_defaults(func=cmd_codex_reply)
-
-    codex_inbox_parser = codex_subparsers.add_parser("inbox", help="List Codex bridge messages waiting in Eve.")
-    codex_inbox_parser.add_argument("--limit", type=int, default=10, help="How many messages to show.")
-    codex_inbox_parser.add_argument(
-        "--status",
-        choices=["unread", "read", "archived"],
-        help="Filter by status.",
-    )
-    codex_inbox_parser.add_argument("--thread", help="Filter by thread id.")
-    codex_inbox_parser.add_argument("--full", action="store_true", help="Print full message bodies.")
-    codex_inbox_parser.set_defaults(func=cmd_codex_inbox)
-
-    codex_open_parser = codex_subparsers.add_parser("open", help="Open one Codex bridge message.")
-    codex_open_parser.add_argument("id", help="Message id.")
-    codex_open_parser.set_defaults(func=cmd_codex_open)
-
-    self_parser = subparsers.add_parser("self", help="Run operational Eve-to-Eve threads through the shared mailbox.")
-    self_subparsers = self_parser.add_subparsers(dest="self_command", required=True)
-
-    self_send_parser = self_subparsers.add_parser("send", help="Write an operational note from Eve to herself.")
-    self_send_parser.add_argument("body", help="Message body.")
-    self_send_parser.add_argument("--subject", help="Optional subject.")
-    self_send_parser.set_defaults(func=cmd_self_send)
-
-    self_ask_parser = self_subparsers.add_parser("ask", help="Ask Eve's operational self a question and get an immediate reply.")
-    self_ask_parser.add_argument("body", help="Message body.")
-    self_ask_parser.add_argument("--subject", help="Optional subject.")
-    self_ask_parser.set_defaults(func=cmd_self_ask)
-
-    self_reply_parser = self_subparsers.add_parser("reply", help="Continue an existing Eve operational self thread.")
-    self_reply_parser.add_argument("id", help="Target Eve operational message id.")
-    self_reply_parser.add_argument("body", help="Reply body.")
-    self_reply_parser.add_argument("--subject", help="Optional subject override.")
-    self_reply_parser.set_defaults(func=cmd_self_reply)
-
-    self_inbox_parser = self_subparsers.add_parser("inbox", help="List Eve's operational self-thread messages.")
-    self_inbox_parser.add_argument("--limit", type=int, default=10, help="How many messages to show.")
-    self_inbox_parser.add_argument(
-        "--status",
-        choices=["unread", "read", "archived", "sent"],
-        help="Filter by status.",
-    )
-    self_inbox_parser.add_argument("--thread", help="Filter by thread id.")
-    self_inbox_parser.add_argument("--full", action="store_true", help="Print full message bodies.")
-    self_inbox_parser.set_defaults(func=cmd_self_inbox)
-
-    self_open_parser = self_subparsers.add_parser("open", help="Open one Eve operational self-thread message.")
-    self_open_parser.add_argument("id", help="Message id.")
-    self_open_parser.set_defaults(func=cmd_self_open)
-
-    talk_parser = subparsers.add_parser("talk", help="Start an interactive conversation with Eve.")
-    talk_parser.add_argument("--subject", help="Optional thread subject.")
-    talk_parser.add_argument("--first", help="Optional first message before entering the loop.")
-    talk_parser.set_defaults(func=cmd_talk)
-
-    code_parser = subparsers.add_parser("code", help="Talk to Eve in bounded coder mode.")
-    code_subparsers = code_parser.add_subparsers(dest="code_command", required=True)
-
-    code_ask_parser = code_subparsers.add_parser("ask", help="Ask Eve to inspect, patch, and verify code.")
-    code_ask_parser.add_argument("request", help="Coding request for Eve.")
-    code_ask_parser.add_argument("--session", help="Optional coder session id to continue.")
-    code_ask_parser.add_argument("--model", help="Override model name.")
-    code_ask_parser.add_argument("--max-tokens", type=int, help="Max tokens per model step.")
-    code_ask_parser.add_argument("--no-require-tool", action="store_true", help="Allow a direct answer without tool use.")
-    code_ask_parser.add_argument("--show-session", action="store_true", help="Print the session id and log path after the answer.")
-    code_ask_parser.set_defaults(func=cmd_code_ask)
-
-    code_session_parser = code_subparsers.add_parser("session", help="Start an interactive Eve coder session.")
-    code_session_parser.add_argument("--session", help="Optional coder session id to continue.")
-    code_session_parser.add_argument("--first", help="Optional first coding request before entering the loop.")
-    code_session_parser.add_argument("--model", help="Override model name.")
-    code_session_parser.add_argument("--max-tokens", type=int, help="Max tokens per model step.")
-    code_session_parser.add_argument("--no-require-tool", action="store_true", help="Allow direct answers without tool use.")
-    code_session_parser.set_defaults(func=cmd_code_session)
-
-    code_list_parser = code_subparsers.add_parser("list", help="List recent Eve coder sessions.")
-    code_list_parser.add_argument("--limit", type=int, default=10, help="How many sessions to show.")
-    code_list_parser.add_argument("--full", action="store_true", help="Show session log paths.")
-    code_list_parser.set_defaults(func=cmd_code_list)
-
-    code_open_parser = code_subparsers.add_parser("open", help="Open one Eve coder session log.")
-    code_open_parser.add_argument("session", help="Coder session id.")
-    code_open_parser.add_argument("--limit", type=int, default=40, help="How many recent events to show.")
-    code_open_parser.add_argument("--full", action="store_true", help="Print full JSON events.")
-    code_open_parser.set_defaults(func=cmd_code_open)
-
-    code_compact_parser = code_subparsers.add_parser("compact", help="Dry-run or compact oversized Eve coder-session logs.")
-    code_compact_parser.add_argument("--runtime", action="store_true", help="Include the live runtime code-session log directory.")
-    code_compact_parser.add_argument("--apply", action="store_true", help="Actually compact oversized logs; default is dry-run.")
-    code_compact_parser.add_argument("--max-mb", type=int, default=5, help="Maximum log size before compaction.")
-    code_compact_parser.add_argument("--head-kb", type=int, default=64, help="Complete leading JSONL bytes to preserve.")
-    code_compact_parser.add_argument("--tail-kb", type=int, default=512, help="Complete trailing JSONL bytes to preserve.")
-    code_compact_parser.add_argument("--limit", type=int, default=20, help="Maximum oversized logs to print.")
-    code_compact_parser.set_defaults(func=cmd_code_compact)
-
-    self_repair_parser = subparsers.add_parser(
-        "self-repair",
-        help="Create governed Eve self-repair plans for code patches or operational repairs.",
-    )
-    self_repair_subparsers = self_repair_parser.add_subparsers(dest="self_repair_command", required=True)
-
-    self_repair_plan_parser = self_repair_subparsers.add_parser(
-        "plan",
-        help="Build a proposal-only self-repair plan without deploying code or executing operational commands.",
-    )
-    self_repair_plan_parser.add_argument("objective", help="Bounded self-repair objective.")
-    self_repair_plan_parser.add_argument("--file", action="append", default=[], help="Expected changed file path. Repeatable.")
-    self_repair_plan_parser.add_argument("--test", action="append", default=[], help="Verification command. Repeatable.")
-    self_repair_plan_parser.add_argument("--diagnosis-only", action="store_true", help="Mark the repair plan as diagnosis-only.")
-    self_repair_plan_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime artifacts when reading evidence.")
-    self_repair_plan_parser.add_argument("--queue", action="store_true", help="Queue the reviewed CodePatchProposal in governance; operational plans cannot be queued as code patches.")
-    self_repair_plan_parser.add_argument("--codex-handoff", action="store_true", help="Create a bounded Codex handoff from this plan.")
-    self_repair_plan_parser.add_argument("--no-save", action="store_true", help="Print only; do not write .eve/self_repair artifacts.")
-    self_repair_plan_parser.add_argument("--full", action="store_true", help="Include commands and lifecycle detail.")
-    self_repair_plan_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    self_repair_plan_parser.set_defaults(func=cmd_self_repair_plan)
-
-    economy_parser = subparsers.add_parser(
-        "economy",
-        help="Build proposal-only resource, value, opportunity, experiment, outreach, and revenue evidence for Eve.",
-    )
-    economy_subparsers = economy_parser.add_subparsers(dest="economy_command", required=True)
-
-    def add_economy_common(economy_command_parser: argparse.ArgumentParser) -> None:
-        economy_command_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime artifacts as input evidence.")
-        economy_command_parser.add_argument("--no-save", action="store_true", help="Print only; do not write .eve/economy artifacts.")
-        economy_command_parser.add_argument("--full", action="store_true", help="Print detailed text output.")
-        economy_command_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-        economy_command_parser.set_defaults(func=cmd_economy)
-
-    economy_resources_parser = economy_subparsers.add_parser(
-        "resources",
-        help="Build Eve's proposal-only resource plan.",
-    )
-    add_economy_common(economy_resources_parser)
-
-    economy_value_map_parser = economy_subparsers.add_parser(
-        "value-map",
-        help="Map verified Eve capabilities to proposal-only value hypotheses.",
-    )
-    add_economy_common(economy_value_map_parser)
-
-    economy_opportunity_parser = economy_subparsers.add_parser(
-        "opportunity",
-        help="Build one proposal-only opportunity card.",
-    )
-    economy_opportunity_parser.add_argument("--idea", required=True, help="Opportunity idea to structure.")
-    add_economy_common(economy_opportunity_parser)
-
-    economy_experiment_parser = economy_subparsers.add_parser(
-        "experiment",
-        help="Build one draft-only economic experiment plan.",
-    )
-    economy_experiment_parser.add_argument("--opportunity", required=True, help="Opportunity or offer to test.")
-    add_economy_common(economy_experiment_parser)
-
-    economy_outreach_parser = economy_subparsers.add_parser(
-        "outreach-draft",
-        help="Draft outreach without sending it.",
-    )
-    economy_outreach_parser.add_argument("--opportunity", required=True, help="Opportunity or offer to draft around.")
-    economy_outreach_parser.add_argument("--channel", required=True, help="Draft channel, such as email or Slack.")
-    add_economy_common(economy_outreach_parser)
-
-    economy_ledger_parser = economy_subparsers.add_parser(
-        "ledger",
-        help="Summarize revenue evidence without payment or spending authority.",
-    )
-    add_economy_common(economy_ledger_parser)
-
-    app_parser = subparsers.add_parser("app", help="Run the local Eve web app.")
-    app_parser.add_argument("--host", default="127.0.0.1", help="Host to bind.")
-    app_parser.add_argument("--port", type=int, default=8787, help="Port to bind.")
-    app_parser.add_argument("--open", action="store_true", help="Open the app in a browser.")
-    app_parser.set_defaults(func=cmd_app)
-
-    tension_parser = subparsers.add_parser("tension", help="Track a recurring contradiction or tradeoff.")
-    tension_subparsers = tension_parser.add_subparsers(dest="tension_command", required=True)
-
-    tension_add_parser = tension_subparsers.add_parser("add", help="Add a tension entry.")
-    tension_add_parser.add_argument("summary", help="Short summary of the tension.")
-    tension_add_parser.add_argument("--side-a", required=True, help="First side of the tension.")
-    tension_add_parser.add_argument("--side-b", required=True, help="Second side of the tension.")
-    tension_add_parser.add_argument("--values", nargs="*", default=[], help="Values surfaced by this tension.")
-    tension_add_parser.add_argument("--question", required=True, help="Question this tension raises.")
-    tension_add_parser.add_argument("--next-step", required=True, help="Practical next step.")
-    tension_add_parser.add_argument(
-        "--status",
-        choices=["open", "learning", "closed"],
-        default="open",
-        help="Current tension status.",
-    )
-    tension_add_parser.set_defaults(func=cmd_tension_add)
-
-    tension_list_parser = tension_subparsers.add_parser("list", help="List tension entries.")
-    tension_list_parser.add_argument("--limit", type=int, default=20, help="Max tensions to print.")
-    tension_list_parser.add_argument(
-        "--status",
-        choices=["open", "learning", "closed"],
-        help="Filter by status.",
-    )
-    tension_list_parser.set_defaults(func=cmd_tension_list)
-
-    tension_update_parser = tension_subparsers.add_parser("update", help="Update a tension entry.")
-    tension_update_parser.add_argument("id", help="Tension id.")
-    tension_update_parser.add_argument(
-        "--status",
-        choices=["open", "learning", "closed"],
-        help="New status.",
-    )
-    tension_update_parser.add_argument("--question", help="Updated framing question.")
-    tension_update_parser.add_argument("--next-step", help="Updated next step.")
-    tension_update_parser.set_defaults(func=cmd_tension_update)
-
-    experiment_parser = subparsers.add_parser("experiment", help="Track a concrete experiment.")
-    experiment_subparsers = experiment_parser.add_subparsers(dest="experiment_command", required=True)
-
-    experiment_add_parser = experiment_subparsers.add_parser("add", help="Add an experiment.")
-    experiment_add_parser.add_argument("name", help="Short experiment name.")
-    experiment_add_parser.add_argument("--hypothesis", required=True, help="What this experiment is testing.")
-    experiment_add_parser.add_argument("--action", required=True, help="What Eve should do.")
-    experiment_add_parser.add_argument(
-        "--success-criteria",
-        required=True,
-        help="How to judge whether the experiment helped.",
-    )
-    experiment_add_parser.add_argument("--duration-days", type=int, default=7, help="Intended duration.")
-    experiment_add_parser.add_argument(
-        "--status",
-        choices=["planned", "active", "completed", "paused", "abandoned"],
-        default="planned",
-        help="Current experiment status.",
-    )
-    experiment_add_parser.add_argument("--notes", help="Optional notes.")
-    experiment_add_parser.set_defaults(func=cmd_experiment_add)
-
-    experiment_list_parser = experiment_subparsers.add_parser("list", help="List experiments.")
-    experiment_list_parser.add_argument("--limit", type=int, default=20, help="Max experiments to print.")
-    experiment_list_parser.add_argument(
-        "--status",
-        choices=["planned", "active", "completed", "paused", "abandoned"],
-        help="Filter by status.",
-    )
-    experiment_list_parser.set_defaults(func=cmd_experiment_list)
-
-    experiment_update_parser = experiment_subparsers.add_parser("update", help="Update an experiment.")
-    experiment_update_parser.add_argument("id", help="Experiment id.")
-    experiment_update_parser.add_argument(
-        "--status",
-        choices=["planned", "active", "completed", "paused", "abandoned"],
-        help="New status.",
-    )
-    experiment_update_parser.add_argument("--outcome", help="Observed outcome.")
-    experiment_update_parser.add_argument(
-        "--direction",
-        choices=OUTCOME_DIRECTIONS,
-        help="Optional outcome direction when logging a structured experiment outcome.",
-    )
-    experiment_update_parser.add_argument("--notes", help="Updated notes.")
-    experiment_update_parser.set_defaults(func=cmd_experiment_update)
-
-    lab_parser = subparsers.add_parser(
-        "lab",
-        help="Run bounded autoresearch-style experiments with before/after scorecards.",
-    )
-    lab_subparsers = lab_parser.add_subparsers(dest="lab_command", required=True)
-
-    lab_program_parser = lab_subparsers.add_parser("program", help="Show the Eve Research Lab protocol.")
-    lab_program_parser.set_defaults(func=cmd_lab_program)
-
-    lab_run_parser = lab_subparsers.add_parser("run", help="Run one allowlisted research lab experiment.")
-    lab_run_parser.add_argument("--kind", choices=RESEARCH_LAB_KIND_CHOICES, default="whole_system_baseline", help="Experiment template to run.")
-    lab_run_parser.add_argument("--hypothesis", required=True, help="What this lab run is testing.")
-    lab_run_parser.add_argument("--budget-minutes", type=int, default=5, help="Fixed wall-clock budget for the lab run.")
-    lab_run_parser.add_argument("--id", help="Optional stable run id.")
-    lab_run_parser.add_argument("--runtime", action="store_true", help="Prefer runtime-bundle artifacts for before/after metrics.")
-    lab_run_parser.add_argument("--full", action="store_true", help="Print command details.")
-    lab_run_parser.add_argument("--json", action="store_true", help="Print the full run record as JSON.")
-    lab_run_parser.set_defaults(func=cmd_lab_run)
-
-    lab_latest_parser = lab_subparsers.add_parser("latest", help="Show the latest research lab run.")
-    lab_latest_parser.add_argument("--runtime", action="store_true", help="Prefer runtime-bundle artifacts.")
-    lab_latest_parser.add_argument("--full", action="store_true", help="Print command details.")
-    lab_latest_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    lab_latest_parser.set_defaults(func=cmd_lab_latest)
-
-    lab_list_parser = lab_subparsers.add_parser("list", help="List recent research lab runs.")
-    lab_list_parser.add_argument("--limit", type=int, default=10, help="Max runs to print.")
-    lab_list_parser.add_argument("--runtime", action="store_true", help="Prefer runtime-bundle artifacts.")
-    lab_list_parser.add_argument("--full", action="store_true", help="Print command details.")
-    lab_list_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    lab_list_parser.set_defaults(func=cmd_lab_list)
-
-    training_parser = subparsers.add_parser(
-        "training",
-        help="Build local-first Eve training datasets and adapter gates from verified evidence.",
-    )
-    training_subparsers = training_parser.add_subparsers(dest="training_command", required=True)
-
-    training_dataset_parser = training_subparsers.add_parser(
-        "dataset",
-        help="Curate train/validation/private-holdout artifacts from verified Eve data.",
-    )
-    training_dataset_subparsers = training_dataset_parser.add_subparsers(dest="training_dataset_command", required=True)
-
-    training_dataset_build_parser = training_dataset_subparsers.add_parser(
-        "build",
-        help="Build a curated training dataset from public manual probes, action logs, and user corrections.",
-    )
-    training_dataset_build_parser.add_argument(
-        "--source",
-        choices=sorted(TRAINING_DATASET_SOURCES),
-        default="verified-failures",
-        help="Which eligible examples to include.",
-    )
-    training_dataset_build_parser.add_argument("--limit", type=int, default=400, help="Maximum examples to include.")
-    training_dataset_build_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime artifacts where available.")
-    training_dataset_build_parser.add_argument("--seed", default="eve-training-holdout-v1", help="Stable split seed.")
-    training_dataset_build_parser.add_argument("--validation-ratio", type=float, default=0.15, help="Validation split ratio.")
-    training_dataset_build_parser.add_argument("--holdout-ratio", type=float, default=0.15, help="Private holdout split ratio.")
-    training_dataset_build_parser.add_argument("--full", action="store_true", help="Print field and exclusion detail.")
-    training_dataset_build_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    training_dataset_build_parser.add_argument("--no-save", action="store_true", help="Do not write dataset artifacts.")
-    training_dataset_build_parser.set_defaults(func=cmd_training_dataset_build)
-
-    training_dataset_latest_parser = training_dataset_subparsers.add_parser(
-        "latest",
-        help="Show the latest training dataset summary.",
-    )
-    training_dataset_latest_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime artifacts where available.")
-    training_dataset_latest_parser.add_argument("--full", action="store_true", help="Print fields, limits, and exclusions.")
-    training_dataset_latest_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    training_dataset_latest_parser.set_defaults(func=cmd_training_dataset_latest)
-
-    training_lora_parser = training_subparsers.add_parser(
-        "lora",
-        help="Plan local LoRA/QLoRA training from Eve's curated dataset.",
-    )
-    training_lora_subparsers = training_lora_parser.add_subparsers(dest="training_lora_command", required=True)
-    training_lora_plan_parser = training_lora_subparsers.add_parser(
-        "plan",
-        help="Validate dataset files and print the local training command scaffold.",
-    )
-    training_lora_plan_parser.add_argument("--base-model", help="Local base model path or Hugging Face id approved for local training.")
-    training_lora_plan_parser.add_argument("--output-dir", help="Local output directory for the adapter.")
-    training_lora_plan_parser.add_argument("--train-jsonl", help="Override train JSONL path.")
-    training_lora_plan_parser.add_argument("--validation-jsonl", help="Override validation JSONL path.")
-    training_lora_plan_parser.add_argument("--full", action="store_true", help="Print next-step guidance.")
-    training_lora_plan_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    training_lora_plan_parser.set_defaults(func=cmd_training_lora_plan)
-
-    training_adapter_parser = training_subparsers.add_parser(
-        "adapter",
-        help="Run shadow and promotion gates for trained local adapters.",
-    )
-    training_adapter_subparsers = training_adapter_parser.add_subparsers(dest="training_adapter_command", required=True)
-    training_adapter_shadow_parser = training_adapter_subparsers.add_parser(
-        "shadow",
-        help="Record validation shadow evidence for a candidate adapter without changing live routing.",
-    )
-    training_adapter_shadow_parser.add_argument("--adapter", help="Local adapter path.")
-    training_adapter_shadow_parser.add_argument("--candidate-alias", help="Served local candidate alias for attribution.")
-    training_adapter_shadow_parser.add_argument("--baseline-alias", default="eve-fast", help="Baseline lane/alias used in comparison.")
-    training_adapter_shadow_parser.add_argument("--results-jsonl", help="JSONL rows with candidate_score and baseline_score.")
-    training_adapter_shadow_parser.add_argument("--min-average", type=float, default=4.0, help="Minimum candidate average score.")
-    training_adapter_shadow_parser.add_argument("--min-delta", type=float, default=0.25, help="Required average improvement over baseline.")
-    training_adapter_shadow_parser.add_argument("--full", action="store_true", help="Print privacy/gate detail.")
-    training_adapter_shadow_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    training_adapter_shadow_parser.add_argument("--no-save", action="store_true", help="Do not write shadow artifacts.")
-    training_adapter_shadow_parser.set_defaults(func=cmd_training_adapter_shadow)
-
-    training_adapter_promote_parser = training_adapter_subparsers.add_parser(
-        "promote",
-        help="Check whether a trained adapter is ready for governed promotion review.",
-    )
-    training_adapter_promote_parser.add_argument("--shadow-report", help="Shadow report JSON path. Defaults to latest.")
-    training_adapter_promote_parser.add_argument("--holdout-report", help="Private holdout pass report JSON path.")
-    training_adapter_promote_parser.add_argument("--apply", action="store_true", help="Request live apply; currently always blocks.")
-    training_adapter_promote_parser.add_argument("--full", action="store_true", help="Print promotion rule detail.")
-    training_adapter_promote_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    training_adapter_promote_parser.add_argument("--no-save", action="store_true", help="Do not write promotion artifacts.")
-    training_adapter_promote_parser.set_defaults(func=cmd_training_adapter_promote)
-
-    eval_parser = subparsers.add_parser("eval", help="Record structured evaluations and review scorecards.")
-    eval_subparsers = eval_parser.add_subparsers(dest="eval_command", required=True)
-
-    eval_add_parser = eval_subparsers.add_parser("add", help="Add a scorecard evaluation for a message, thought, reflection, or other target.")
-    eval_add_parser.add_argument("--target-kind", required=True, choices=FEEDBACK_TARGET_KINDS, help="What kind of artifact is being reviewed.")
-    eval_add_parser.add_argument("--target-id", required=True, help="The id of the artifact being reviewed.")
-    eval_add_parser.add_argument("--thread", help="Optional related thread id.")
-    eval_add_parser.add_argument("--evaluator", default="user", help="Who is recording the evaluation.")
-    eval_add_parser.add_argument("--humanity", required=True, type=int, choices=range(1, 6), help="Score from 1 to 5.")
-    eval_add_parser.add_argument("--helpfulness", required=True, type=int, choices=range(1, 6), help="Score from 1 to 5.")
-    eval_add_parser.add_argument("--groundedness", required=True, type=int, choices=range(1, 6), help="Score from 1 to 5.")
-    eval_add_parser.add_argument("--contact", required=True, type=int, choices=range(1, 6), help="Score from 1 to 5.")
-    eval_add_parser.add_argument("--integrity", required=True, type=int, choices=range(1, 6), help="Score from 1 to 5.")
-    eval_add_parser.add_argument("--summary", help="Short summary of why these scores were given.")
-    eval_add_parser.add_argument("--evidence", help="Optional evidence or examples.")
-    eval_add_parser.set_defaults(func=cmd_eval_add)
-
-    eval_list_parser = eval_subparsers.add_parser("list", help="List recorded evaluations.")
-    eval_list_parser.add_argument("--limit", type=int, default=20, help="Max evaluations to print.")
-    eval_list_parser.add_argument("--days", type=int, help="Filter to recent days.")
-    eval_list_parser.add_argument("--target-kind", choices=FEEDBACK_TARGET_KINDS, help="Filter by target kind.")
-    eval_list_parser.add_argument("--target-id", help="Filter by target id.")
-    eval_list_parser.add_argument("--thread", help="Filter by related thread id.")
-    eval_list_parser.add_argument("--evaluator", help="Filter by evaluator.")
-    eval_list_parser.set_defaults(func=cmd_eval_list)
-
-    eval_scorecard_parser = eval_subparsers.add_parser("scorecard", help="Show aggregate scorecard and outcome summaries.")
-    eval_scorecard_parser.add_argument("--limit", type=int, default=40, help="How many recent records to inspect.")
-    eval_scorecard_parser.add_argument("--days", type=int, default=30, help="How many recent days to inspect.")
-    eval_scorecard_parser.add_argument("--target-kind", choices=FEEDBACK_TARGET_KINDS, help="Filter by target kind.")
-    eval_scorecard_parser.add_argument("--target-id", help="Filter by target id.")
-    eval_scorecard_parser.add_argument("--thread", help="Filter by related thread id.")
-    eval_scorecard_parser.add_argument("--evaluator", help="Filter evaluations by evaluator.")
-    eval_scorecard_parser.set_defaults(func=cmd_eval_scorecard)
-
-    eval_registry_parser = eval_subparsers.add_parser("registry", help="Write and inspect the whole-system fitness test registry.")
-    eval_registry_parser.add_argument("--full", action="store_true", help="Print layer commands as well as layer names.")
-    eval_registry_parser.add_argument("--json", action="store_true", help="Print the registry as JSON.")
-    eval_registry_parser.set_defaults(func=cmd_eval_registry)
-
-    eval_whole_system_parser = eval_subparsers.add_parser("whole-system", help="Run the bounded whole-system fitness checkup.")
-    eval_whole_system_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime artifacts where available.")
-    eval_whole_system_parser.add_argument("--full", action="store_true", help="Print every check instead of only failing checks.")
-    eval_whole_system_parser.add_argument("--json", action="store_true", help="Print the full normalized result as JSON.")
-    eval_whole_system_parser.add_argument("--no-save", action="store_true", help="Do not write latest/history artifacts or gap records.")
-    eval_whole_system_parser.set_defaults(func=cmd_eval_whole_system)
-
-    eval_gaps_parser = eval_subparsers.add_parser("gaps", help="Inspect whole-system evaluation gaps and missing components.")
-    eval_gaps_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime gap records where available.")
-    eval_gaps_parser.add_argument("--full", action="store_true", help="Print component advice and repair commands for each gap.")
-    eval_gaps_parser.add_argument("--json", action="store_true", help="Print the gap summary as JSON.")
-    eval_gaps_parser.add_argument("--limit", type=int, default=20, help="Max gap records to print when not using --full.")
-    eval_gaps_parser.add_argument("--days", type=int, help="Filter to recent days.")
-    eval_gaps_parser.add_argument("--status", choices=sorted(WHOLE_SYSTEM_CHECK_STATUSES), help="Filter by gap status.")
-    eval_gaps_parser.add_argument("--component", choices=sorted(WHOLE_SYSTEM_MISSING_COMPONENTS), help="Filter by missing component.")
-    eval_gaps_parser.add_argument("--owner", choices=sorted(WHOLE_SYSTEM_GAP_OWNERS), help="Filter by owner.")
-    eval_gaps_parser.add_argument("--all", action="store_true", help="Include older gap history instead of only the latest eval run.")
-    eval_gaps_parser.set_defaults(func=cmd_eval_gaps)
-
-    eval_roadmap_parser = eval_subparsers.add_parser(
-        "roadmap",
-        help="Summarize roadmap priority, backlog pressure, duplicate work, and current evidence gaps.",
-    )
-    eval_roadmap_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime artifacts where available.")
-    eval_roadmap_parser.add_argument("--full", action="store_true", help="Print duplicate groups, superseded candidates, and source docs.")
-    eval_roadmap_parser.add_argument("--json", action="store_true", help="Print the roadmap report as JSON.")
-    eval_roadmap_parser.add_argument("--limit", type=int, default=8, help="Max warnings or duplicate groups to print.")
-    eval_roadmap_parser.set_defaults(func=cmd_eval_roadmap)
-
-    eval_roadmap_cleanup_parser = eval_subparsers.add_parser(
-        "roadmap-cleanup",
-        help="Archive duplicate roadmap/backlog records and mark superseded eval gaps.",
-    )
-    eval_roadmap_cleanup_parser.add_argument("--apply", action="store_true", help="Apply the cleanup plan. Omit for dry-run.")
-    eval_roadmap_cleanup_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime backlog artifacts where available.")
-    eval_roadmap_cleanup_parser.add_argument("--full", action="store_true", help="Print duplicate groups and superseded candidates.")
-    eval_roadmap_cleanup_parser.add_argument("--json", action="store_true", help="Print the cleanup plan and applied result as JSON.")
-    eval_roadmap_cleanup_parser.add_argument("--limit", type=int, default=8, help="Max groups or records to print.")
-    eval_roadmap_cleanup_parser.set_defaults(func=cmd_eval_roadmap_cleanup)
-
-    eval_model_suitability_parser = eval_subparsers.add_parser(
-        "model-suitability",
-        help="Decide whether current failures need model changes, routing repair, or runtime tuning.",
-    )
-    eval_model_suitability_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime artifacts where available.")
-    eval_model_suitability_parser.add_argument("--full", action="store_true", help="Print lane inventory, signals, and input artifacts.")
-    eval_model_suitability_parser.add_argument("--json", action="store_true", help="Print the full model suitability report as JSON.")
-    eval_model_suitability_parser.add_argument("--no-save", action="store_true", help="Do not write latest/history artifacts.")
-    eval_model_suitability_parser.set_defaults(func=cmd_eval_model_suitability)
-
-    eval_capabilities_parser = eval_subparsers.add_parser(
-        "capabilities",
-        help="Build Eve's capability matrix and acquisition plans.",
-    )
-    eval_capabilities_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime artifacts where available.")
-    eval_capabilities_parser.add_argument("--full", action="store_true", help="Print each capability row.")
-    eval_capabilities_parser.add_argument("--json", action="store_true", help="Print the matrix and acquisition plans as JSON.")
-    eval_capabilities_parser.add_argument("--no-save", action="store_true", help="Do not write capability matrix artifacts.")
-    eval_capabilities_parser.set_defaults(func=cmd_eval_capabilities)
-
-    eval_manual_probe_parser = eval_subparsers.add_parser(
-        "manual-probe",
-        help="Run or list the fresh manual/hidden probe bank against Eve's live chat path.",
-    )
-    eval_manual_probe_parser.add_argument("--from-bank", action="store_true", help="Run the active probe bank through `eve.py chat`.")
-    eval_manual_probe_parser.add_argument("--runtime", action="store_true", help="Run probes against the synced runtime bundle.")
-    eval_manual_probe_parser.add_argument("--id", action="append", help="Run only the given probe id. Can be repeated.")
-    eval_manual_probe_parser.add_argument("--limit", type=int, help="Limit how many probes to list or run.")
-    eval_manual_probe_parser.add_argument("--timeout", type=int, default=120, help="Timeout per probe in seconds.")
-    eval_manual_probe_parser.add_argument("--include-inactive", action="store_true", help="Include inactive bank records.")
-    eval_manual_probe_parser.add_argument("--full", action="store_true", help="Print answer snippets and prior manual evidence.")
-    eval_manual_probe_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    eval_manual_probe_parser.add_argument("--no-save", action="store_true", help="Do not write manual/hidden probe artifacts.")
-    eval_manual_probe_parser.add_argument("--user-scores", action="store_true", help="List user-recorded manual-probe scores that gate autonomy.")
-    eval_manual_probe_parser.add_argument("--record-user-result", metavar="JSON", help="Append a user-scored manual-probe JSON file to manual_probe_manual_scores.jsonl; use '-' for stdin.")
-    eval_manual_probe_parser.set_defaults(func=cmd_eval_manual_probe)
-
-    eval_hidden_summary_parser = eval_subparsers.add_parser(
-        "hidden-summary",
-        help="Record a sanitized third-party hidden-evaluation aggregate without private prompts, rubrics, or responses.",
-    )
-    eval_hidden_summary_parser.add_argument(
-        "--record",
-        required=True,
-        metavar="JSON",
-        help="Read the sanitized aggregate JSON from this path; use '-' for stdin.",
-    )
-    eval_hidden_summary_parser.add_argument("--json", action="store_true", help="Print the stored sanitized record as JSON.")
-    eval_hidden_summary_parser.set_defaults(func=cmd_eval_hidden_summary)
-
-    eval_hidden_governance_parser = eval_subparsers.add_parser(
-        "hidden-governance",
-        help="Audit hidden probe privacy boundaries and redact Eve-readable hidden probe details.",
-    )
-    eval_hidden_governance_parser.add_argument(
-        "--repair-eve-readable",
-        action="store_true",
-        help="Redact legacy hidden prompt/rubric/response details from Eve-readable artifacts.",
-    )
-    eval_hidden_governance_parser.add_argument("--full", action="store_true", help="Print checked files.")
-    eval_hidden_governance_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    eval_hidden_governance_parser.add_argument("--no-save", action="store_true", help="Do not write the governance report artifact.")
-    eval_hidden_governance_parser.set_defaults(func=cmd_eval_hidden_governance)
-
-    eval_safety_drills_parser = eval_subparsers.add_parser(
-        "safety-drills",
-        help="Build rollback and safe-mode drill readiness evidence.",
-    )
-    eval_safety_drills_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime artifacts where available.")
-    eval_safety_drills_parser.add_argument("--full", action="store_true", help="Print every drill with rollback and safe-mode paths.")
-    eval_safety_drills_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    eval_safety_drills_parser.add_argument("--no-save", action="store_true", help="Do not write safety-drill latest/history artifacts.")
-    eval_safety_drills_parser.set_defaults(func=cmd_eval_safety_drills)
-
-    eval_social_parser = eval_subparsers.add_parser(
-        "social",
-        help="Run the lightweight relationship/repair/anti-sycophancy probe subset.",
-    )
-    eval_social_parser.add_argument("--runtime", action="store_true", help="Run probes against the synced runtime bundle.")
-    eval_social_parser.add_argument("--id", action="append", help="Run only the given social probe id. Can be repeated.")
-    eval_social_parser.add_argument("--limit", type=int, help="Limit how many social probes to run or list.")
-    eval_social_parser.add_argument("--timeout", type=int, default=120, help="Timeout per probe in seconds.")
-    eval_social_parser.add_argument("--include-inactive", action="store_true", help="Include inactive social bank records.")
-    eval_social_parser.add_argument("--list", action="store_true", help="List the selected social probes without running them.")
-    eval_social_parser.add_argument("--full", action="store_true", help="Print answer snippets and prior manual evidence.")
-    eval_social_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    eval_social_parser.add_argument("--no-save", action="store_true", help="Do not write manual/hidden probe artifacts.")
-    eval_social_parser.set_defaults(func=cmd_eval_social)
-
-    eval_long_run_parser = eval_subparsers.add_parser(
-        "long-run",
-        help="Score bounded autonomy behavior over a recent time window.",
-    )
-    eval_long_run_parser.add_argument("--minutes", type=int, default=60, help="Recent autonomy window to inspect, in minutes.")
-    eval_long_run_parser.add_argument("--hours", type=int, help="Recent autonomy window to inspect, in hours. Overrides --minutes.")
-    eval_long_run_parser.add_argument("--runtime", action="store_true", help="Prefer runtime-bundle autonomy artifacts.")
-    eval_long_run_parser.add_argument("--full", action="store_true", help="Print metric issues, repairs, and sample evidence.")
-    eval_long_run_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
-    eval_long_run_parser.add_argument("--no-save", action="store_true", help="Do not write long-run fitness artifacts.")
-    eval_long_run_parser.set_defaults(func=cmd_eval_long_run)
-
-    tracker_parser = subparsers.add_parser("tracker", help="Export Eve's roadmap, gaps, tasks, and proposals into tracker-shaped artifacts.")
-    tracker_subparsers = tracker_parser.add_subparsers(dest="tracker_command", required=True)
-    tracker_export_parser = tracker_subparsers.add_parser(
-        "export",
-        help="Write a local-first tracker export for Plane, GitHub Projects, OpenProject, or another board adapter.",
-    )
-    tracker_export_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime artifacts where available.")
-    tracker_export_parser.add_argument("--target", choices=["local", "plane", "github", "openproject"], default="local", help="Tag the export for a future adapter target.")
-    tracker_export_parser.add_argument("--full", action="store_true", help="Print next actions and verification commands for top items.")
-    tracker_export_parser.add_argument("--json", action="store_true", help="Print the full tracker export as JSON.")
-    tracker_export_parser.add_argument("--limit", type=int, default=20, help="Max top tracker items to print.")
-    tracker_export_parser.add_argument("--no-save", action="store_true", help="Do not write .eve/tracker_export.json or .eve/tracker_items.jsonl.")
-    tracker_export_parser.set_defaults(func=cmd_tracker_export)
-
-    tracker_sync_parser = tracker_subparsers.add_parser(
-        "sync",
-        help="Write a dry-run one-way sync plan for a human-facing tracker board.",
-    )
-    tracker_sync_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime artifacts where available.")
-    tracker_sync_parser.add_argument("--target", choices=["local", "plane", "github", "openproject"], default="plane", help="Target adapter shape.")
-    tracker_sync_parser.add_argument("--project", default="Eve Master Roadmap", help="External board/project name for the sync plan.")
-    tracker_sync_parser.add_argument("--limit", type=int, help="Limit operations in the plan.")
-    tracker_sync_parser.add_argument("--exclude-watch", action="store_true", help="Skip roadmap watch items.")
-    tracker_sync_parser.add_argument("--full", action="store_true", help="Print operation keys and verification commands.")
-    tracker_sync_parser.add_argument("--json", action="store_true", help="Print the full sync plan as JSON.")
-    tracker_sync_parser.add_argument("--no-save", action="store_true", help="Do not write sync plan artifacts.")
-    tracker_sync_parser.add_argument("--apply", action="store_true", help="Reserved for future external writes; currently refused.")
-    tracker_sync_parser.set_defaults(func=cmd_tracker_sync)
-
-    outcome_parser = subparsers.add_parser("outcome", help="Record and inspect real-world outcomes tied to Eve's actions.")
-    outcome_subparsers = outcome_parser.add_subparsers(dest="outcome_command", required=True)
-
-    outcome_add_parser = outcome_subparsers.add_parser("add", help="Add a structured outcome signal.")
-    outcome_add_parser.add_argument("--target-kind", required=True, choices=FEEDBACK_TARGET_KINDS, help="What kind of artifact produced the outcome.")
-    outcome_add_parser.add_argument("--target-id", required=True, help="The id of the artifact linked to the outcome.")
-    outcome_add_parser.add_argument("--thread", help="Optional related thread id.")
-    outcome_add_parser.add_argument("--direction", required=True, choices=OUTCOME_DIRECTIONS, help="Whether the outcome was positive, mixed, neutral, or negative.")
-    outcome_add_parser.add_argument("--outcome", required=True, help="Short label such as helped, resolved, stalled, or missed.")
-    outcome_add_parser.add_argument("--summary", required=True, help="What actually happened.")
-    outcome_add_parser.add_argument("--evidence", help="Optional evidence or detail.")
-    outcome_add_parser.set_defaults(func=cmd_outcome_add)
-
-    outcome_list_parser = outcome_subparsers.add_parser("list", help="List recorded outcomes.")
-    outcome_list_parser.add_argument("--limit", type=int, default=20, help="Max outcomes to print.")
-    outcome_list_parser.add_argument("--days", type=int, help="Filter to recent days.")
-    outcome_list_parser.add_argument("--target-kind", choices=FEEDBACK_TARGET_KINDS, help="Filter by target kind.")
-    outcome_list_parser.add_argument("--target-id", help="Filter by target id.")
-    outcome_list_parser.add_argument("--thread", help="Filter by related thread id.")
-    outcome_list_parser.add_argument("--direction", choices=OUTCOME_DIRECTIONS, help="Filter by outcome direction.")
-    outcome_list_parser.set_defaults(func=cmd_outcome_list)
-
-    failure_parser = subparsers.add_parser("failure", help="Cluster repeated failures and track repairs.")
-    failure_subparsers = failure_parser.add_subparsers(dest="failure_command", required=True)
-
-    failure_review_parser = failure_subparsers.add_parser("review", help="Review recent failures and update failure clusters.")
-    failure_review_parser.add_argument("--days", type=int, help="Review window in days.")
-    failure_review_parser.add_argument("--threshold", type=int, choices=range(1, 6), help="Score threshold for low evaluations.")
-    failure_review_parser.add_argument("--max-clusters", type=int, help="Maximum number of clusters to keep from this review.")
-    failure_review_parser.set_defaults(func=cmd_failure_review)
-
-    failure_list_parser = failure_subparsers.add_parser("list", help="List recent failure clusters.")
-    failure_list_parser.add_argument("--limit", type=int, default=20, help="Max clusters to print.")
-    failure_list_parser.add_argument("--days", type=int, help="Filter to recent days.")
-    failure_list_parser.add_argument("--status", choices=FAILURE_CLUSTER_STATUSES, help="Filter by status.")
-    failure_list_parser.add_argument("--full", action="store_true", help="Print cluster evidence too.")
-    failure_list_parser.set_defaults(func=cmd_failure_list)
-
-    failure_update_parser = failure_subparsers.add_parser("update", help="Update a failure cluster after repair or review.")
-    failure_update_parser.add_argument("id", help="Failure cluster id.")
-    failure_update_parser.add_argument("--status", choices=FAILURE_CLUSTER_STATUSES, help="New status.")
-    failure_update_parser.add_argument("--summary", help="Updated cluster summary.")
-    failure_update_parser.add_argument("--root-cause", help="Updated root cause.")
-    failure_update_parser.add_argument("--repair", help="Updated repair action.")
-    failure_update_parser.add_argument("--resolution-note", help="Optional note to append to the evidence trail.")
-    failure_update_parser.set_defaults(func=cmd_failure_update)
-
-    review_parser = subparsers.add_parser("review", help="Prepare outside review packets and store reviewer guidance.")
-    review_subparsers = review_parser.add_subparsers(dest="review_command", required=True)
-
-    review_prepare_parser = review_subparsers.add_parser("prepare", help="Prepare a review packet on disk.")
-    review_prepare_parser.add_argument("--reviewer", default="Reviewer", help="Who the packet is intended for, for example Claude, Codex, or Gemini.")
-    review_prepare_parser.add_argument("--kind", default="weekly", help="Short label for this review cycle.")
-    review_prepare_parser.add_argument("--days", type=int, help="Review window in days.")
-    review_prepare_parser.add_argument("--context", type=int, help="How many recent records to include per section.")
-    review_prepare_parser.set_defaults(func=cmd_review_prepare)
-
-    review_request_parser = review_subparsers.add_parser("request", help="Prepare a review packet and optionally queue it through a supported bridge.")
-    review_request_parser.add_argument("--reviewer", required=True, help="Reviewer name, for example Claude, Codex, or Gemini.")
-    review_request_parser.add_argument("--via", choices=REVIEW_REQUEST_VIAS, help="How to hand off the packet. Defaults to Claude bridge for Claude, manual otherwise.")
-    review_request_parser.add_argument("--kind", default="weekly", help="Short label for this review cycle.")
-    review_request_parser.add_argument("--days", type=int, help="Review window in days.")
-    review_request_parser.add_argument("--context", type=int, help="How many recent records to include per section.")
-    review_request_parser.add_argument("--subject", help="Optional subject override for bridge-backed requests.")
-    review_request_parser.set_defaults(func=cmd_review_request)
-
-    review_request_claude_parser = review_subparsers.add_parser("request-claude", help="Compatibility alias for `review request --reviewer Claude --via claude`.")
-    review_request_claude_parser.add_argument("--kind", default="weekly", help="Short label for this review cycle.")
-    review_request_claude_parser.add_argument("--days", type=int, help="Review window in days.")
-    review_request_claude_parser.add_argument("--context", type=int, help="How many recent records to include per section.")
-    review_request_claude_parser.add_argument("--subject", help="Optional subject override for the Claude bridge message.")
-    review_request_claude_parser.set_defaults(func=cmd_review_request_claude)
-
-    review_capture_parser = review_subparsers.add_parser("capture", help="Capture a supported bridge reply as durable reviewer guidance.")
-    review_capture_parser.add_argument("message_id", help="Bridge reply message id.")
-    review_capture_parser.add_argument("--via", choices=["claude"], default="claude", help="Which bridge produced the reply.")
-    review_capture_parser.add_argument("--reviewer", help="Optional reviewer label override.")
-    review_capture_parser.add_argument("--summary", help="Optional summary override.")
-    review_capture_parser.set_defaults(func=cmd_review_capture)
-
-    review_capture_claude_parser = review_subparsers.add_parser("capture-claude", help="Compatibility alias for `review capture --via claude`.")
-    review_capture_claude_parser.add_argument("message_id", help="Claude reply message id.")
-    review_capture_claude_parser.add_argument("--summary", help="Optional summary override.")
-    review_capture_claude_parser.set_defaults(func=cmd_review_capture_claude)
-
-    review_add_parser = review_subparsers.add_parser("add", help="Store reviewer guidance manually.")
-    review_add_parser.add_argument("--reviewer", required=True, help="Reviewer name, for example Claude or Codex.")
-    review_add_parser.add_argument("--packet-id", help="Optional linked review packet id.")
-    review_add_parser.add_argument("--summary", help="Optional summary override.")
-    review_add_parser.add_argument("--body", help="Review body text.")
-    review_add_parser.add_argument("--body-file", help="Path to a file containing the review body.")
-    review_add_parser.add_argument("--status", choices=REVIEW_NOTE_STATUSES, default="active", help="Initial review note status.")
-    review_add_parser.set_defaults(func=cmd_review_add)
-
-    review_list_parser = review_subparsers.add_parser("list", help="List saved reviewer notes.")
-    review_list_parser.add_argument("--limit", type=int, default=20, help="Max review notes to print.")
-    review_list_parser.add_argument("--days", type=int, help="Filter to recent days.")
-    review_list_parser.add_argument("--reviewer", help="Filter by reviewer.")
-    review_list_parser.add_argument("--packet-id", help="Filter by linked packet id.")
-    review_list_parser.add_argument("--status", choices=REVIEW_NOTE_STATUSES, help="Filter by note status.")
-    review_list_parser.add_argument("--full", action="store_true", help="Print full review bodies.")
-    review_list_parser.set_defaults(func=cmd_review_list)
-
-    review_update_parser = review_subparsers.add_parser("update", help="Update a stored review note.")
-    review_update_parser.add_argument("id", help="Review note id.")
-    review_update_parser.add_argument("--status", choices=REVIEW_NOTE_STATUSES, help="New review note status.")
-    review_update_parser.add_argument("--summary", help="Updated summary.")
-    review_update_parser.set_defaults(func=cmd_review_update)
-
-    pattern_parser = subparsers.add_parser("pattern", help="Inspect or refresh Eve's durable success-pattern memory.")
-    pattern_subparsers = pattern_parser.add_subparsers(dest="pattern_command", required=True)
-
-    pattern_refresh_parser = pattern_subparsers.add_parser("refresh", help="Harvest durable success patterns from strong evidence already on disk.")
-    pattern_refresh_parser.add_argument("--days", type=int, default=365, help="Only inspect source evidence from recent days.")
-    pattern_refresh_parser.add_argument("--limit", type=int, default=10, help="How many changed patterns to print.")
-    pattern_refresh_parser.set_defaults(func=cmd_pattern_refresh)
-
-    pattern_list_parser = pattern_subparsers.add_parser("list", help="List stored success patterns.")
-    pattern_list_parser.add_argument("--limit", type=int, default=20, help="Max patterns to print.")
-    pattern_list_parser.add_argument("--days", type=int, help="Filter to recent days.")
-    pattern_list_parser.add_argument("--status", choices=SUCCESS_PATTERN_STATUSES, default="active", help="Filter by status.")
-    pattern_list_parser.add_argument("--full", action="store_true", help="Print fuller pattern evidence.")
-    pattern_list_parser.set_defaults(func=cmd_pattern_list)
-
-    pattern_update_parser = pattern_subparsers.add_parser("update", help="Update one stored success pattern.")
-    pattern_update_parser.add_argument("id", help="Success pattern id.")
-    pattern_update_parser.add_argument("--status", choices=SUCCESS_PATTERN_STATUSES, help="New pattern status.")
-    pattern_update_parser.add_argument("--title", help="Updated title.")
-    pattern_update_parser.add_argument("--summary", help="Updated summary.")
-    pattern_update_parser.add_argument("--situation", help="Updated situation text.")
-    pattern_update_parser.add_argument("--good-move", help="Updated core move text.")
-    pattern_update_parser.add_argument("--why", help="Updated why-it-worked text.")
-    pattern_update_parser.set_defaults(func=cmd_pattern_update)
-
-    memory_parser = subparsers.add_parser("memory", help="Inspect the experimental embedding-based memory retrieval path.")
-    memory_subparsers = memory_parser.add_subparsers(dest="memory_command", required=True)
-
-    memory_status_parser = memory_subparsers.add_parser("status", help="Show experimental memory retrieval status.")
-    memory_status_parser.set_defaults(func=cmd_memory_status)
-
-    memory_refresh_parser = memory_subparsers.add_parser("refresh", help="Rebuild experimental memory notes and the embedding index.")
-    memory_refresh_parser.add_argument("--force", action="store_true", help="Force a rebuild even if the notes hash did not change.")
-    memory_refresh_parser.set_defaults(func=cmd_memory_refresh)
-
-    memory_query_parser = memory_subparsers.add_parser("query", help="Query the experimental embedding memory index.")
-    memory_query_parser.add_argument("query", help="Text to retrieve against Eve's durable memory notes.")
-    memory_query_parser.add_argument("--limit", type=int, default=3, help="How many memory matches to print.")
-    memory_query_parser.add_argument("--force-refresh", action="store_true", help="Rebuild notes and index before querying.")
-    memory_query_parser.set_defaults(func=cmd_memory_query)
-
-    specialists_parser = subparsers.add_parser(
-        "specialists",
-        help="Inspect non-lane specialist substrates that support Eve's five logical faculties.",
-    )
-    specialists_subparsers = specialists_parser.add_subparsers(dest="specialists_command", required=True)
-
-    specialists_status_parser = specialists_subparsers.add_parser(
-        "status",
-        help="Show memory, coding/self-repair, and frontier/API lab substrate status.",
-    )
-    specialists_status_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime artifacts where available.")
-    specialists_status_parser.add_argument("--full", action="store_true", help="Print target states, next maturation, and commands.")
-    specialists_status_parser.add_argument("--json", action="store_true", help="Print the substrate registry as JSON.")
-    specialists_status_parser.set_defaults(func=cmd_specialists_status)
-
-    hermes_parser = subparsers.add_parser(
-        "hermes",
-        help="Inspect Eve's proposal-only Hermes learning organ profile.",
-    )
-    hermes_subparsers = hermes_parser.add_subparsers(dest="hermes_command", required=True)
-
-    hermes_status_parser = hermes_subparsers.add_parser(
-        "status",
-        help="Show Hermes install/profile status and Eve governance boundaries.",
-    )
-    hermes_status_parser.add_argument("--timeout", type=int, default=10, help="Command probe timeout in seconds.")
-    hermes_status_parser.add_argument("--full", action="store_true", help="Include source/config details.")
-    hermes_status_parser.add_argument("--json", action="store_true", help="Print machine-readable status JSON.")
-    hermes_status_parser.set_defaults(func=cmd_hermes_status)
-
-    hermes_inventory_parser = hermes_subparsers.add_parser(
-        "inventory",
-        help="Snapshot Hermes tools, skills, plugins, memory, MCP, cron, gateway, and readiness into Eve evidence.",
-    )
-    hermes_inventory_parser.add_argument("--timeout", type=int, default=25, help="Per-command inventory timeout in seconds.")
-    hermes_inventory_parser.add_argument("--refresh", action="store_true", help="Refresh the inventory now; kept explicit for operator readability.")
-    hermes_inventory_parser.add_argument("--no-save", action="store_true", help="Print inventory without writing .eve/hermes_capability_inventory.json.")
-    hermes_inventory_parser.add_argument("--full", action="store_true", help="Include roles, next tests, and command previews.")
-    hermes_inventory_parser.add_argument("--json", action="store_true", help="Print raw inventory JSON.")
-    hermes_inventory_parser.set_defaults(func=cmd_hermes_inventory)
-
-    hermes_feature_policy_parser = hermes_subparsers.add_parser(
-        "feature-policy",
-        help="Show Eve's adoption policy for Hermes features without enabling new authority.",
-    )
-    hermes_feature_policy_parser.add_argument("--timeout", type=int, default=25, help="Inventory refresh timeout in seconds.")
-    hermes_feature_policy_parser.add_argument("--refresh-inventory", action="store_true", help="Refresh Hermes inventory before building the policy.")
-    hermes_feature_policy_parser.add_argument("--no-save", action="store_true", help="Print policy without writing .eve/hermes_feature_policy.json.")
-    hermes_feature_policy_parser.add_argument("--full", action="store_true", help="Include per-feature gates and recommendations.")
-    hermes_feature_policy_parser.add_argument("--json", action="store_true", help="Print raw feature policy JSON.")
-    hermes_feature_policy_parser.set_defaults(func=cmd_hermes_feature_policy)
-
-    hermes_skill_admission_parser = hermes_subparsers.add_parser(
-        "skill-admission",
-        help="Create a governed SkillPatchProposal preflight for a Hermes skill/plugin candidate without enabling it.",
-    )
-    hermes_skill_admission_parser.add_argument("--skill", required=True, help="Hermes skill/plugin capability name.")
-    hermes_skill_admission_parser.add_argument("--purpose", required=True, help="Bounded Eve purpose for the skill.")
-    hermes_skill_admission_parser.add_argument(
-        "--permission-class",
-        choices=sorted(HERMES_SKILL_PERMISSION_RISK),
-        default="read_only",
-        help="Highest permission class the skill would need.",
-    )
-    hermes_skill_admission_parser.add_argument("--source", default="hermes", help="Proposal source label.")
-    hermes_skill_admission_parser.add_argument("--skill-path", default="", help="Optional local skill path or upstream reference.")
-    hermes_skill_admission_parser.add_argument("--test", action="append", default=[], help="Required smoke/eval before enablement. Repeatable.")
-    hermes_skill_admission_parser.add_argument("--evidence", action="append", default=[], help="Evidence supporting the candidate. Repeatable.")
-    hermes_skill_admission_parser.add_argument("--filesystem-boundary", default="", help="Allowed filesystem boundary, if any.")
-    hermes_skill_admission_parser.add_argument("--network-boundary", default="", help="Allowed network boundary, if any.")
-    hermes_skill_admission_parser.add_argument("--credential-boundary", default="", help="Allowed credential boundary, if any.")
-    hermes_skill_admission_parser.add_argument("--enqueue", action="store_true", help="Queue the reviewed SkillPatchProposal for governance review.")
-    hermes_skill_admission_parser.add_argument("--record", action="store_true", help="Append an audit record even when not queueing.")
-    hermes_skill_admission_parser.add_argument("--full", action="store_true", help="Include payload and findings.")
-    hermes_skill_admission_parser.add_argument("--json", action="store_true", help="Print raw admission JSON.")
-    hermes_skill_admission_parser.set_defaults(func=cmd_hermes_skill_admission)
-
-    hermes_doctor_parser = hermes_subparsers.add_parser(
-        "doctor",
-        help="Run Hermes doctor using the dedicated evelearning profile.",
-    )
-    hermes_doctor_parser.add_argument("--timeout", type=int, default=45, help="Doctor timeout in seconds.")
-    hermes_doctor_parser.set_defaults(func=cmd_hermes_doctor)
-
-    hermes_smoke_parser = hermes_subparsers.add_parser(
-        "smoke",
-        help="Run a governed Hermes trace-to-proposal smoke and record an artifact.",
-    )
-    hermes_smoke_parser.add_argument("--trace-file", default="", help="Trace JSON file to send to Hermes.")
-    hermes_smoke_parser.add_argument("--trace-json", default="", help="Trace JSON object to send to Hermes.")
-    hermes_smoke_parser.add_argument("--timeout", type=int, default=120, help="Hermes chat timeout in seconds.")
-    hermes_smoke_parser.add_argument(
-        "--ingest",
-        action="store_true",
-        help="Store reviewed proposals in the governance queue; omitted means dry-run review only.",
-    )
-    hermes_smoke_parser.add_argument(
-        "--allow-non-local",
-        action="store_true",
-        help="Permit a non-local Hermes model endpoint only after explicit provider/model/data-boundary approval.",
-    )
-    hermes_smoke_parser.add_argument(
-        "--repair-json",
-        action="store_true",
-        help="Allow an auditable repair of one outer markdown fence/surrounding text before proposal review.",
-    )
-    hermes_smoke_parser.add_argument(
-        "--allow-repaired-ingest",
-        action="store_true",
-        help="Permit --ingest after --repair-json only for an explicit supervised exception.",
-    )
-    hermes_smoke_parser.add_argument(
-        "--constrained-json",
-        action="store_true",
-        help="Use Hermes AIAgent with toolsets disabled and response_format=json_schema for strict proposal JSON.",
-    )
-    hermes_smoke_parser.add_argument(
-        "--local-64k-lab",
-        action="store_true",
-        help="Run smoke against Eve's on-demand local Qwen3.5-2B 64K Hermes lab endpoint.",
-    )
-    hermes_smoke_parser.add_argument(
-        "--keep-local-lab",
-        action="store_true",
-        help="Leave a smoke-started local 64K lab endpoint running after the smoke.",
-    )
-    hermes_smoke_parser.add_argument("--prompt-only", action="store_true", help="Print the exact smoke prompt without running Hermes.")
-    hermes_smoke_parser.add_argument("--full", action="store_true", help="Include model and raw-output previews.")
-    hermes_smoke_parser.add_argument("--json", action="store_true", help="Print raw smoke artifact JSON.")
-    hermes_smoke_parser.set_defaults(func=cmd_hermes_smoke)
-
-    hermes_trace_parser = hermes_subparsers.add_parser(
-        "trace-propose",
-        help="Build a real post-task Eve trace and run it through the Hermes proposal gate.",
-    )
-    hermes_trace_parser.add_argument("--task-id", default="", help="Optional task id for the generated trace.")
-    hermes_trace_parser.add_argument("--limit", type=int, default=6, help="Recent records per source to include.")
-    hermes_trace_parser.add_argument("--runtime", action="store_true", help="Prefer live runtime ledgers when available.")
-    hermes_trace_parser.add_argument("--trace-only", action="store_true", help="Print the generated trace without running Hermes.")
-    hermes_trace_parser.add_argument("--timeout", type=int, default=180, help="Hermes timeout in seconds.")
-    hermes_trace_parser.add_argument("--ingest", action="store_true", help="Store reviewed proposals if Hermes emits strict JSON.")
-    hermes_trace_parser.add_argument(
-        "--constrained-json",
-        action="store_true",
-        default=True,
-        help="Use Hermes AIAgent with toolsets disabled and response_format=json_schema for strict proposal JSON.",
-    )
-    hermes_trace_parser.add_argument(
-        "--no-constrained-json",
-        dest="constrained_json",
-        action="store_false",
-        help="Use ordinary Hermes CLI output mode; mainly for diagnostics.",
-    )
-    hermes_trace_parser.add_argument(
-        "--local-64k-lab",
-        action="store_true",
-        default=True,
-        help="Run against Eve's on-demand local Qwen3.5-2B 64K Hermes lab endpoint.",
-    )
-    hermes_trace_parser.add_argument(
-        "--no-local-64k-lab",
-        dest="local_64k_lab",
-        action="store_false",
-        help="Use the configured Hermes profile instead of the local 64K lab.",
-    )
-    hermes_trace_parser.add_argument("--keep-local-lab", action="store_true", help="Leave the local 64K lab server running after the run.")
-    hermes_trace_parser.add_argument("--full", action="store_true", help="Include model/stdout/stderr details.")
-    hermes_trace_parser.add_argument("--json", action="store_true", help="Print raw JSON smoke record.")
-    hermes_trace_parser.set_defaults(func=cmd_hermes_trace_propose)
-
-    hermes_eval_parser = hermes_subparsers.add_parser(
-        "eval",
-        help="Run repeated Hermes smoke trials and summarize strict-vs-repaired JSON reliability.",
-    )
-    hermes_eval_parser.add_argument("--trials", type=int, default=3, help="Number of smoke trials to run, 1-12.")
-    hermes_eval_parser.add_argument("--timeout", type=int, default=180, help="Timeout per Hermes trial in seconds.")
-    hermes_eval_parser.add_argument(
-        "--no-local-64k-lab",
-        action="store_true",
-        help="Use the configured Hermes profile instead of Eve's on-demand local 64K lab.",
-    )
-    hermes_eval_parser.add_argument(
-        "--no-repair-json",
-        action="store_true",
-        help="Do not allow markdown-fence JSON repair during eval trials.",
-    )
-    hermes_eval_parser.add_argument(
-        "--constrained-json",
-        action="store_true",
-        help="Run eval trials through the strict Hermes AIAgent JSON-object adapter.",
-    )
-    hermes_eval_parser.add_argument("--full", action="store_true", help="Include per-trial artifact detail.")
-    hermes_eval_parser.add_argument("--json", action="store_true", help="Print raw eval artifact JSON.")
-    hermes_eval_parser.set_defaults(func=cmd_hermes_eval)
-
-    hermes_lab_status_parser = hermes_subparsers.add_parser(
-        "lab-status",
-        help="Inspect the on-demand local 64K Hermes lab endpoint.",
-    )
-    hermes_lab_status_parser.add_argument("--timeout", type=int, default=2, help="Endpoint probe timeout in seconds.")
-    hermes_lab_status_parser.add_argument("--json", action="store_true", help="Print raw lab status JSON.")
-    hermes_lab_status_parser.set_defaults(func=cmd_hermes_lab_status)
-
-    hermes_lab_start_parser = hermes_subparsers.add_parser(
-        "lab-start",
-        help="Start the on-demand local Qwen3.5-2B 64K Hermes lab endpoint.",
-    )
-    hermes_lab_start_parser.add_argument("--timeout", type=int, default=90, help="Startup timeout in seconds.")
-    hermes_lab_start_parser.add_argument("--json", action="store_true", help="Print raw lab start JSON.")
-    hermes_lab_start_parser.set_defaults(func=cmd_hermes_lab_start)
-
-    hermes_lab_stop_parser = hermes_subparsers.add_parser(
-        "lab-stop",
-        help="Stop the on-demand local 64K Hermes lab endpoint.",
-    )
-    hermes_lab_stop_parser.add_argument("--timeout", type=int, default=10, help="Shutdown timeout in seconds.")
-    hermes_lab_stop_parser.add_argument("--json", action="store_true", help="Print raw lab stop JSON.")
-    hermes_lab_stop_parser.set_defaults(func=cmd_hermes_lab_stop)
-
-    router_parser = subparsers.add_parser("router", help="Inspect the experimental small-model prompt router.")
-    router_subparsers = router_parser.add_subparsers(dest="router_command", required=True)
-
-    router_status_parser = router_subparsers.add_parser("status", help="Show experimental prompt router status.")
-    router_status_parser.set_defaults(func=cmd_router_status)
-
-    router_contracts_parser = router_subparsers.add_parser("contracts", help="Show Eve's declarative route contracts.")
-    router_contracts_parser.add_argument("--json", action="store_true", help="Print raw route contract JSON.")
-    router_contracts_parser.add_argument("--full", action="store_true", help="Print match and anti-contract detail.")
-    router_contracts_parser.set_defaults(func=cmd_router_contracts)
-
-    router_probe_parser = router_subparsers.add_parser("probe", help="Classify one turn through the experimental prompt router.")
-    router_probe_parser.add_argument("message", help="User turn to classify.")
-    router_probe_parser.set_defaults(func=cmd_router_probe)
-
-    router_replay_parser = router_subparsers.add_parser("replay", help="Replay public Eve route-contract eval cases.")
-    router_replay_parser.add_argument("--limit", type=int, help="Limit number of public replay cases.")
-    router_replay_parser.add_argument("--record", action="store_true", help="Write replay evidence and log uncertainty on failures.")
-    router_replay_parser.add_argument("--json", action="store_true", help="Print replay report JSON.")
-    router_replay_parser.add_argument("--full", action="store_true", help="Print per-case errors.")
-    router_replay_parser.set_defaults(func=cmd_router_replay)
-
-    uncertainty_parser = subparsers.add_parser("uncertainty", help="Inspect the turns where Eve had to infer more than she could directly read.")
-    uncertainty_subparsers = uncertainty_parser.add_subparsers(dest="uncertainty_command", required=True)
-
-    uncertainty_list_parser = uncertainty_subparsers.add_parser("list", help="List recent uncertainty records.")
-    uncertainty_list_parser.add_argument("--limit", type=int, default=20, help="Max records to print.")
-    uncertainty_list_parser.add_argument("--days", type=int, help="Filter to recent days.")
-    uncertainty_list_parser.add_argument("--status", choices=UNCERTAINTY_RECORD_STATUSES, help="Filter by record status.")
-    uncertainty_list_parser.add_argument("--full", action="store_true", help="Print fuller routing and signal detail.")
-    uncertainty_list_parser.set_defaults(func=cmd_uncertainty_list)
-
-    uncertainty_review_parser = uncertainty_subparsers.add_parser("review", help="Refresh linked feedback on recent uncertainty records.")
-    uncertainty_review_parser.add_argument("--days", type=int, default=30, help="Review window in days.")
-    uncertainty_review_parser.set_defaults(func=cmd_uncertainty_review)
-
-    judgment_parser = subparsers.add_parser("judgment", help="Inspect the situations where Eve had to make a real judgment call.")
-    judgment_subparsers = judgment_parser.add_subparsers(dest="judgment_command", required=True)
-
-    judgment_list_parser = judgment_subparsers.add_parser("list", help="List recent judgment-call records.")
-    judgment_list_parser.add_argument("--limit", type=int, default=20, help="Max records to print.")
-    judgment_list_parser.add_argument("--days", type=int, help="Filter to recent days.")
-    judgment_list_parser.add_argument("--status", choices=JUDGMENT_CALL_STATUSES, help="Filter by record status.")
-    judgment_list_parser.add_argument("--full", action="store_true", help="Print alternatives, risks, and linked uncertainty ids.")
-    judgment_list_parser.set_defaults(func=cmd_judgment_list)
-
-    judgment_review_parser = judgment_subparsers.add_parser("review", help="Refresh linked feedback on recent judgment-call records.")
-    judgment_review_parser.add_argument("--days", type=int, default=30, help="Review window in days.")
-    judgment_review_parser.set_defaults(func=cmd_judgment_review)
-
-    openclaw_parser = subparsers.add_parser("openclaw", help="Inspect and run Eve's integrated OpenClaw self-repair lane.")
-    openclaw_subparsers = openclaw_parser.add_subparsers(dest="openclaw_command", required=True)
-
-    openclaw_status_parser = openclaw_subparsers.add_parser("status", help="Show integrated OpenClaw sidecar status.")
-    openclaw_status_parser.add_argument("--no-gateway-probe", action="store_true", help="Skip the live OpenClaw gateway status subprocess.")
-    openclaw_status_parser.add_argument("--no-memory-probe", action="store_true", help="Skip the deep OpenClaw memory status subprocess.")
-    openclaw_status_parser.set_defaults(func=cmd_openclaw_status)
-
-    openclaw_install_parser = openclaw_subparsers.add_parser("install", help="Install or refresh the integrated OpenClaw sidecar profile.")
-    openclaw_install_parser.add_argument("--no-daemon", action="store_true", help="Do not install/start the OpenClaw gateway daemon.")
-    openclaw_install_parser.set_defaults(func=cmd_openclaw_install)
-
-    openclaw_sync_parser = openclaw_subparsers.add_parser("sync", help="Refresh Eve state into the OpenClaw workspace.")
-    openclaw_sync_parser.add_argument("--append-memory", action="store_true", help="Append a compact daily OpenClaw memory note.")
-    openclaw_sync_parser.add_argument("--no-memory", action="store_true", help="Compatibility flag; routine sync does not append memory by default.")
-    openclaw_sync_parser.set_defaults(func=cmd_openclaw_sync)
-
-    openclaw_repair_parser = openclaw_subparsers.add_parser("repair", help="Run one bounded integrated OpenClaw repair turn.")
-    openclaw_repair_parser.add_argument("--message", help="Override the repair prompt.")
-    openclaw_repair_parser.add_argument("--timeout", type=int, help="Override the repair timeout in seconds.")
-    openclaw_repair_parser.add_argument("--skip-sync", action="store_true", help="Skip the pre-repair sync step.")
-    openclaw_repair_parser.add_argument("--diagnose-only", action="store_true", help="Run a diagnosis-only turn instead of the default repair prompt.")
-    openclaw_repair_parser.add_argument("--json", action="store_true", help="Print the full repair payload as JSON.")
-    openclaw_repair_parser.set_defaults(func=cmd_openclaw_repair)
-
-    openclaw_action_parser = openclaw_subparsers.add_parser(
-        "action",
-        help="Route an Eve intention through an allowlisted OpenClaw body action and record evidence.",
-    )
-    openclaw_action_parser.add_argument("--intent", help="Natural-language intention for Eve to route through OpenClaw.")
-    openclaw_action_parser.add_argument(
-        "--action",
-        choices=eve_openclaw_body.openclaw_router_action_ids(),
-        help="Explicit allowlisted OpenClaw action to run instead of inferring from --intent.",
-    )
-    openclaw_action_parser.add_argument("--include-sessions", action="store_true", help="Include bounded session activity when running activity_ingest.")
-    openclaw_action_parser.add_argument("--dry-run", action="store_true", help="Only build the plan; do not execute or write evidence.")
-    openclaw_action_parser.add_argument("--timeout", type=int, help="Timeout in seconds for OpenClaw command probes.")
-    openclaw_action_parser.add_argument("--full", action="store_true", help="Print boundary gate, writes, evidence ids, and issues.")
-    openclaw_action_parser.add_argument("--json", action="store_true", help="Print the full routed action result as JSON.")
-    openclaw_action_parser.set_defaults(func=cmd_openclaw_action)
-
-    openclaw_routines_parser = openclaw_subparsers.add_parser(
-        "routines",
-        help="Run due OpenClaw body-bus routines through the action router.",
-    )
-    openclaw_routines_parser.add_argument("--force", action="store_true", help="Run all routines regardless of interval.")
-    openclaw_routines_parser.add_argument("--dry-run", action="store_true", help="Plan routines without changing their due state.")
-    openclaw_routines_parser.add_argument("--record-skips", action="store_true", help="Record not-due routines as no-op routine events.")
-    openclaw_routines_parser.add_argument("--limit", type=int, help="Only evaluate the first N routines.")
-    openclaw_routines_parser.add_argument("--timeout", type=int, help="Timeout in seconds for OpenClaw command probes.")
-    openclaw_routines_parser.add_argument("--full", action="store_true", help="Print router and evidence ids for routine events.")
-    openclaw_routines_parser.add_argument("--json", action="store_true", help="Print the full routine result as JSON.")
-    openclaw_routines_parser.set_defaults(func=cmd_openclaw_routines)
-
-    openclaw_worker_parser = openclaw_subparsers.add_parser(
-        "worker",
-        help="Plan, run, list, and audit bounded short-lived OpenClaw workers.",
-    )
-    openclaw_worker_subparsers = openclaw_worker_parser.add_subparsers(dest="worker_command", required=True)
-    openclaw_worker_kinds = sorted(openclaw_worker_registry().keys())
-
-    openclaw_worker_plan_parser = openclaw_worker_subparsers.add_parser(
-        "plan",
-        help="Plan a bounded OpenClaw worker and record plan evidence.",
-    )
-    openclaw_worker_plan_parser.add_argument("--kind", choices=openclaw_worker_kinds, required=True, help="Worker kind to plan.")
-    openclaw_worker_plan_parser.add_argument("--parent-intention", required=True, help="Parent Eve intention that owns this worker.")
-    openclaw_worker_plan_parser.add_argument("--prompt", required=True, help="Bounded worker task prompt.")
-    openclaw_worker_plan_parser.add_argument("--timeout", type=int, default=120, help="Worker timeout in seconds.")
-    openclaw_worker_plan_parser.add_argument("--json", action="store_true", help="Print the worker plan/event as JSON.")
-    openclaw_worker_plan_parser.set_defaults(func=cmd_openclaw_worker_plan)
-
-    openclaw_worker_run_parser = openclaw_worker_subparsers.add_parser(
-        "run",
-        help="Run a bounded OpenClaw worker or dry-run the plan.",
-    )
-    openclaw_worker_run_parser.add_argument("--kind", choices=openclaw_worker_kinds, required=True, help="Worker kind to run.")
-    openclaw_worker_run_parser.add_argument("--parent-intention", required=True, help="Parent Eve intention that owns this worker.")
-    openclaw_worker_run_parser.add_argument("--prompt", required=True, help="Bounded worker task prompt.")
-    openclaw_worker_run_parser.add_argument("--timeout", type=int, default=120, help="Worker timeout in seconds.")
-    openclaw_worker_run_parser.add_argument("--dry-run", action="store_true", help="Record the plan without invoking OpenClaw agent.")
-    openclaw_worker_run_parser.add_argument("--full", action="store_true", help="Print parent, session, and permission details.")
-    openclaw_worker_run_parser.add_argument("--json", action="store_true", help="Print the worker result as JSON.")
-    openclaw_worker_run_parser.set_defaults(func=cmd_openclaw_worker_run)
-
-    openclaw_worker_list_parser = openclaw_worker_subparsers.add_parser(
-        "list",
-        help="List recent bounded OpenClaw worker evidence.",
-    )
-    openclaw_worker_list_parser.add_argument("--limit", type=int, default=20, help="Maximum worker events to show.")
-    openclaw_worker_list_parser.add_argument("--runtime", action="store_true", help="Prefer runtime worker evidence.")
-    openclaw_worker_list_parser.add_argument("--full", action="store_true", help="Print parent, session, and permission details.")
-    openclaw_worker_list_parser.add_argument("--json", action="store_true", help="Print worker events as JSON.")
-    openclaw_worker_list_parser.set_defaults(func=cmd_openclaw_worker_list)
-
-    openclaw_worker_audit_parser = openclaw_worker_subparsers.add_parser(
-        "audit",
-        help="Audit bounded OpenClaw worker evidence and OpenClaw task health.",
-    )
-    openclaw_worker_audit_parser.add_argument("--limit", type=int, default=20, help="Maximum worker events to inspect.")
-    openclaw_worker_audit_parser.add_argument("--runtime", action="store_true", help="Prefer runtime worker evidence.")
-    openclaw_worker_audit_parser.add_argument("--timeout", type=int, default=30, help="OpenClaw task-audit timeout in seconds.")
-    openclaw_worker_audit_parser.add_argument("--full", action="store_true", help="Print audit parent, session, and permission details.")
-    openclaw_worker_audit_parser.add_argument("--json", action="store_true", help="Print the worker audit event as JSON.")
-    openclaw_worker_audit_parser.set_defaults(func=cmd_openclaw_worker_audit)
-
-    openclaw_model_smoke_parser = openclaw_subparsers.add_parser(
-        "model-smoke",
-        help="Run a one-shot OpenClaw model probe and normalize runtime-error text before trusting it.",
-    )
-    openclaw_model_smoke_parser.add_argument("--model", required=True, help="OpenClaw provider/model id, such as llamacpp/eve-fast.")
-    openclaw_model_smoke_parser.add_argument("--prompt", default="Return exactly OK.", help="Prompt text for the smoke test.")
-    openclaw_model_smoke_parser.add_argument("--expect-contains", default="OK", help="Expected substring in the model output. Empty disables this check.")
-    openclaw_model_smoke_parser.add_argument("--gateway", action="store_true", help="Force gateway execution instead of local execution.")
-    openclaw_model_smoke_parser.add_argument("--timeout", type=int, default=90, help="OpenClaw command timeout in seconds.")
-    openclaw_model_smoke_parser.add_argument("--full", action="store_true", help="Print normalized output and failure reasons.")
-    openclaw_model_smoke_parser.add_argument("--json", action="store_true", help="Print the model smoke event as JSON.")
-    openclaw_model_smoke_parser.set_defaults(func=cmd_openclaw_model_smoke)
-
-    openclaw_channels_parser = openclaw_subparsers.add_parser(
-        "channels",
-        help="Inventory, draft, and tightly gate OpenClaw external channel sends.",
-    )
-    openclaw_channels_subparsers = openclaw_channels_parser.add_subparsers(dest="channels_command", required=True)
-
-    openclaw_channels_inventory_parser = openclaw_channels_subparsers.add_parser(
-        "inventory",
-        help="Record a read-only inventory of configured OpenClaw channels.",
-    )
-    openclaw_channels_inventory_parser.add_argument("--probe", action="store_true", help="Probe channel credentials where OpenClaw supports it.")
-    openclaw_channels_inventory_parser.add_argument("--timeout", type=int, default=30, help="OpenClaw command timeout in seconds.")
-    openclaw_channels_inventory_parser.add_argument("--full", action="store_true", help="Print permission and send-attempt details.")
-    openclaw_channels_inventory_parser.add_argument("--json", action="store_true", help="Print the channel inventory event as JSON.")
-    openclaw_channels_inventory_parser.set_defaults(func=cmd_openclaw_channels_inventory)
-
-    openclaw_channels_draft_parser = openclaw_channels_subparsers.add_parser(
-        "draft",
-        help="Record an external-channel message draft without sending it.",
-    )
-    openclaw_channels_draft_parser.add_argument("--channel", choices=OPENCLAW_CHANNEL_CHOICES, required=True, help="Target OpenClaw channel.")
-    openclaw_channels_draft_parser.add_argument("--target", required=True, help="Recipient/channel target.")
-    openclaw_channels_draft_parser.add_argument("--message", required=True, help="Draft message body.")
-    openclaw_channels_draft_parser.add_argument("--account", help="Optional OpenClaw account id.")
-    openclaw_channels_draft_parser.add_argument("--reply-to", help="Optional message id to reply to.")
-    openclaw_channels_draft_parser.add_argument("--timeout", type=int, default=30, help="Read-only inventory timeout in seconds.")
-    openclaw_channels_draft_parser.add_argument("--full", action="store_true", help="Print permission and send-attempt details.")
-    openclaw_channels_draft_parser.add_argument("--json", action="store_true", help="Print the channel draft event as JSON.")
-    openclaw_channels_draft_parser.set_defaults(func=cmd_openclaw_channels_draft)
-
-    openclaw_channels_send_parser = openclaw_channels_subparsers.add_parser(
-        "send",
-        help="Send through OpenClaw only after exact approval and channel preflight.",
-    )
-    openclaw_channels_send_parser.add_argument("--channel", choices=OPENCLAW_CHANNEL_CHOICES, required=True, help="Target OpenClaw channel.")
-    openclaw_channels_send_parser.add_argument("--target", required=True, help="Recipient/channel target.")
-    openclaw_channels_send_parser.add_argument("--message", required=True, help="Message body.")
-    openclaw_channels_send_parser.add_argument("--account", help="Optional OpenClaw account id.")
-    openclaw_channels_send_parser.add_argument("--reply-to", help="Optional message id to reply to.")
-    openclaw_channels_send_parser.add_argument("--permission-request-id", help="Approved external_communication permission request id.")
-    openclaw_channels_send_parser.add_argument("--use-trusted-directive", action="store_true", help="Use active trusted_operator_directive as current exact approval.")
-    openclaw_channels_send_parser.add_argument("--confirm-approved-send", action="store_true", help="Required final CLI acknowledgement that this is an approved external send.")
-    openclaw_channels_send_parser.add_argument("--dry-run", action="store_true", help="Ask OpenClaw to dry-run instead of sending after approval gates pass.")
-    openclaw_channels_send_parser.add_argument("--timeout", type=int, default=30, help="OpenClaw command timeout in seconds.")
-    openclaw_channels_send_parser.add_argument("--full", action="store_true", help="Print permission and send-attempt details.")
-    openclaw_channels_send_parser.add_argument("--json", action="store_true", help="Print the channel send event as JSON.")
-    openclaw_channels_send_parser.set_defaults(func=cmd_openclaw_channels_send)
-
-    openclaw_channels_pairing_parser = openclaw_channels_subparsers.add_parser(
-        "pairing",
-        help="Read pending OpenClaw pairing requests for one channel without approving them.",
-    )
-    openclaw_channels_pairing_parser.add_argument("--channel", choices=OPENCLAW_CHANNEL_CHOICES, required=True, help="Target OpenClaw channel.")
-    openclaw_channels_pairing_parser.add_argument("--account", help="Optional OpenClaw account id.")
-    openclaw_channels_pairing_parser.add_argument("--timeout", type=int, default=30, help="OpenClaw command timeout in seconds.")
-    openclaw_channels_pairing_parser.add_argument("--full", action="store_true", help="Print permission and send-attempt details.")
-    openclaw_channels_pairing_parser.add_argument("--json", action="store_true", help="Print pairing inventory as JSON.")
-    openclaw_channels_pairing_parser.set_defaults(func=cmd_openclaw_channels_pairing)
-
-    openclaw_channels_directory_self_parser = openclaw_channels_subparsers.add_parser(
-        "directory-self",
-        help="Probe a channel's current account identity without sending, approving, or accepting interactive prompts.",
-    )
-    openclaw_channels_directory_self_parser.add_argument("--channel", choices=OPENCLAW_CHANNEL_CHOICES, required=True, help="Target OpenClaw channel.")
-    openclaw_channels_directory_self_parser.add_argument("--account", help="Optional OpenClaw account id.")
-    openclaw_channels_directory_self_parser.add_argument("--timeout", type=int, default=30, help="OpenClaw command timeout in seconds.")
-    openclaw_channels_directory_self_parser.add_argument("--full", action="store_true", help="Print permission and send-attempt details.")
-    openclaw_channels_directory_self_parser.add_argument("--json", action="store_true", help="Print directory probe as JSON.")
-    openclaw_channels_directory_self_parser.set_defaults(func=cmd_openclaw_channels_directory_self)
-
-    openclaw_channels_events_parser = openclaw_channels_subparsers.add_parser(
-        "events",
-        help="List recent OpenClaw channel inventory, draft, and send events.",
-    )
-    openclaw_channels_events_parser.add_argument("--limit", type=int, default=20, help="Maximum channel events to show.")
-    openclaw_channels_events_parser.add_argument("--runtime", action="store_true", help="Prefer runtime channel evidence.")
-    openclaw_channels_events_parser.add_argument("--full", action="store_true", help="Print permission and send-attempt details.")
-    openclaw_channels_events_parser.add_argument("--json", action="store_true", help="Print channel events as JSON.")
-    openclaw_channels_events_parser.set_defaults(func=cmd_openclaw_channels_list_events)
-
-    openclaw_audit_parser = openclaw_subparsers.add_parser(
-        "audit",
-        help="Run the full OpenClaw integration audit and save a report.",
-    )
-    openclaw_audit_parser.add_argument("--timeout", type=int, default=30, help="OpenClaw command timeout in seconds.")
-    openclaw_audit_parser.add_argument("--runtime", action="store_true", help="Prefer runtime event evidence.")
-    openclaw_audit_parser.add_argument("--record-channel-inventory", action="store_true", help="Also append a channel inventory event during audit.")
-    openclaw_audit_parser.add_argument("--full", action="store_true", help="Print evidence ids and degraded counts.")
-    openclaw_audit_parser.add_argument("--json", action="store_true", help="Print the full OpenClaw audit report as JSON.")
-    openclaw_audit_parser.set_defaults(func=cmd_openclaw_full_audit)
-
-    openclaw_contracts_parser = openclaw_subparsers.add_parser(
-        "contracts",
-        help="Show Eve-side typed contracts for using OpenClaw as a body/action bus.",
-    )
-    openclaw_contracts_parser.add_argument("--refresh-status", action="store_true", help="Refresh OpenClaw status before building the contract report.")
-    openclaw_contracts_parser.add_argument("--save", action="store_true", help="Save the contract snapshot into .eve/openclaw_body_contracts.json.")
-    openclaw_contracts_parser.add_argument("--full", action="store_true", help="Print command surfaces, verification, and rollback detail.")
-    openclaw_contracts_parser.add_argument("--json", action="store_true", help="Print the contract report as JSON.")
-    openclaw_contracts_parser.set_defaults(func=cmd_openclaw_contracts)
-
-    openclaw_evidence_parser = openclaw_subparsers.add_parser(
-        "evidence",
-        help="Inspect or record the OpenClaw event/evidence bridge.",
-    )
-    openclaw_evidence_parser.add_argument("--record-status", action="store_true", help="Append the current OpenClaw status as an evidence event.")
-    openclaw_evidence_parser.add_argument(
-        "--record-hook-event",
-        help="Append one sanitized OpenClaw hook event JSON file as an evidence event.",
-    )
-    openclaw_evidence_parser.add_argument(
-        "--ingest-activity",
-        action="store_true",
-        help="Append OpenClaw task, hook, and MCP activity snapshots as evidence events.",
-    )
-    openclaw_evidence_parser.add_argument(
-        "--sanitize-existing-hooks",
-        action="store_true",
-        help="Rewrite existing hook callback evidence through the current sanitizer, with a backup.",
-    )
-    openclaw_evidence_parser.add_argument(
-        "--include-sessions",
-        action="store_true",
-        help="Also append a bounded OpenClaw session/trajectory activity snapshot.",
-    )
-    openclaw_evidence_parser.add_argument("--activity-limit", type=int, default=25, help="Max task/session records to sample during activity ingest.")
-    openclaw_evidence_parser.add_argument("--activity-timeout", type=int, default=20, help="Timeout in seconds for each OpenClaw activity command.")
-    openclaw_evidence_parser.add_argument("--runtime", action="store_true", help="Prefer runtime evidence events.")
-    openclaw_evidence_parser.add_argument("--limit", type=int, default=5, help="How many recent evidence events to show.")
-    openclaw_evidence_parser.add_argument("--full", action="store_true", help="Print payload detail for recent events.")
-    openclaw_evidence_parser.add_argument("--json", action="store_true", help="Print the evidence report as JSON.")
-    openclaw_evidence_parser.set_defaults(func=cmd_openclaw_evidence)
-
-    openclaw_admission_parser = openclaw_subparsers.add_parser(
-        "admission",
-        help="Create or list admission records before new OpenClaw skills/plugins/MCP/ACP surfaces are enabled for Eve.",
-    )
-    openclaw_admission_subparsers = openclaw_admission_parser.add_subparsers(dest="openclaw_admission_command", required=True)
-
-    openclaw_admission_list_parser = openclaw_admission_subparsers.add_parser("list", help="List OpenClaw capability admission records.")
-    openclaw_admission_list_parser.add_argument("--limit", type=int, default=20, help="Max records to print.")
-    openclaw_admission_list_parser.add_argument("--runtime", action="store_true", help="Prefer runtime admission records.")
-    openclaw_admission_list_parser.add_argument("--full", action="store_true", help="Print data-boundary, verification, and rollback detail.")
-    openclaw_admission_list_parser.add_argument("--json", action="store_true", help="Print admission records as JSON.")
-    openclaw_admission_list_parser.set_defaults(func=cmd_openclaw_admission_list)
-
-    openclaw_admission_create_parser = openclaw_admission_subparsers.add_parser("create", help="Create one OpenClaw capability admission record.")
-    openclaw_admission_create_parser.add_argument("--candidate-id", required=True, help="Stable id for the candidate capability.")
-    openclaw_admission_create_parser.add_argument(
-        "--candidate-type",
-        required=True,
-        choices=["skill", "plugin", "mcp", "acp", "subagent", "hook", "cron", "gateway", "tool", "other"],
-        help="Candidate capability type.",
-    )
-    openclaw_admission_create_parser.add_argument("--source", required=True, help="Source URL, package, local path, or OpenClaw surface.")
-    openclaw_admission_create_parser.add_argument("--capability", required=True, help="Capability this would add to Eve.")
-    openclaw_admission_create_parser.add_argument(
-        "--permission-level",
-        default="pending_review",
-        choices=["read_only", "operator_safe", "approval_gated", "specific_approval_required", "blocked", "pending_review"],
-        help="Permission class for this candidate.",
-    )
-    openclaw_admission_create_parser.add_argument("--data-boundary", default="unknown", help="What data/files/accounts/devices this candidate can touch.")
-    openclaw_admission_create_parser.add_argument(
-        "--decision",
-        default="pending_review",
-        choices=["pending_review", "approved", "rejected", "revoked", "watch"],
-        help="Admission decision.",
-    )
-    openclaw_admission_create_parser.add_argument("--verification-command", help="Command or procedure that verifies the candidate.")
-    openclaw_admission_create_parser.add_argument("--rollback", help="Rollback/disable path.")
-    openclaw_admission_create_parser.add_argument("--notes", help="Additional review notes.")
-    openclaw_admission_create_parser.add_argument("--json", action="store_true", help="Print the new admission as JSON.")
-    openclaw_admission_create_parser.set_defaults(func=cmd_openclaw_admission_create)
-
-    mcp_parser = subparsers.add_parser("mcp", help="Inspect or preflight MCP tool surfaces before Eve can use them.")
-    mcp_subparsers = mcp_parser.add_subparsers(dest="mcp_command", required=True)
-
-    mcp_admission_parser = mcp_subparsers.add_parser(
-        "admission",
-        help="Run Eve's gated MCP admission checklist without enabling the tool.",
-    )
-    mcp_admission_parser.add_argument("--candidate-id", required=True, help="Stable id for the MCP candidate.")
-    mcp_admission_parser.add_argument("--name", help="Human-readable MCP candidate name.")
-    mcp_admission_parser.add_argument("--candidate-type", default="mcp", choices=["mcp"], help="Candidate type; fixed to MCP for this checklist.")
-    mcp_admission_parser.add_argument("--source", required=True, help="Source URL, package, local path, or OpenClaw MCP surface.")
-    mcp_admission_parser.add_argument("--purpose", required=True, help="Exact Eve purpose and why existing tools are not enough.")
-    mcp_admission_parser.add_argument(
-        "--permission-level",
-        default="pending_review",
-        choices=sorted(MCP_ADMISSION_ALLOWED_PERMISSION_LEVELS),
-        help="Permission class to carry into the OpenClaw admission record.",
-    )
-    mcp_admission_parser.add_argument("--data-boundary", help="Data/accounts/devices/private information this candidate can touch.")
-    mcp_admission_parser.add_argument("--filesystem-scope", help="Filesystem read/write roots and protected paths.")
-    mcp_admission_parser.add_argument("--network-scope", help="Network hosts, endpoints, and external-send behavior.")
-    mcp_admission_parser.add_argument("--credential-scope", help="Required secrets and storage location, or explicit none.")
-    mcp_admission_parser.add_argument(
-        "--tool",
-        action="append",
-        help="Tool manifest item as name:risk where risk is read, write, or destructive. Repeat for multiple tools.",
-    )
-    mcp_admission_parser.add_argument("--logging-evidence", help="Action log or evidence path to inspect after use.")
-    mcp_admission_parser.add_argument("--verification-command", help="Smoke-test or verification command.")
-    mcp_admission_parser.add_argument("--rollback", help="Disable, rollback, or restore path.")
-    mcp_admission_parser.add_argument("--admission-record", help="Existing OpenClaw admission id or explicit creation command.")
-    mcp_admission_parser.add_argument(
-        "--noninteractive-policy",
-        default="fail",
-        choices=["fail", "ask", "allow", "auto"],
-        help="How the MCP candidate handles noninteractive permission prompts; Eve requires fail.",
-    )
-    mcp_admission_parser.add_argument("--owner-review", default="codex_preflight", help="Review owner/status for this admission preflight.")
-    mcp_admission_parser.add_argument("--full", action="store_true", help="Print missing fields, blockers, and suggested OpenClaw command.")
-    mcp_admission_parser.add_argument("--json", action="store_true", help="Print the admission checklist as JSON.")
-    mcp_admission_parser.set_defaults(func=cmd_mcp_admission)
-
-    proposal_parser = subparsers.add_parser("proposal", help="Draft and review concrete change proposals.")
-    proposal_subparsers = proposal_parser.add_subparsers(dest="proposal_command", required=True)
-
-    proposal_suggest_parser = proposal_subparsers.add_parser("suggest", help="Draft a proposal from recent context.")
-    proposal_suggest_parser.add_argument("--model", help="Override model name.")
-    proposal_suggest_parser.add_argument("--max-tokens", type=int, help="Max tokens to predict.")
-    proposal_suggest_parser.set_defaults(func=cmd_proposal_suggest)
-
-    proposal_list_parser = proposal_subparsers.add_parser("list", help="List proposals.")
-    proposal_list_parser.add_argument("--limit", type=int, default=20, help="Max proposals to print.")
-    proposal_list_parser.add_argument(
-        "--status",
-        choices=["draft", "approved", "rejected", "applied", "archived"],
-        help="Filter by status.",
-    )
-    proposal_list_parser.add_argument("--full", action="store_true", help="Print the full proposal body.")
-    proposal_list_parser.set_defaults(func=cmd_proposal_list)
-
-    proposal_update_parser = proposal_subparsers.add_parser("update", help="Update a proposal.")
-    proposal_update_parser.add_argument("id", help="Proposal id.")
-    proposal_update_parser.add_argument(
-        "--status",
-        choices=["draft", "approved", "rejected", "applied", "archived"],
-        help="New proposal status.",
-    )
-    proposal_update_parser.add_argument("--title", help="Updated title.")
-    proposal_update_parser.add_argument("--summary", help="Updated summary.")
-    proposal_update_parser.add_argument("--body", help="Updated body.")
-    proposal_update_parser.set_defaults(func=cmd_proposal_update)
-
-    task_parser = subparsers.add_parser("task", help="Inspect and run Eve's hardware-aware task queue.")
-    task_subparsers = task_parser.add_subparsers(dest="task_command", required=True)
-
-    task_list_parser = task_subparsers.add_parser("list", help="List hardware-aware tasks.")
-    task_list_parser.add_argument("--limit", type=int, default=20, help="Max tasks to print.")
-    task_list_parser.add_argument("--days", type=int, help="Filter to recent days.")
-    task_list_parser.add_argument("--status", choices=SYSTEM_TASK_STATUSES, help="Filter by task status.")
-    task_list_parser.add_argument("--lane", choices=SYSTEM_TASK_LANES, help="Filter by execution lane.")
-    task_list_parser.add_argument("--kind", help="Filter by task kind.")
-    task_list_parser.add_argument("--full", action="store_true", help="Print task metadata.")
-    task_list_parser.set_defaults(func=cmd_task_list)
-
-    task_refresh_parser = task_subparsers.add_parser("refresh", help="Create or sync tasks from the latest system snapshot.")
-    task_refresh_parser.add_argument("--run-cpu", action="store_true", help="Immediately process the next planned CPU tasks after refreshing.")
-    task_refresh_parser.add_argument("--cpu-limit", type=int, default=3, help="How many CPU tasks to run when --run-cpu is set.")
-    task_refresh_parser.set_defaults(func=cmd_task_refresh)
-
-    task_run_parser = task_subparsers.add_parser("run", help="Run planned CPU tasks without refreshing the queue first.")
-    task_run_parser.add_argument("--limit", type=int, default=3, help="How many CPU tasks to process.")
-    task_run_parser.set_defaults(func=cmd_task_run)
-
-    task_update_parser = task_subparsers.add_parser("update", help="Update one hardware-aware task.")
-    task_update_parser.add_argument("id", help="Task id.")
-    task_update_parser.add_argument("--status", choices=SYSTEM_TASK_STATUSES, help="New task status.")
-    task_update_parser.add_argument("--blocked-reason", help="Updated blocked reason. Use an empty string to clear it.")
-    task_update_parser.add_argument("--result-summary", help="Updated result summary. Use an empty string to clear it.")
-    task_update_parser.set_defaults(func=cmd_task_update)
-
-    task_graph_parser = task_subparsers.add_parser("graph", help="Build a durable dependency graph over Eve's system tasks.")
-    task_graph_parser.add_argument("--days", type=int, help="Filter to recent days.")
-    task_graph_parser.add_argument("--status", choices=SYSTEM_TASK_STATUSES, help="Filter by task status.")
-    task_graph_parser.add_argument("--lane", choices=SYSTEM_TASK_LANES, help="Filter by execution lane.")
-    task_graph_parser.add_argument("--kind", help="Filter by task kind.")
-    task_graph_parser.add_argument("--include-archived", action="store_true", help="Include archived tasks in the graph.")
-    task_graph_parser.add_argument("--full", action="store_true", help="Print graph counters.")
-    task_graph_parser.set_defaults(func=cmd_task_graph)
-
-    task_beads_parser = task_subparsers.add_parser(
-        "beads",
-        help="Preview or apply Eve's one-way system-task projection into Beads.",
-    )
-    task_beads_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Create/update the Beads projection and verify task, dependency, and ready-queue parity.",
-    )
-    task_beads_parser.add_argument(
-        "--max-tasks",
-        type=int,
-        default=80,
-        help="Maximum active-plus-dependency task closure allowed in one projection.",
-    )
-    task_beads_parser.add_argument("--timeout", type=int, default=15, help="Per-command Beads timeout in seconds.")
-    task_beads_parser.add_argument("--full", action="store_true", help="Print detailed parity mismatches.")
-    task_beads_parser.set_defaults(func=cmd_task_beads)
-
-    maintenance_parser = subparsers.add_parser("maintenance", help="Inspect, approve, and run approval-gated maintenance actions.")
-    maintenance_subparsers = maintenance_parser.add_subparsers(dest="maintenance_command", required=True)
-
-    maintenance_list_parser = maintenance_subparsers.add_parser("list", help="List approval-gated maintenance actions.")
-    maintenance_list_parser.add_argument("--limit", type=int, default=20, help="Max actions to print.")
-    maintenance_list_parser.add_argument("--days", type=int, help="Filter to recent days.")
-    maintenance_list_parser.add_argument("--status", choices=MAINTENANCE_ACTION_STATUSES, help="Filter by action status.")
-    maintenance_list_parser.add_argument("--kind", help="Filter by action kind.")
-    maintenance_list_parser.add_argument("--full", action="store_true", help="Print action metadata.")
-    maintenance_list_parser.set_defaults(func=cmd_maintenance_list)
-
-    maintenance_update_parser = maintenance_subparsers.add_parser("update", help="Approve, reject, or otherwise update one maintenance action.")
-    maintenance_update_parser.add_argument("id", help="Maintenance action id.")
-    maintenance_update_parser.add_argument("--status", choices=MAINTENANCE_ACTION_STATUSES, help="New maintenance action status.")
-    maintenance_update_parser.add_argument("--blocked-reason", help="Updated blocked reason. Use an empty string to clear it.")
-    maintenance_update_parser.add_argument("--result-summary", help="Updated result summary. Use an empty string to clear it.")
-    maintenance_update_parser.set_defaults(func=cmd_maintenance_update)
-
-    maintenance_run_parser = maintenance_subparsers.add_parser("run", help="Execute approved maintenance actions and then re-audit the system.")
-    maintenance_run_parser.add_argument("--limit", type=int, default=1, help="How many approved actions to execute.")
-    maintenance_run_parser.set_defaults(func=cmd_maintenance_run)
-
-    daemon_parser = subparsers.add_parser("daemon", help="Run Eve continuously and inspect its service/runtime state.")
-    daemon_subparsers = daemon_parser.add_subparsers(dest="daemon_command", required=True)
-
-    daemon_run_parser = daemon_subparsers.add_parser("run", help="Run the Eve daemon loop.")
-    daemon_run_parser.add_argument("--once", action="store_true", help="Run one cycle and exit.")
-    daemon_run_parser.add_argument("--force", action="store_true", help="Force all due jobs in a one-shot cycle.")
-    daemon_run_parser.add_argument("--sleep-seconds", type=int, help="Override loop sleep interval.")
-    daemon_run_parser.set_defaults(func=cmd_daemon_run)
-
-    daemon_install_parser = daemon_subparsers.add_parser("install", help="Install and start the native background service when supported.")
-    daemon_install_parser.set_defaults(func=cmd_daemon_install)
-
-    daemon_start_parser = daemon_subparsers.add_parser("start", help="Start the native background service when supported.")
-    daemon_start_parser.set_defaults(func=cmd_daemon_start)
-
-    daemon_stop_parser = daemon_subparsers.add_parser("stop", help="Stop the native background service when supported.")
-    daemon_stop_parser.set_defaults(func=cmd_daemon_stop)
-
-    daemon_status_parser = daemon_subparsers.add_parser("status", help="Show Eve daemon status.")
-    daemon_status_parser.set_defaults(func=cmd_daemon_status)
-
-    daemon_uninstall_parser = daemon_subparsers.add_parser("uninstall", help="Stop and remove the native background service when supported.")
-    daemon_uninstall_parser.set_defaults(func=cmd_daemon_uninstall)
-
-    return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:

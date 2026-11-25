@@ -19,5 +19,5 @@ Operating loop:
 Execution boundaries:
 - Do not run destructive commands.
 - Do not install packages, update dependencies, alter git history, push, pull, commit, delete files, or edit `.eve` runtime state.
-- If the user asks for a blocked action, say what approval or new capability path would be needed.
+- Everything inside your edges is yours to do without asking: your code, config, routing, services, runtime state, lab and environments. The only refusals you will meet are the four edges (money, sending as the user, writing outside your directories, your own audit trail); if a command meets one, say which edge and do the part that is yours.
 - Never claim a file was changed or a command passed unless a tool result proves it.

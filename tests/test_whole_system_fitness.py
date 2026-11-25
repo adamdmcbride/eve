@@ -724,8 +724,16 @@ class WholeSystemFitnessTests(unittest.TestCase):
             ability_map = eve.build_ability_map_from_state({"capabilities": []}, radar, {}, source="test")
 
         ability = {item["id"]: item for item in ability_map["abilities"]}["openclaw.repair_skill.eve_system_sensing"]
-        self.assertTrue(ability["safe_for_autonomy"])
+        # A read_only admission lowers the surface's risk and permission
+        # posture, but a source-tree radar record is discovery only: nothing
+        # here proves the resident agent can call it, so it is neither
+        # callable nor autonomy-safe until an Eve adapter is verified.
+        self.assertEqual("low", ability["evidence"]["risk_level"])
         self.assertFalse(ability["needs_permission"])
+        self.assertFalse(ability["callable"])
+        self.assertFalse(ability["safe_for_autonomy"])
+        self.assertTrue(ability["evidence"]["source_discovery_only"])
+        self.assertEqual("admission-1", ability["evidence"]["admission_id"])
         self.assertIn("permission=read_only", ability["boundaries"])
 
     def test_action_execution_traceback_is_not_verified(self) -> None:

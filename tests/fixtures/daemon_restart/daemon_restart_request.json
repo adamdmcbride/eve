@@ -1,0 +1,6 @@
+{
+  "reason": "fixture self-change handover",
+  "source": "self_change",
+  "requested_at": "2026-09-17T05:30:00+00:00",
+  "rollback_dir": "/fixture/rollback"
+}

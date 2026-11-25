@@ -1,0 +1,5 @@
+{
+  "schema_id": "eve_daemon_activity.v0",
+  "pid": 12345,
+  "last_heartbeat_at": "2026-09-17T05:20:15+00:00"
+}

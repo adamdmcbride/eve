@@ -8,6 +8,15 @@ import json
 import eve_openclaw_body
 
 
+RESTRICTED_PLUGIN_OUTPUT = """
+[state/db] skipped permission hardening for /tmp/eve/.openclaw-eve-repair/state:
+Error: EPERM: operation not permitted, chmod '/tmp/eve/.openclaw-eve-repair/state'
+OpenClaw config is invalid
+Problem:
+  - plugins.allow: plugin llama-cpp: runtime extension entry not found: ./dist/index.js
+"""
+
+
 class OpenClawBodyContractTests(unittest.TestCase):
     def test_contract_registry_defines_required_body_bus_contracts(self) -> None:
         contracts = eve_openclaw_body.openclaw_body_contracts()
@@ -164,6 +173,32 @@ class OpenClawBodyContractTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual([], result["payload"]["tasks"])
+        self.assertTrue(result["observation_complete"])
+        self.assertTrue(result["observation_authoritative"])
+        self.assertFalse(result["observation_environment_limited"])
+
+    def test_restricted_plugin_false_negative_is_not_capability_absence_evidence(self) -> None:
+        fields = eve_openclaw_body.openclaw_command_observation_fields(
+            returncode=1,
+            output=RESTRICTED_PLUGIN_OUTPUT,
+        )
+
+        self.assertFalse(fields["observation_complete"])
+        self.assertFalse(fields["observation_authoritative"])
+        self.assertTrue(fields["observation_environment_limited"])
+        self.assertEqual("restricted_environment", fields["failure_kind"])
+        self.assertIn("llama_cpp_runtime_extension_unresolved", fields["diagnostic_codes"])
+
+    def test_permission_warning_does_not_hide_an_unrelated_profile_failure(self) -> None:
+        fields = eve_openclaw_body.openclaw_command_observation_fields(
+            returncode=1,
+            output=RESTRICTED_PLUGIN_OUTPUT
+            + "\n  - gateway.bind: invalid bind mode\n",
+        )
+
+        self.assertFalse(fields["observation_environment_limited"])
+        self.assertTrue(fields["observation_authoritative"])
+        self.assertEqual(2, fields["profile_problem_count"])
 
     def test_activity_ingest_events_keep_openclaw_as_noncanonical_body_bus(self) -> None:
         def fake_command(args, *, timeout=20):

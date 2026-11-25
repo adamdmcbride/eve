@@ -482,6 +482,32 @@ class SpecialistSubstrateTests(unittest.TestCase):
             prefer_runtime=True,
         )
 
+    def test_beads_preview_preserves_last_receipt_when_observer_cannot_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge_path = Path(tmp) / "beads_bridge.json"
+            bridge_path.write_text(
+                json.dumps(
+                    {
+                        "status": "verified",
+                        "parity": {"ok": True},
+                        "source_graph_fingerprint": "host-proof",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(eve, "BEADS_BRIDGE_PATH", bridge_path), patch.object(
+                eve, "_run_beads_task_bridge_unlocked"
+            ) as runner, patch.object(eve, "store_lock") as lock:
+                lock.return_value.__enter__.side_effect = PermissionError(1, "restricted")
+                report = eve.run_beads_task_bridge(apply=False, max_tasks=4, timeout=2)
+
+        self.assertEqual("inconclusive_environment", report["status"])
+        self.assertFalse(report["observation_authoritative"])
+        self.assertTrue(report["observation_environment_limited"])
+        self.assertEqual("verified", report["last_authoritative_status"])
+        self.assertTrue(report["last_authoritative_parity_ok"])
+        runner.assert_not_called()
+
     def test_beads_refresh_is_change_triggered_before_the_hourly_deadline(self) -> None:
         tasks = [
             {
@@ -523,6 +549,46 @@ class SpecialistSubstrateTests(unittest.TestCase):
 
         self.assertEqual("lab_verified", signal["status"])
         self.assertEqual("lab_ready", signal["operational_status"])
+
+    def test_oss_environment_limited_check_stays_inconclusive(self) -> None:
+        oss_status = {
+            "status": "partial",
+            "inventory_status": "ready",
+            "trace_status": "ready",
+            "training_dataset_status": "ready",
+            "trainer_recipe_status": "written_current",
+            "dvc_manifest_status": "verified",
+            "workflow_status": "completed",
+            "grants_live_authority": False,
+            "readiness": {
+                "ready_checks": 7,
+                "total_checks": 8,
+                "blocking": ["trainer_no_train_forward_validation"],
+                "checks": [
+                    {
+                        "name": "trainer_no_train_forward_validation",
+                        "status": "blocked",
+                        "observed": "inconclusive_environment",
+                    }
+                ],
+            },
+        }
+        with patch.object(eve, "build_oss_integration_status_report", return_value=oss_status):
+            report = eve.build_specialist_substrate_report({}, prefer_runtime=False)
+
+        substrate = next(
+            item
+            for item in report["substrates"]
+            if item["id"] == "oss_improvement_substrate"
+        )
+        signal = eve.organ_signal_from_substrate("oss_improvement_substrate", substrate)
+        self.assertFalse(signal["observation_complete"])
+        self.assertFalse(signal["observation_authoritative"])
+        self.assertTrue(signal["observation_environment_limited"])
+        self.assertEqual(
+            ["trainer_no_train_forward_validation"],
+            signal["observation_blockers"],
+        )
 
     def test_model_inference_acceleration_lab_is_not_a_lane(self) -> None:
         substrate = eve.SPECIALIST_SUBSTRATE_REGISTRY["model_inference_acceleration_lab"]
@@ -619,6 +685,53 @@ class SpecialistSubstrateTests(unittest.TestCase):
 
         self.assertIn("model_context_below_hermes_minimum", eve.hermes_smoke_gate_reasons(status))
 
+    def test_hermes_restricted_endpoint_probe_is_inconclusive_not_unreachable(self) -> None:
+        endpoint = {
+            "checked": True,
+            "ok": False,
+            "detail": "<urlopen error [Errno 1] Operation not permitted>",
+        }
+
+        self.assertTrue(eve.hermes_endpoint_observation_environment_limited(endpoint))
+        status = eve.classify_hermes_learning_organ_status(
+            version_ok=True,
+            profile_exists=True,
+            config_exists=True,
+            guardrail_ok=True,
+            model_endpoint=endpoint,
+            model_endpoint_observation_valid=False,
+            model_context_length=32768,
+        )
+        self.assertEqual("available_proposal_only_context_below_hermes_minimum", status)
+        reasons = eve.hermes_smoke_gate_reasons(
+            {
+                "status": status,
+                "version_ok": True,
+                "profile_exists": True,
+                "config_exists": True,
+                "soul_guardrail_ok": True,
+                "model_context_length": 32768,
+                "hermes_minimum_context_length": 64000,
+                "model_endpoint_checked": True,
+                "model_endpoint_reachable": False,
+                "model_endpoint_observation_valid": False,
+            }
+        )
+        self.assertIn("model_context_below_hermes_minimum", reasons)
+        self.assertNotIn("model_endpoint_unreachable", reasons)
+
+    def test_hermes_verified_local_64k_route_counts_as_proposal_ready(self) -> None:
+        status = {
+            "status": "available_proposal_only_context_below_hermes_minimum",
+            "soul_guardrail_ok": True,
+            "model_endpoint_reachable": False,
+            "model_context_length": 32768,
+            "hermes_minimum_context_length": 64000,
+            "serious_learning_route_verified": True,
+        }
+
+        self.assertTrue(eve.hermes_serious_proposal_route_ready(status))
+
     def test_hermes_smoke_prompt_keeps_proposal_only_boundary(self) -> None:
         prompt = eve.build_hermes_smoke_prompt(eve.default_hermes_smoke_trace())
 
@@ -709,6 +822,7 @@ class SpecialistSubstrateTests(unittest.TestCase):
                 ingest=True,
                 repair_json=True,
                 allow_repaired_ingest=False,
+                constrained_json=False,
             )
 
         self.assertEqual("blocked_repaired_ingest", record["status"])
@@ -761,6 +875,93 @@ class SpecialistSubstrateTests(unittest.TestCase):
         self.assertTrue(record["strict_json_ok"])
         self.assertFalse(record["json_repair_used"])
         self.assertEqual(1, record["proposal_count"])
+        self.assertFalse(record["persistent_memory_enabled"])
+        self.assertEqual("disabled_for_run", record["profile_memory_authority"])
+        self.assertFalse(record["project_context_files_enabled"])
+        self.assertTrue(record["profile_soul_identity_enabled"])
+        self.assertFalse(record["background_review_enabled"])
+        self.assertFalse(record["session_persistence_enabled"])
+        self.assertEqual(1, record["max_agent_iterations"])
+
+    def test_hermes_smoke_and_eval_cli_default_to_toolless_constrained_mode(self) -> None:
+        smoke_record = {
+            "status": "passed",
+            "id": "hermes-smoke-test",
+            "stored_governance_proposals": False,
+            "strict_json_ok": True,
+            "json_repair_used": False,
+            "constrained_json": True,
+            "execution_mode": "constrained_toolless_adapter",
+            "summary": "ok",
+        }
+        eval_record = {
+            "status": "strict_pass",
+            "id": "hermes-eval-test",
+            "constrained_json": True,
+            "execution_mode": "constrained_toolless_adapter",
+            "summary": {"trials": 1, "verdict": "strict_pass"},
+        }
+
+        with patch("eve.run_hermes_smoke", return_value=smoke_record) as run_smoke, patch("sys.stdout"):
+            self.assertEqual(0, eve.main(["hermes", "smoke"]))
+        self.assertTrue(run_smoke.call_args.kwargs["constrained_json"])
+
+        with patch("eve.run_hermes_smoke_eval", return_value=eval_record) as run_eval, patch("sys.stdout"):
+            self.assertEqual(0, eve.main(["hermes", "eval", "--trials", "1"]))
+        self.assertTrue(run_eval.call_args.kwargs["constrained_json"])
+
+    def test_hermes_cli_diagnostic_escape_hatch_is_explicit(self) -> None:
+        smoke_record = {
+            "status": "passed",
+            "id": "hermes-smoke-test",
+            "stored_governance_proposals": False,
+            "strict_json_ok": True,
+            "json_repair_used": False,
+            "constrained_json": False,
+            "execution_mode": "ordinary_hermes_cli_diagnostic",
+            "summary": "diagnostic",
+        }
+        with patch("eve.run_hermes_smoke", return_value=smoke_record) as run_smoke, patch("sys.stdout"):
+            self.assertEqual(0, eve.main(["hermes", "smoke", "--no-constrained-json"]))
+        self.assertFalse(run_smoke.call_args.kwargs["constrained_json"])
+
+    def test_hermes_toolset_parser_reports_exact_authority_surface(self) -> None:
+        parsed = eve.parse_hermes_cli_toolsets(
+            """Built-in toolsets (cli):
+              ✓ enabled  web  Web Search
+              ✓ enabled  terminal  Terminal
+              ✗ disabled  video  Video
+            """
+        )
+
+        self.assertEqual(["web", "terminal"], parsed["enabled"])
+        self.assertEqual(["video"], parsed["disabled"])
+        self.assertEqual(3, parsed["observed_count"])
+        self.assertTrue(parsed["observation_complete"])
+
+    def test_hermes_constrained_runner_disables_tools_and_profile_memory(self) -> None:
+        completed = SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+        with patch("eve.subprocess.run", return_value=completed) as run_process:
+            result = eve.run_hermes_constrained_json_chat(
+                prompt="Return one governed proposal envelope.",
+                profile_home="/tmp/hermes-evelearning",
+                timeout=15,
+            )
+
+        self.assertIs(completed, result)
+        command = run_process.call_args.args[0]
+        script = command[2]
+        self.assertIn("enabled_toolsets=[]", script)
+        self.assertIn("max_iterations=1", script)
+        self.assertIn("skip_context_files=True", script)
+        self.assertIn("load_soul_identity=True", script)
+        self.assertIn("skip_memory=True", script)
+        self.assertIn("skip_background_review=True", script)
+        self.assertIn("agent._persist_disabled = True", script)
+        self.assertIn("agent._session_json_enabled = False", script)
+        self.assertIn("agent.close()", script)
+        self.assertEqual("/tmp/hermes-evelearning", run_process.call_args.kwargs["env"]["HERMES_HOME"])
 
     def test_hermes_constrained_json_budget_fits_one_governed_envelope(self) -> None:
         model_config = eve.hermes_local_lab_model_config()
@@ -914,9 +1115,129 @@ class SpecialistSubstrateTests(unittest.TestCase):
 
         self.assertFalse(inventory["default_profile_ready_for_serious_learning"])
         self.assertEqual("local_64k_lab_constrained_json", inventory["serious_learning_route"])
+        self.assertEqual(
+            {
+                "toolsets_enabled": [],
+                "persistent_memory_enabled": False,
+                "project_context_files_enabled": False,
+                "profile_soul_identity_enabled": True,
+                "background_review_enabled": False,
+                "session_persistence_enabled": False,
+                "max_agent_iterations": 1,
+            },
+            inventory["admitted_execution_contract"],
+        )
         families = {item["id"]: item for item in inventory["capability_families"]}
         self.assertEqual("default_blocked_use_local_64k_lab", families["model_route"]["status"])
         self.assertTrue(families["skills"]["admission_required_before_use"])
+
+    def test_hermes_semantic_success_with_profile_write_denial_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile = Path(temp_dir) / "evelearning"
+            profile.mkdir(mode=0o700)
+            completed = subprocess.CompletedProcess(
+                args=["hermes", "insights"],
+                returncode=0,
+                stdout=(
+                    f"Error generating insights: state.db is not writable: directory {profile} "
+                    "is read-only for this user."
+                ),
+                stderr="",
+            )
+            with patch.object(eve, "HERMES_EVE_PROFILE_HOME", profile), patch.object(
+                eve, "hermes_command_args", return_value=["hermes", "insights"]
+            ), patch("eve.subprocess.run", return_value=completed):
+                result = eve.run_hermes_profile_command(["insights", "--days", "30"])
+
+        self.assertTrue(result["process_ok"])
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["observation_complete"])
+        self.assertFalse(result["observation_authoritative"])
+        self.assertTrue(result["observation_environment_limited"])
+        self.assertEqual("restricted_environment", result["failure_kind"])
+
+    def test_hermes_source_artifacts_preserve_live_runtime_authority(self) -> None:
+        hermes_status = {
+            "status": "available_proposal_only_context_below_hermes_minimum",
+            "model_endpoint_reachable": False,
+            "model_context_length": 32768,
+            "hermes_minimum_context_length": 64000,
+            "soul_guardrail_ok": True,
+        }
+
+        def fake_command(args, **kwargs):
+            return {
+                "ok": True,
+                "returncode": 0,
+                "stdout": "",
+                "stderr": "",
+                "stdout_preview": "",
+                "stderr_preview": "",
+                "observation_complete": True,
+                "observation_authoritative": True,
+                "observation_environment_limited": False,
+                "failure_kind": "none",
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            inventory_path = Path(temp_dir) / "hermes_inventory.json"
+            policy_path = Path(temp_dir) / "hermes_policy.json"
+            with patch.object(eve, "HERMES_CAPABILITY_INVENTORY_PATH", inventory_path), patch.object(
+                eve, "HERMES_FEATURE_POLICY_PATH", policy_path
+            ), patch("eve.running_from_runtime_bundle", return_value=False), patch(
+                "eve.daemon_runtime_running", return_value=True
+            ), patch("eve.detect_hermes_learning_organ", return_value=hermes_status), patch(
+                "eve.hermes_local_lab_status", return_value={"ok": False}
+            ), patch("eve.run_hermes_profile_command", side_effect=fake_command), patch(
+                "eve.mirror_store_file_to_runtime"
+            ) as mirror:
+                inventory = eve.build_hermes_capability_inventory(save=True)
+                policy = eve.build_hermes_feature_policy(
+                    status=hermes_status,
+                    inventory=inventory,
+                    save=True,
+                )
+
+        self.assertEqual("source_only_preserved_live_runtime", inventory["state_authority"]["persistence"])
+        self.assertFalse(inventory["state_authority"]["runtime_mirror_written"])
+        self.assertEqual("source_only_preserved_live_runtime", policy["state_authority"]["persistence"])
+        self.assertFalse(policy["state_authority"]["runtime_mirror_written"])
+        mirror.assert_not_called()
+
+    def test_hermes_runtime_inventory_delegates_to_runtime_bundle(self) -> None:
+        with patch("eve.delegate_cli_to_runtime", return_value=0) as delegate, patch("sys.stdout"):
+            code = eve.main(["hermes", "inventory", "--runtime", "--full"])
+
+        self.assertEqual(0, code)
+        self.assertEqual("hermes", delegate.call_args.args[0][0])
+        self.assertEqual("inventory", delegate.call_args.args[0][1])
+        self.assertIn("--full", delegate.call_args.args[0])
+
+    def test_hermes_security_dns_failure_is_not_a_clean_audit(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["hermes", "security", "audit"],
+            returncode=2,
+            stdout="",
+            stderr="audit failed: OSV batch query failed: <urlopen error [Errno 8] nodename nor servname provided>",
+        )
+        with patch.object(eve, "hermes_command_args", return_value=["hermes", "security", "audit"]), patch(
+            "eve.subprocess.run", return_value=completed
+        ):
+            result = eve.run_hermes_profile_command(["security", "audit", "--json"])
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["observation_authoritative"])
+        self.assertTrue(result["observation_environment_limited"])
+        families = eve.build_hermes_capability_families(
+            {"security_audit": result},
+            {
+                "status": "available_proposal_only_context_below_hermes_minimum",
+                "model_context_length": 32768,
+                "hermes_minimum_context_length": 64000,
+            },
+        )
+        by_id = {item["id"]: item for item in families}
+        self.assertEqual("inconclusive_environment", by_id["supply_chain_security"]["status"])
 
     def test_hermes_inventory_classifies_current_extended_feature_surfaces(self) -> None:
         def command(stdout="", *, ok=True):
@@ -945,6 +1266,11 @@ class SpecialistSubstrateTests(unittest.TestCase):
                 )
             ),
             "tools_summary": command("tools available"),
+            "tools_list_cli": command(
+                "✓ enabled web Web Search\n"
+                "✓ enabled terminal Terminal\n"
+                "✗ disabled video Video"
+            ),
             "skills_list_enabled": command("skills enabled"),
             "curator_status": command("Curator: enabled\nRuns: 0"),
             "curator_usage": command("Agent-created: 17"),
@@ -1003,12 +1329,18 @@ class SpecialistSubstrateTests(unittest.TestCase):
         self.assertEqual("update_available_265_commits", by_id["source_update"]["status"])
         self.assertEqual("enabled_runs_0", by_id["skill_curator"]["status"])
         self.assertEqual("available_ready", by_id["acp_editor_bridge"]["status"])
+        self.assertEqual("broad_cli_authority_enabled", by_id["tools_toolsets"]["status"])
+        self.assertEqual(["web", "terminal"], by_id["tools_toolsets"]["enabled_cli_toolsets"])
+        self.assertFalse(by_id["tools_toolsets"]["ordinary_cli_tool_authority_disabled"])
         self.assertEqual("available_inactive", by_id["model_orchestration"]["status"])
         self.assertEqual("available_driver_missing", by_id["computer_use"]["status"])
+        self.assertEqual("available_not_configured", by_id["cron_hooks"]["cron_status"])
+        self.assertEqual("available_not_configured", by_id["cron_hooks"]["shell_hooks_status"])
         self.assertEqual("watch", policy["status"])
         self.assertIn("46 known vulnerability", "\n".join(policy["watch_items"]))
         self.assertIn("blocking=2", "\n".join(policy["watch_items"]))
         self.assertIn("265 upstream commits", "\n".join(policy["watch_items"]))
+        self.assertIn("web, terminal", "\n".join(policy["watch_items"]))
 
     def test_hermes_feature_policy_keeps_shiny_features_proposal_only(self) -> None:
         status = {

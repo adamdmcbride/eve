@@ -28,7 +28,6 @@ The versions below are the versions resolved in `uv.lock` and reviewed on
 | Langfuse | 4.14.4 | oss-lab | MIT |
 | LangGraph | 1.2.11 | oss-lab | MIT |
 | OpenInference Semantic Conventions | 0.1.32 | oss-lab | Apache-2.0 |
-| PEFT | 0.20.0 | oss-lab | Apache-2.0 |
 
 Package metadata and license texts are available from each package's official
 [PyPI project page](https://pypi.org/). LanceDB's Apache-2.0 text was verified
@@ -45,6 +44,10 @@ declared installation. In particular:
   license rather than an OSI-approved open-source license.
 - DVC and Ragas are not declared by the public `oss-lab` extra while their
   resolved dependency paths have open advisories without patched releases.
+- PEFT is not declared by the public `oss-lab` extra because its Torch path
+  expands the cross-platform lock into CUDA packages with proprietary or
+  unresolved license records. Eve may still detect a separately installed,
+  user-managed PEFT lab.
 
 Eve therefore does not install these packages through a public project extra.
 Any local integration remains opt-in, separately installed, and governed by

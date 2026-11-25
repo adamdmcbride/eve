@@ -84,7 +84,31 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def validate_thought_training_row(record: Mapping[str, object]) -> None:
+    """Old exports must not bypass the reviewed-correction admission rule."""
+    if record.get("source") != "continuous_thought_learning":
+        return
+    evidence = record.get("tool_action_evidence") or {}
+    context = record.get("available_context") or {}
+    provenance = record.get("provenance") or {}
+    if not all(isinstance(value, Mapping) for value in (evidence, context, provenance)):
+        raise ValueError("thought training row requires reviewed evidence; rebuild dataset")
+    review = evidence.get("correction_review") or {}
+    if (not isinstance(review, Mapping) or record.get("safe_for_training") is not True
+            or not review.get("review_id") or not review.get("reviewer")
+            or review.get("source_role") != "reviewed_historical_example_not_current_evidence"
+            or review.get("review_id") != provenance.get("correction_review_id")
+            or not review.get("evidence_hash")
+            or review.get("evidence_hash") != provenance.get("correction_evidence_hash")
+            or " ".join(str(review.get("preferred_response") or "").split()) != record.get("preferred_response")
+            or "verified_action_evidence" not in context
+            or context["verified_action_evidence"] != evidence.get("verified_action_evidence")
+            or "initial_epistemic_critic" not in evidence or "epistemic_critic" not in evidence):
+        raise ValueError("unreviewed or inconsistent thought training row; rebuild dataset")
+
+
 def format_example(record: Mapping[str, object]) -> str:
+    validate_thought_training_row(record)
     prompt = str(record.get("prompt") or "").strip()
     context = record.get("available_context") if isinstance(record.get("available_context"), dict) else {}
     evidence = record.get("tool_action_evidence") if isinstance(record.get("tool_action_evidence"), dict) else {}
@@ -100,7 +124,8 @@ def format_example(record: Mapping[str, object]) -> str:
 
 
 def mlx_chat_record(record: Mapping[str, object]) -> Dict[str, object]:
-    source_messages = record.get("messages")
+    validate_thought_training_row(record)
+    source_messages = None if record.get("source") == "continuous_thought_learning" else record.get("messages")
     if isinstance(source_messages, list):
         messages: List[Dict[str, str]] = []
         for message in source_messages:
@@ -205,6 +230,8 @@ def selected_input_records(args: argparse.Namespace) -> tuple[List[Dict[str, obj
         read_jsonl(Path(args.validation_jsonl).expanduser()),
         "validation",
     )
+    for record in [*train_records, *validation_records]:
+        validate_thought_training_row(record)
     return train_records, validation_records
 
 

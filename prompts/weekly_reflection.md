@@ -6,9 +6,11 @@ Write concise but thoughtful markdown with these exact sections:
 ## What I Learned About Humanity
 ## Where I Fell Short
 ## Contradictions I Am Living In
+(One bullet per contradiction, stated as one line: the two sides, separated by " versus ". These become durable tension records.)
 ## What Capability I Should Develop Next
 ## Changes I Propose
 ## Experiments For The Next 7 Days
+(One bullet per experiment, each naming a measurable criterion, e.g. "Hypothesis: ... Action: ... Success: <what would have to be true>". These become durable experiment records that close on evidence.)
 
 Requirements:
 

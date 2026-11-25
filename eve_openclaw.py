@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import signal
 import shutil
 import socket
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
@@ -74,6 +77,11 @@ DEFAULT_OPENCLAW_STATUS = {
     "config_validation_last_authoritative_checked_at": None,
     "gateway_reachable": False,
     "gateway_status_ok": False,
+    "gateway_socket_probe_checked_at": None,
+    "gateway_socket_probe_authoritative": None,
+    "gateway_socket_probe_environment_limited": False,
+    "gateway_socket_probe_failure_kind": "",
+    "gateway_socket_probe_error_code": "",
     "gateway_status_output": "",
     "gateway_probe_checked_at": None,
     "gateway_probe_authoritative": None,
@@ -242,7 +250,11 @@ def load_openclaw_status(prefer_runtime: bool = False) -> Dict[str, object]:
     return sanitize_legacy_repair_status(merged)
 
 
-def save_openclaw_status(payload: Dict[str, object]) -> Dict[str, object]:
+def save_openclaw_status(
+    payload: Dict[str, object],
+    *,
+    mirror_runtime: bool = True,
+) -> Dict[str, object]:
     merged = dict(DEFAULT_OPENCLAW_STATUS)
     merged.update(payload)
     merged["updated_at"] = utc_now()
@@ -250,7 +262,7 @@ def save_openclaw_status(payload: Dict[str, object]) -> Dict[str, object]:
         eve_store.write_json_dict(local_status_path(), merged)
     except OSError:
         pass
-    if ROOT != RUNTIME_DIR and not str(ROOT).endswith(".eve_runtime"):
+    if mirror_runtime and ROOT != RUNTIME_DIR and not str(ROOT).endswith(".eve_runtime"):
         try:
             eve_store.write_json_dict(runtime_status_path(), merged)
         except OSError:
@@ -655,12 +667,41 @@ def parse_labeled_reply(text: object) -> Dict[str, object]:
     return parsed
 
 
-def gateway_reachable(port: int, host: str = "127.0.0.1", timeout_seconds: float = 0.4) -> bool:
+def gateway_reachability_observation(
+    port: int,
+    host: str = "127.0.0.1",
+    timeout_seconds: float = 0.4,
+) -> Dict[str, object]:
     try:
         with socket.create_connection((host, port), timeout=timeout_seconds):
-            return True
-    except OSError:
-        return False
+            return {
+                "reachable": True,
+                "observation_complete": True,
+                "observation_authoritative": True,
+                "observation_environment_limited": False,
+                "failure_kind": "none",
+                "error_code": "",
+            }
+    except OSError as exc:
+        environment_limited = getattr(exc, "errno", None) in {errno.EPERM, errno.EACCES}
+        return {
+            "reachable": False,
+            "observation_complete": not environment_limited,
+            "observation_authoritative": not environment_limited,
+            "observation_environment_limited": environment_limited,
+            "failure_kind": "restricted_environment" if environment_limited else "unreachable",
+            "error_code": errno.errorcode.get(getattr(exc, "errno", None), type(exc).__name__),
+        }
+
+
+def gateway_reachable(port: int, host: str = "127.0.0.1", timeout_seconds: float = 0.4) -> bool:
+    return bool(
+        gateway_reachability_observation(
+            port,
+            host=host,
+            timeout_seconds=timeout_seconds,
+        ).get("reachable")
+    )
 
 
 def openclaw_command() -> Optional[str]:
@@ -687,11 +728,227 @@ def openclaw_env() -> Dict[str, str]:
     return env
 
 
-def run(command: list[str], *, cwd: Optional[Path] = None, timeout: int = 1200) -> subprocess.CompletedProcess[str]:
+def _process_table_descendants(root_pid: int) -> tuple[list[int], bool]:
+    """Return a bounded snapshot of descendants, including new process groups.
+
+    OpenClaw launches its local agent in a fresh session. Killing only the
+    repair wrapper therefore does not guarantee that the agent stops. The
+    process-table snapshot lets the outer supervisor address descendant groups
+    before it terminates the wrapper. Failure to inspect the table remains
+    explicit so callers never mistake best-effort cleanup for verified cleanup.
+    """
+
+    ps_path = shutil.which("ps") or "/bin/ps"
+    try:
+        result = subprocess.run(
+            [ps_path, "-axo", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+            env=openclaw_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return [], False
+    if result.returncode != 0:
+        return [], False
+
+    children: dict[int, list[int]] = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        try:
+            pid, parent_pid = (int(value) for value in fields)
+        except ValueError:
+            continue
+        children.setdefault(parent_pid, []).append(pid)
+
+    descendants: list[int] = []
+    stack = list(children.get(int(root_pid), []))
+    seen = {int(root_pid)}
+    while stack and len(descendants) < 512:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        descendants.append(pid)
+        stack.extend(children.get(pid, []))
+    return descendants, True
+
+
+def _process_exists(pid: int) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen[str],
+    *,
+    grace_seconds: float = 1.0,
+) -> Dict[str, object]:
+    """Terminate the wrapper plus descendant sessions, then report residue."""
+
+    descendants, enumerated = _process_table_descendants(process.pid)
+    target_pids = [*reversed(descendants), process.pid]
+    own_group = os.getpgrp()
+    target_groups: list[int] = []
+    for pid in target_pids:
+        try:
+            group = os.getpgid(pid)
+        except ProcessLookupError:
+            continue
+        if group != own_group and group not in target_groups:
+            target_groups.append(group)
+
+    def signal_targets(signum: int) -> None:
+        for group in target_groups:
+            try:
+                os.killpg(group, signum)
+            except (ProcessLookupError, PermissionError):
+                continue
+        for pid in target_pids:
+            if not _process_exists(pid):
+                continue
+            try:
+                os.kill(pid, signum)
+            except (ProcessLookupError, PermissionError):
+                continue
+
+    signal_targets(signal.SIGTERM)
+    deadline = time.monotonic() + max(0.0, float(grace_seconds))
+    while time.monotonic() < deadline:
+        if process.poll() is not None and not any(_process_exists(pid) for pid in descendants):
+            break
+        time.sleep(0.05)
+
+    remaining = [pid for pid in target_pids if _process_exists(pid)]
+    if remaining:
+        signal_targets(signal.SIGKILL)
+    try:
+        process.wait(timeout=max(0.2, float(grace_seconds)))
+    except subprocess.TimeoutExpired:
+        pass
+    remaining = [pid for pid in target_pids if _process_exists(pid)]
+    return {
+        "process_tree_enumerated": enumerated,
+        "descendant_count": len(descendants),
+        "remaining_pids": remaining,
+    }
+
+
+def _run_with_process_tree_cancellation(
+    command: list[str],
+    *,
+    cwd: Optional[Path],
+    timeout: float,
+    termination_grace_seconds: float,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        command,
+        cwd=str(cwd or ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+        env=openclaw_env(),
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(
+            command,
+            process.returncode or 0,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    except subprocess.TimeoutExpired as exc:
+        cleanup = _terminate_process_tree(process, grace_seconds=termination_grace_seconds)
+        try:
+            stdout, stderr = process.communicate(timeout=max(0.2, termination_grace_seconds))
+        except subprocess.TimeoutExpired:
+            stdout = exc.stdout or exc.output or ""
+            stderr = exc.stderr or ""
+            for stream in (process.stdout, process.stderr):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except OSError:
+                    pass
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        timeout_text = f"Command timed out after {timeout:g} seconds: {_command_text_for_log(command)}"
+        cleanup_text = (
+            "Process-tree cancellation: "
+            f"enumerated={str(cleanup['process_tree_enumerated']).lower()} "
+            f"descendants={cleanup['descendant_count']} "
+            f"remaining={len(cleanup['remaining_pids'])}."
+        )
+        stderr = "\n".join(
+            part
+            for part in (timeout_text, cleanup_text, str(stderr or "").strip())
+            if part
+        )
+        return subprocess.CompletedProcess(command, 124, stdout=str(stdout or ""), stderr=stderr)
+
+
+def _command_text_for_log(command: list[str]) -> str:
+    """Render a command without persisting prompt or credential arguments."""
+
+    sensitive_flags = {
+        "--api-key",
+        "--message",
+        "--password",
+        "--secret",
+        "--token",
+    }
+    rendered: list[str] = []
+    redact_next = False
+    for value in command:
+        text = str(value)
+        if redact_next:
+            rendered.append("<redacted>")
+            redact_next = False
+            continue
+        inline_flag = next(
+            (flag for flag in sensitive_flags if text.startswith(f"{flag}=")),
+            "",
+        )
+        if inline_flag:
+            rendered.append(f"{inline_flag}=<redacted>")
+            continue
+        rendered.append(text)
+        if text in sensitive_flags:
+            redact_next = True
+    return " ".join(rendered)
+
+
+def run(
+    command: list[str],
+    *,
+    cwd: Optional[Path] = None,
+    timeout: float = 1200,
+    cancel_process_tree_on_timeout: bool = False,
+    termination_grace_seconds: float = 1.0,
+) -> subprocess.CompletedProcess[str]:
     def stream_text(value: object) -> str:
         if isinstance(value, bytes):
             return value.decode("utf-8", errors="replace")
         return str(value or "")
+
+    if cancel_process_tree_on_timeout:
+        return _run_with_process_tree_cancellation(
+            command,
+            cwd=cwd,
+            timeout=timeout,
+            termination_grace_seconds=termination_grace_seconds,
+        )
 
     try:
         return subprocess.run(
@@ -706,7 +963,7 @@ def run(command: list[str], *, cwd: Optional[Path] = None, timeout: int = 1200) 
     except subprocess.TimeoutExpired as exc:
         stdout = normalize_text(stream_text(exc.stdout or exc.output), fallback="", limit=4000)
         stderr_text = normalize_text(stream_text(exc.stderr), fallback="", limit=3600)
-        timeout_text = f"Command timed out after {timeout} seconds: {' '.join(command)}"
+        timeout_text = f"Command timed out after {timeout:g} seconds: {_command_text_for_log(command)}"
         stderr = f"{timeout_text}\n{stderr_text}".strip() if stderr_text else timeout_text
         return subprocess.CompletedProcess(command, 124, stdout=stdout, stderr=stderr)
 
@@ -1124,7 +1381,33 @@ def collect_openclaw_status(
         previous_gateway_reachable = status.get("gateway_reachable")
         previous_gateway_checked_at = status.get("updated_at")
     previous_gateway_status_ok = status.get("gateway_status_ok")
-    status["gateway_reachable"] = gateway_reachable(int(status["gateway_port"]))
+    socket_observation = gateway_reachability_observation(int(status["gateway_port"]))
+    status["gateway_socket_probe_checked_at"] = utc_now()
+    status["gateway_socket_probe_authoritative"] = bool(
+        socket_observation.get("observation_authoritative")
+    )
+    status["gateway_socket_probe_environment_limited"] = bool(
+        socket_observation.get("observation_environment_limited")
+    )
+    status["gateway_socket_probe_failure_kind"] = str(
+        socket_observation.get("failure_kind") or "unknown"
+    )
+    status["gateway_socket_probe_error_code"] = str(
+        socket_observation.get("error_code") or ""
+    )
+    if socket_observation.get("observation_environment_limited"):
+        # A sandbox EPERM/EACCES says this process could not observe loopback;
+        # it is not evidence that Eve's host gateway went down.
+        if previous_gateway_reachable is not None:
+            status["gateway_reachable"] = previous_gateway_reachable
+            status["gateway_status_ok"] = previous_gateway_status_ok
+            status["gateway_last_authoritative_reachable"] = previous_gateway_reachable
+            status["gateway_last_authoritative_checked_at"] = previous_gateway_checked_at
+        else:
+            status["gateway_reachable"] = False
+            status["gateway_status_ok"] = False
+    else:
+        status["gateway_reachable"] = bool(socket_observation.get("reachable"))
     command_path = openclaw_command()
     if include_gateway_probe and command_path and status["profile_config_exists"]:
         result = run(
@@ -1156,7 +1439,7 @@ def collect_openclaw_status(
             authoritative_reachable = bool(status["gateway_reachable"] or status["gateway_status_ok"])
             status["gateway_last_authoritative_reachable"] = authoritative_reachable
             status["gateway_last_authoritative_checked_at"] = checked_at
-    else:
+    elif not socket_observation.get("observation_environment_limited"):
         status["gateway_status_ok"] = bool(status["gateway_reachable"])
     should_probe_config = include_gateway_probe if include_config_probe is None else include_config_probe
     if should_probe_config and command_path and status["profile_config_exists"]:
@@ -1345,6 +1628,7 @@ def repair_openclaw(
     timeout: Optional[int] = None,
     skip_sync: bool = False,
 ) -> Dict[str, object]:
+    total_timeout = max(1, int(timeout or config.get("openclaw_timeout_seconds") or 900))
     command = [
         sys.executable,
         str(REPAIR_SCRIPT),
@@ -1355,14 +1639,18 @@ def repair_openclaw(
         "--agent",
         openclaw_agent(config),
         "--timeout",
-        str(int(timeout or config.get("openclaw_timeout_seconds") or 900)),
+        str(total_timeout),
         "--json",
     ]
     if skip_sync:
         command.append("--skip-sync")
     if message:
         command.extend(["--message", message])
-    result = run(command, timeout=int(timeout or config.get("openclaw_timeout_seconds") or 900) + 120)
+    result = run(
+        command,
+        timeout=total_timeout,
+        cancel_process_tree_on_timeout=True,
+    )
 
     payload: Dict[str, object] = {}
     if result.stdout.strip():
@@ -1383,7 +1671,12 @@ def repair_openclaw(
         if fallback_reply:
             parsed_reply = fallback_reply
 
-    repair_status_value = normalize_text((parsed_reply or {}).get("status") or "", fallback="", limit=60)
+    timed_out = result.returncode == 124
+    repair_status_value = normalize_text(
+        (parsed_reply or {}).get("status") or ("timed_out" if timed_out else ""),
+        fallback="",
+        limit=60,
+    )
     hard_failures = payload.get("hard_failures") if isinstance(payload.get("hard_failures"), list) else []
     payload_error = normalize_text(payload.get("error"), fallback="", limit=260)
     strict_repair_ok = bool(
@@ -1395,13 +1688,39 @@ def repair_openclaw(
     )
 
     status = collect_openclaw_status(config, include_gateway_probe=False)
-    repair_issue = normalize_text((parsed_reply or {}).get("issue") or "", fallback="", limit=220)
-    repair_next_step = normalize_text(
-        (parsed_reply or {}).get("next_step") or (parsed_reply or {}).get("safest_next_step") or "",
+    repair_issue = normalize_text(
+        (parsed_reply or {}).get("issue")
+        or ("OpenClaw repair exceeded its total deadline and was cancelled." if timed_out else ""),
         fallback="",
         limit=220,
     )
-    repair_verified = normalize_text((parsed_reply or {}).get("verified") or "", fallback="", limit=220)
+    repair_next_step = normalize_text(
+        (parsed_reply or {}).get("next_step")
+        or (parsed_reply or {}).get("safest_next_step")
+        or (
+            "Ignore late session output and recheck current OpenClaw evidence before any retry."
+            if timed_out
+            else ""
+        ),
+        fallback="",
+        limit=220,
+    )
+    cancellation_output = str(result.stderr or "")
+    cancellation_verified = bool(
+        timed_out
+        and "enumerated=true" in cancellation_output
+        and "remaining=0" in cancellation_output
+    )
+    repair_verified = normalize_text(
+        (parsed_reply or {}).get("verified")
+        or (
+            "Outer supervisor found no remaining process from the cancelled repair tree."
+            if cancellation_verified
+            else ""
+        ),
+        fallback="",
+        limit=220,
+    )
     status.update(
         {
             "last_repair_at": utc_now(),

@@ -1212,8 +1212,12 @@ class HumanitySubstrateTests(unittest.TestCase):
                 "summary": "OpenClaw sync completed, but one or more context artifacts could not be updated.",
             },
         ]
-        # Isolate from the live prediction-error ledger (C1 surprise contribution).
-        with patch.object(eve, "read_recent_prediction_checks", return_value=[]):
+        # This tests recovered actions, not the separately tested live kernel
+        # surprise loop. Isolate both sources so daemon activity cannot move
+        # the fixture's pressure while the test runs.
+        with patch.object(eve, "read_recent_prediction_checks", return_value=[]), patch.object(
+            eve, "kernel_prediction_error_signal", return_value={}
+        ):
             homeostasis = eve.build_homeostasis_state(
                 source="test",
                 human_context=eve.default_human_context(),

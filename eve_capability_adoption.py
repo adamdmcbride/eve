@@ -114,6 +114,65 @@ GENERIC_ID_TOKENS = {
     "update",
     "upgrade",
 }
+NATURAL_LANGUAGE_HYPHENATED_PHRASES = {
+    "host-authoritative",
+    "human-like",
+    "local-first",
+    "local-only",
+    "long-term",
+    "no-code",
+    "open-source",
+    "proposal-only",
+    "read-only",
+    "real-time",
+    "self-hosted",
+    "source-owned",
+    "third-party",
+    "tool-less",
+    "tool-using",
+    "write-only",
+}
+GENERIC_SLASH_LIST_TOKENS = GENERIC_ID_TOKENS | {
+    "audio",
+    "chat",
+    "cloud",
+    "context",
+    "human",
+    "image",
+    "input",
+    "local",
+    "memory",
+    "output",
+    "provenance",
+    "read",
+    "text",
+    "trace",
+    "tracing",
+    "user",
+    "voice",
+    "write",
+}
+LOW_SIGNAL_MATCH_TOKENS = GENERIC_ID_TOKENS | {
+    "available",
+    "current",
+    "evidence",
+    "into",
+    "local",
+    "ready",
+    "result",
+    "state",
+    "status",
+    "verified",
+    "working",
+}
+
+# Preserve explicit package/surface names that ordinary tokenization destroys.
+# For example, ``py_trees`` becomes the generic token ``tree`` after the short
+# ``py`` token is dropped.  Without this anchor, a high-overlap but unrelated
+# action-tree record can outrank the capability the caller named explicitly.
+EXPLICIT_IDENTIFIER_RE = re.compile(
+    r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]*(?:[_/-][A-Za-z0-9]+)+)(?![A-Za-z0-9])"
+)
 
 JsonFetcher = Callable[[str, int], object]
 TextFetcher = Callable[[str, int], str]
@@ -137,6 +196,22 @@ def stable_json_hash(value: object) -> str:
 
 def normalize_token(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def explicit_identifier_anchors(value: object) -> List[str]:
+    anchors: List[str] = []
+    for match in EXPLICIT_IDENTIFIER_RE.finditer(str(value or "")):
+        raw_anchor = match.group(1).lower()
+        if raw_anchor in NATURAL_LANGUAGE_HYPHENATED_PHRASES:
+            continue
+        if "/" in raw_anchor and "_" not in raw_anchor:
+            slash_parts = [part for part in raw_anchor.split("/") if part]
+            if slash_parts and all(part in GENERIC_SLASH_LIST_TOKENS for part in slash_parts):
+                continue
+        anchor = re.sub(r"[^a-z0-9]+", "", raw_anchor)
+        if len(anchor) >= 5:
+            anchors.append(anchor)
+    return sorted(set(anchors))
 
 
 def meaningful_tokens(value: object) -> List[str]:
@@ -202,6 +277,14 @@ def record_search_text(record: Dict[str, object]) -> str:
         record.get("candidate_role"),
         record.get("missing_dependency"),
         record.get("next_acquisition_step"),
+        record.get("subsystem"),
+        record.get("family"),
+        record.get("current_state"),
+        record.get("decision"),
+        record.get("rationale"),
+        record.get("configuration_action"),
+        record.get("authority_boundary"),
+        record.get("lifecycle"),
         record.get("evidence"),
     ]
     return " ".join(text for item in preferred for text in _iter_text(item))
@@ -213,10 +296,19 @@ def match_score(objective: object, record: Dict[str, object]) -> Dict[str, objec
     objective_tokens = meaningful_tokens(objective_text)
     record_tokens = set(meaningful_tokens(record_text))
     overlap = sorted(set(objective_tokens) & record_tokens)
+    high_signal_overlap = sorted(set(overlap) - LOW_SIGNAL_MATCH_TOKENS)
     exact_phrase = bool(objective_text and len(objective_text) >= 5 and objective_text in record_text)
     id_or_name = normalize_token(f"{record.get('id') or ''} {record.get('name') or ''}")
     id_name_phrase = bool(objective_text and len(objective_text) >= 5 and objective_text in id_or_name)
     id_name_tokens = set(meaningful_tokens(id_or_name))
+    identifier_anchors = explicit_identifier_anchors(objective)
+    compact_record_text = re.sub(r"[^a-z0-9]+", "", record_search_text(record).lower())
+    missing_identifier_anchors = [
+        anchor for anchor in identifier_anchors if anchor not in compact_record_text
+    ]
+    matched_identifier_anchors = [
+        anchor for anchor in identifier_anchors if anchor in compact_record_text
+    ]
     specific_id_overlap = sorted(
         token
         for token in objective_tokens
@@ -231,22 +323,41 @@ def match_score(objective: object, record: Dict[str, object]) -> Dict[str, objec
         score += 0.25
     if specific_id_overlap:
         score += 0.22
+    if matched_identifier_anchors and not missing_identifier_anchors:
+        score += 0.3
+    # Detailed objectives often name several constraints (privacy, holdout,
+    # versioning, trainer, promotion) that one installed family only partially
+    # owns.  Do not let those useful constraints dilute a strong domain match
+    # back below the build threshold.  Generic words such as ``local`` and
+    # ``evidence`` are deliberately excluded from this bonus.
+    if len(high_signal_overlap) >= 3:
+        score += min(0.18, 0.04 * len(high_signal_overlap))
     # One generic overlap is not enough to conclude that coding is unnecessary.
     credible = bool(
         id_name_phrase
         or exact_phrase
         or bool(specific_id_overlap)
+        or bool(matched_identifier_anchors)
         or len(overlap) >= 2
         or (len(objective_tokens) == 1 and len(overlap) == 1 and len(objective_tokens[0]) >= 5)
+    ) and not missing_identifier_anchors and bool(
+        high_signal_overlap
+        or id_name_phrase
+        or exact_phrase
+        or matched_identifier_anchors
     )
     return {
         "score": round(min(1.0, score), 4),
         "credible": credible and score >= 0.34,
         "overlap": overlap,
+        "high_signal_overlap": high_signal_overlap,
         "objective_tokens": objective_tokens,
         "exact_phrase": exact_phrase,
         "id_name_phrase": id_name_phrase,
         "specific_id_overlap": specific_id_overlap,
+        "identifier_anchors": identifier_anchors,
+        "matched_identifier_anchors": matched_identifier_anchors,
+        "missing_identifier_anchors": missing_identifier_anchors,
     }
 
 
@@ -329,6 +440,43 @@ def _feature_review_from_target(
     return {}
 
 
+def _component_update_review_from_target(
+    target: Optional[Dict[str, object]],
+    components: Sequence[Dict[str, object]],
+) -> Dict[str, object]:
+    if not isinstance(target, dict) or str(target.get("kind") or "") != "installed_component_update":
+        return {}
+    component = _component_by_id(components, target.get("component_id"))
+    if not component:
+        return {}
+    target_version = str(target.get("target_version") or component.get("latest_version") or "").strip()
+    installed_version = str(target.get("installed_version") or component.get("local_version") or "").strip()
+    watcher_authority = str(target.get("source_authority") or "") == "installed_component_watcher"
+    if (
+        not target_version
+        or target_version == installed_version
+        or not (watcher_authority or component.get("update_available") is True)
+    ):
+        return {}
+    release_mode = str(component.get("release_feature_mode") or "installed_version").strip().lower()
+    state = "lab_candidate" if release_mode == "lab_only" else "candidate"
+    return {
+        "id": str(target.get("id") or f"component-update-v1:{component.get('id')}@{target_version}"),
+        "repository": str(component.get("release_repository") or component.get("repository") or ""),
+        "component_id": str(component.get("id") or ""),
+        "component_name": str(component.get("name") or component.get("id") or "installed component"),
+        "target_version": target_version,
+        "installed_version": installed_version,
+        "watcher_latest_version": target_version,
+        "state": state,
+        "priority": "low" if state == "lab_candidate" else "medium",
+        "classification_reason": "The installed-component watcher observed a newer package version even though no matching GitHub release-track record is available.",
+        "required_gate": str(component.get("adoption") or "Stage the package in an isolated environment and run its component contract."),
+        "release_feature_mode": release_mode,
+        "authority": "installed_component_watcher_candidate",
+    }
+
+
 def resolve_capability_first(
     objective: object,
     capability_matrix: Optional[Dict[str, object]] = None,
@@ -362,6 +510,11 @@ def resolve_capability_first(
         and str(item.get("state") or "") != "historical"
         and (item.get("visible_in_current_feed") is not False)
     ]
+    feature_family_reviews = [
+        item
+        for item in intelligence.get("feature_family_reviews") or []
+        if isinstance(item, dict) and item.get("id")
+    ]
     components = [item for item in components if isinstance(item, dict)]
 
     ranked_capabilities = _rank_records(objective_text, matrix_records)
@@ -369,15 +522,74 @@ def resolve_capability_first(
     matched_capability = capability_hit.get("record") if isinstance(capability_hit.get("record"), dict) else {}
     capability_match = capability_hit.get("match") if isinstance(capability_hit.get("match"), dict) else {}
 
+    ranked_families = _rank_records(objective_text, feature_family_reviews)
+    family_hit = next((item for item in ranked_families if item["match"].get("credible")), {})
+    integrated_family_hit = next(
+        (
+            item
+            for item in ranked_families
+            if item["match"].get("credible")
+            and len(item["match"].get("high_signal_overlap") or []) >= 3
+            and (
+                ":organ:" in str(item["record"].get("id") or "")
+                or str(item["record"].get("family") or "").startswith("organ:")
+            )
+            and str(item["record"].get("decision") or "") not in {"defer", "reject"}
+            and float(item["match"].get("score") or 0.0)
+            >= float(family_hit.get("match", {}).get("score") or 0.0) - 0.12
+        ),
+        {},
+    )
+    if integrated_family_hit:
+        family_hit = integrated_family_hit
+    matched_family = family_hit.get("record") if isinstance(family_hit.get("record"), dict) else {}
+    family_match = family_hit.get("match") if isinstance(family_hit.get("match"), dict) else {}
+    capability_bundle = [
+        {
+            "id": item["record"].get("id"),
+            "subsystem": item["record"].get("subsystem"),
+            "family": item["record"].get("family"),
+            "decision": item["record"].get("decision"),
+            "current_state": item["record"].get("current_state"),
+            "score": item["match"].get("score"),
+            "overlap": item["match"].get("overlap"),
+            "high_signal_overlap": item["match"].get("high_signal_overlap"),
+        }
+        for item in ranked_families
+        if item["match"].get("credible")
+        and str(item["record"].get("decision") or "") not in {"defer", "reject"}
+    ][:8]
+    shadowed_capability: Dict[str, object] = {}
+    family_preferred = bool(
+        matched_family
+        and (
+            (
+                bool(family_match.get("matched_identifier_anchors"))
+                and not bool(capability_match.get("matched_identifier_anchors"))
+            )
+            or (
+                bool(family_match.get("specific_id_overlap"))
+                and not bool(capability_match.get("specific_id_overlap"))
+            )
+            or float(family_match.get("score") or 0.0)
+            >= float(capability_match.get("score") or 0.0) + 0.1
+        )
+    )
+    if family_preferred and matched_capability:
+        shadowed_capability = matched_capability
+        matched_capability = {}
+        capability_match = {}
+
     exact_review = _feature_review_from_target(target, feature_reviews)
+    exact_component_update_review = _component_update_review_from_target(target, components)
     ranked_reviews = _rank_records(objective_text, feature_reviews)
     review_hit = next((item for item in ranked_reviews if item["match"].get("credible")), {})
-    matched_review = exact_review or (
+    matched_review = exact_review or exact_component_update_review or (
         review_hit.get("record") if isinstance(review_hit.get("record"), dict) else {}
     )
     review_match = (
         {"score": 1.0, "credible": True, "overlap": ["target_id"], "exact_target": True}
-        if exact_review
+        if exact_review or exact_component_update_review
         else review_hit.get("match") if isinstance(review_hit.get("match"), dict) else {}
     )
     matched_component = _component_by_id(components, matched_review.get("component_id"))
@@ -393,7 +605,7 @@ def resolve_capability_first(
     # a candidate package may expose related words while still requiring its
     # own isolated version canary.
     review_state = str(matched_review.get("state") or "")
-    exact_release_target = bool(exact_review)
+    exact_release_target = bool(exact_review or exact_component_update_review)
     objective_normalized = normalize_token(objective_text)
     target_version_normalized = normalize_token(matched_review.get("target_version"))
     candidate_named_target = bool(
@@ -473,6 +685,53 @@ def resolve_capability_first(
                 "reason": "Finish the visible surface's owning configuration/admission contract; Codex is only for a missing adapter proven by that attempt.",
                 "authority": "admission_required",
             }
+    elif matched_family:
+        existing_path_found = True
+        coding_allowed = False
+        family_decision = str(matched_family.get("decision") or "defer")
+        family_lifecycle = (
+            matched_family.get("lifecycle")
+            if isinstance(matched_family.get("lifecycle"), dict)
+            else {}
+        )
+        lifecycle_stage = str(family_lifecycle.get("stage") or "")
+        family_callable = bool(
+            lifecycle_stage in {"callable", "verified"}
+            or family_lifecycle.get("callable_now")
+            or family_lifecycle.get("consequence_verified")
+        )
+        if family_decision == "use_existing" and family_callable:
+            classification = "use_existing"
+            reason = "Eve's feature-family ledger already has a callable or consequence-verified path for this objective."
+        else:
+            classification = "configure_or_admit_existing"
+            reason = (
+                "Eve already inventories a matching installed or source-visible feature family; "
+                f"its current decision is {family_decision} and it must be used, admitted, canaried, deferred, "
+                "or rejected through that existing contract before any replacement is built."
+            )
+        recommended_action = str(
+            matched_family.get("configuration_action")
+            or "Follow the existing feature-family decision and run its focused consequence check before writing code."
+        )
+        family_subsystem = str(matched_family.get("subsystem") or "eve")
+        family_id = str(matched_family.get("id") or "")
+        primary_organ = (
+            "openclaw"
+            if family_subsystem == "openclaw" or "openclaw" in family_id
+            else "hermes"
+            if family_subsystem == "hermes" or "hermes" in family_id
+            else "eve_runtime"
+        )
+        organ_route = {
+            "owner": "eve",
+            "primary_organ": primary_organ,
+            "supporting_organs": [
+                item for item in ["openclaw", "hermes", "codex"] if item != primary_organ
+            ],
+            "reason": "Resolve the already-inventoried feature family through its owner; Codex is held until that existing contract proves an adapter gap.",
+            "authority": "existing_feature_family",
+        }
     elif matched_review and review_state in {"candidate", "lab_candidate"}:
         classification = "canary_existing_update"
         reason = str(matched_review.get("classification_reason") or "A newer release exists for an installed or staged Eve component.")
@@ -502,6 +761,7 @@ def resolve_capability_first(
 
     confidence = max(
         float(capability_match.get("score") or 0.0),
+        float(family_match.get("score") or 0.0),
         float(review_match.get("score") or 0.0),
         0.7 if classification == "build_required" else 0.0,
     )
@@ -519,6 +779,9 @@ def resolve_capability_first(
         "organ_route": organ_route,
         "matched_capability": matched_capability,
         "capability_match": capability_match,
+        "matched_feature_family": matched_family,
+        "feature_family_match": family_match,
+        "capability_bundle": capability_bundle,
         "matched_feature_review": matched_review,
         "feature_review_match": review_match,
         "matched_component": matched_component,
@@ -529,15 +792,17 @@ def resolve_capability_first(
                 "score": item["match"].get("score"),
                 "credible": item["match"].get("credible"),
             }
-            for item in (ranked_capabilities[:3] + ranked_reviews[:3])
+            for item in (ranked_capabilities[:3] + ranked_families[:3] + ranked_reviews[:3])
         ],
         "evidence": {
             "capability_matrix_updated_at": capability_matrix.get("updated_at"),
             "capability_count": len(matrix_records),
             "intelligence_generated_at": intelligence.get("generated_at"),
             "feature_review_count": len(feature_reviews),
+            "feature_family_review_count": len(feature_family_reviews),
             "radar_updated_at": radar.get("updated_at"),
             "target_id": target.get("id") if isinstance(target, dict) else None,
+            "shadowed_capability_id": shadowed_capability.get("id"),
         },
     }
     resolution["fingerprint"] = stable_json_hash(
@@ -545,11 +810,70 @@ def resolve_capability_first(
             "objective": resolution["objective"],
             "classification": classification,
             "matched_capability": matched_capability.get("id"),
+            "matched_feature_family": matched_family.get("id"),
+            "capability_bundle": [item.get("id") for item in capability_bundle],
             "matched_feature_review": matched_review.get("id"),
             "recommended_action": resolution["recommended_action"],
         }
     )
     return resolution
+
+
+def resolve_capability_needs(
+    objective: object,
+    capability_matrix: Optional[Dict[str, object]] = None,
+    intelligence: Optional[Dict[str, object]] = None,
+    *,
+    needs: Sequence[str] = (),
+    components: Sequence[Dict[str, object]] = (),
+    radar: Optional[Dict[str, object]] = None,
+    target: Optional[Dict[str, object]] = None,
+    resolved_at: Optional[str] = None,
+) -> Dict[str, object]:
+    """Bounded direct/decomposed discovery through the existing resolver.
+
+    Decomposition is supplied explicitly, not inferred tool names or another
+    planner. Only verified registry records enter the selected-id projection.
+    Neither a match nor this result grants execution/admission authority.
+    """
+    if not isinstance(needs, (list, tuple)) or len(needs) > 4:
+        raise ValueError("Provide at most four explicit capability needs")
+    if any(not isinstance(need, str) or not need.strip() or len(need) > 320 for need in needs):
+        raise ValueError("Capability needs must be nonempty strings of at most 320 characters")
+    objective_text = compact_text(objective, 1200)
+    if not objective_text:
+        raise ValueError("Capability objective is required")
+    questions = list(dict.fromkeys(need.strip() for need in needs)) or [objective_text]
+    if target and len(questions) > 1:
+        raise ValueError("A release target must be resolved separately from a multi-need objective")
+    resolutions = [resolve_capability_first(need, capability_matrix, intelligence,
+                   components=components, radar=radar, target=target, resolved_at=resolved_at)
+                   for need in questions]
+    selected, permissioned, unresolved = [], [], []
+    for need, resolution in zip(questions, resolutions):
+        record = resolution.get("matched_capability") or {}
+        usable = all(record.get(key) is True for key in ("available", "callable", "verified"))
+        identifier = record.get("id")
+        classification = resolution.get("classification")
+        if usable and identifier and classification == "use_existing" and not record.get("needs_permission"):
+            selected.append(identifier)
+        else:
+            unresolved.append(need)
+            if usable and identifier and classification == "use_existing_with_permission":
+                permissioned.append(identifier)
+    return {
+        "schema_version": "eve.capability_discovery.v1",
+        "objective": objective_text,
+        "strategy": "direct" if len(questions) == 1 else "decomposed",
+        "resolver_calls": len(resolutions),
+        "selected_capability_ids": sorted(set(selected)),
+        "permission_required_ids": sorted(set(permissioned)),
+        "unresolved_needs": unresolved,
+        "resolutions": resolutions,
+        "authority": "discovery_only",
+        "automatic_execution": False,
+        "status": "resolved" if not unresolved else "requires_owner_review",
+    }
 
 
 def _parse_timestamp(value: object) -> datetime:
@@ -560,6 +884,44 @@ def _parse_timestamp(value: object) -> datetime:
         return datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def capability_gap_target_eligibility(record: Optional[Dict[str, object]]) -> Dict[str, object]:
+    """Decide whether an unresolved gap may drive autonomous build research.
+
+    A gap created from Eve's own reply is evidence that she lacked a verified
+    path; it is not authority to spend future cycles building whatever her
+    generated sentence happened to promise. Human/system-confirmed gaps may
+    still rotate normally, and an explicit objective always bypasses this
+    target-selection filter.
+    """
+
+    record = record if isinstance(record, dict) else {}
+    evidence = record.get("evidence") if isinstance(record.get("evidence"), dict) else {}
+    source = str(evidence.get("source") or record.get("source") or "").strip().lower()
+    authority = str(evidence.get("source_authority") or evidence.get("authority") or "").strip().lower()
+    confirmed = bool(
+        evidence.get("human_confirmed") is True
+        or evidence.get("operator_approved") is True
+        or evidence.get("trusted_directive") is True
+        or authority in {"human_confirmed", "operator_approved", "trusted_directive", "system_owned"}
+    )
+    self_narration = bool(
+        source.startswith(("reply", "dream", "reflection", "self_narration", "model_generated"))
+    )
+    eligible = bool(not self_narration or confirmed)
+    return {
+        "eligible": eligible,
+        "source": source or "unknown",
+        "confirmed": confirmed,
+        "reason": (
+            "human_or_system_confirmed_gap"
+            if self_narration and confirmed
+            else "self_narration_is_evidence_not_build_authority"
+            if self_narration
+            else "non_self_narration_gap"
+        ),
+    }
 
 
 def select_next_target(
@@ -594,8 +956,13 @@ def select_next_target(
             )
 
     targets: List[Dict[str, object]] = []
+    excluded_self_narration_gap_count = 0
     for item in capability_matrix.get("capabilities") or []:
         if not isinstance(item, dict) or str(item.get("category") or "") != "capability_gap":
+            continue
+        eligibility = capability_gap_target_eligibility(item)
+        if not eligibility.get("eligible"):
+            excluded_self_narration_gap_count += 1
             continue
         target_id = str(item.get("id") or "")
         targets.append(
@@ -609,7 +976,55 @@ def select_next_target(
                 "evidence": item.get("evidence") or {},
             }
         )
-    for item in intelligence.get("feature_reviews") or []:
+    current_feature_reviews = [
+        item
+        for item in intelligence.get("feature_reviews") or []
+        if isinstance(item, dict) and item.get("visible_in_current_feed") is not False
+    ]
+    candidate_component_versions = {
+        (str(item.get("component_id") or ""), str(item.get("target_version") or "").lstrip("v"))
+        for item in current_feature_reviews
+        if str(item.get("state") or "") in {"candidate", "lab_candidate"}
+    }
+    eve_subsystem = (
+        (intelligence.get("subsystems") or {}).get("eve")
+        if isinstance(intelligence.get("subsystems"), dict)
+        and isinstance((intelligence.get("subsystems") or {}).get("eve"), dict)
+        else {}
+    )
+    for component in eve_subsystem.get("components") or []:
+        if not isinstance(component, dict):
+            continue
+        component_id = str(component.get("id") or "")
+        latest_version = str(component.get("latest_version") or "").strip()
+        installed_version = str(component.get("local_version") or "").strip()
+        if (
+            not component_id
+            or str(component.get("kind") or "") != "python_package"
+            or component.get("update_available") is not True
+            or not latest_version
+            or latest_version == installed_version
+            or (component_id, latest_version.lstrip("v")) in candidate_component_versions
+        ):
+            continue
+        targets.append(
+            {
+                "id": f"component-update-v1:{component_id}@{latest_version}",
+                "kind": "installed_component_update",
+                "objective": compact_text(
+                    f"{component.get('name') or component_id} installed package update {installed_version} to {latest_version}",
+                    800,
+                ),
+                "component_id": component_id,
+                "target_version": latest_version,
+                "installed_version": installed_version,
+                "repository": component.get("release_repository") or component.get("repository") or "",
+                "priority": 1,
+                "first_seen_at": component.get("checked_at") or intelligence.get("generated_at") or "",
+                "source_authority": "installed_component_watcher",
+            }
+        )
+    for item in current_feature_reviews:
         if not isinstance(item, dict) or not item.get("visible_in_current_feed"):
             continue
         state = str(item.get("state") or "")
@@ -642,6 +1057,9 @@ def select_next_target(
             "kind": "inventory_refresh",
             "objective": "Refresh Eve's capability inventory and official upstream feature sources.",
             "priority": 3,
+            "selection_evidence": {
+                "excluded_self_narration_gap_count": excluded_self_narration_gap_count,
+            },
         }
     # Exhaust new evidence before repeating familiar work.  Priority chooses
     # which *unattempted* target Eve sees first, but it must not let one durable
@@ -655,7 +1073,11 @@ def select_next_target(
                 str(item.get("id") or ""),
             )
         )
-        return unattempted[0]
+        selected = dict(unattempted[0])
+        selected["selection_evidence"] = {
+            "excluded_self_narration_gap_count": excluded_self_narration_gap_count,
+        }
+        return selected
     targets.sort(
         key=lambda item: (
             last_attempt.get(str(item.get("id") or ""), datetime(1970, 1, 1, tzinfo=timezone.utc)),
@@ -664,7 +1086,11 @@ def select_next_target(
             str(item.get("id") or ""),
         )
     )
-    return targets[0]
+    selected = dict(targets[0])
+    selected["selection_evidence"] = {
+        "excluded_self_narration_gap_count": excluded_self_narration_gap_count,
+    }
+    return selected
 
 
 def default_fetch_json(url: str, timeout: int) -> object:
@@ -936,6 +1362,98 @@ def python_candidate_plan(
             else "This candidate needs its component-specific source/build canary; it is not a simple Python package release."
         ),
     }
+
+
+def summarize_candidate_canary_failure(canary: Optional[Dict[str, object]]) -> Dict[str, object]:
+    """Produce a bounded, non-narrative repair signature for a failed canary.
+
+    Full package-manager logs and tracebacks may contain paths, environment
+    details, or credentials. A Codex repair handoff needs the failing phase and
+    exception identity, not the raw transcript. This helper retains hashes and
+    allowlisted Python identifiers only.
+    """
+
+    canary = canary if isinstance(canary, dict) else {}
+    status = str(canary.get("status") or "unknown")
+    commands = [item for item in canary.get("commands") or [] if isinstance(item, dict)]
+    failure_index = next(
+        (
+            index
+            for index, item in enumerate(commands)
+            if item.get("timed_out") is True
+            or item.get("ok") is False
+            or (item.get("returncode") not in (None, 0))
+        ),
+        -1,
+    )
+    if status not in {"failed", "blocked"} or failure_index < 0:
+        return {}
+
+    failed = commands[failure_index]
+    command_tokens = [str(value) for value in failed.get("command") or []]
+    command_text = " ".join(command_tokens).lower()
+    if " venv " in f" {command_text} ":
+        phase = "environment_create"
+    elif " pip " in f" {command_text} " and " install " in f" {command_text} ":
+        phase = "package_install"
+    else:
+        phase = "import_api_smoke"
+
+    output = "\n".join(str(failed.get(key) or "") for key in ("stderr", "stderr_tail", "stdout", "stdout_tail"))
+    exception_matches = re.findall(
+        r"\b(ModuleNotFoundError|ImportError|AttributeError|TypeError|ValueError|RuntimeError|AssertionError|SyntaxError|OSError)\s*:",
+        output,
+    )
+    exception_type = exception_matches[-1] if exception_matches else "unknown"
+    missing_modules = re.findall(
+        r"No module named\s+['\"]([A-Za-z0-9_.-]{1,180})['\"]",
+        output,
+    )
+    missing_module = missing_modules[-1] if missing_modules else ""
+    missing_symbols = re.findall(
+        r"cannot import name\s+['\"]([A-Za-z_][A-Za-z0-9_]{0,120})['\"]",
+        output,
+    )
+    missing_symbol = missing_symbols[-1] if missing_symbols else ""
+
+    package = re.sub(r"[^A-Za-z0-9_.-]", "", str(canary.get("package") or ""))[:120]
+    requirement = re.sub(r"[^A-Za-z0-9_.=+!-]", "", str(canary.get("requirement") or ""))[:160]
+    component_id = re.sub(r"[^A-Za-z0-9_.-]", "", str(canary.get("component_id") or ""))[:140]
+    evidence = {
+        "schema_id": "eve_capability_canary_failure_signature.v1",
+        "component_id": component_id,
+        "package": package,
+        "requirement": requirement,
+        "target_version": compact_text(canary.get("target_version"), 80),
+        "phase": phase,
+        "command_index": failure_index,
+        "returncode": failed.get("returncode"),
+        "timed_out": bool(failed.get("timed_out")),
+        "exception_type": exception_type,
+        "missing_module": missing_module,
+        "missing_symbol": missing_symbol,
+        "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
+        "raw_output_retained": False,
+        "live_environment_changed": bool(canary.get("live_environment_changed")),
+    }
+    evidence["fingerprint"] = stable_json_hash(evidence)
+    subject = requirement or package or component_id or "candidate"
+    diagnostic = (
+        f"{exception_type}: missing module {missing_module}"
+        if missing_module
+        else f"{exception_type}: missing symbol {missing_symbol}"
+        if missing_symbol
+        else exception_type
+        if exception_type != "unknown"
+        else "the bounded artifact lacks the terminal exception"
+    )
+    evidence["repair_objective"] = compact_text(
+        f"Diagnose and repair the isolated {subject} {phase} failure ({diagnostic}). "
+        "Keep Eve's live package version unchanged; reproduce only in the isolated stage, preserve the exact canary contract, "
+        "add a regression for the concrete incompatibility, and return source/tests/evidence for governed promotion or rejection.",
+        700,
+    )
+    return evidence
 
 
 def format_resolution(resolution: Dict[str, object], *, full: bool = False) -> str:

@@ -81,17 +81,93 @@ responsibilities even while `eve.py` remains the compatibility facade:
 | Concern | Owned by |
 | --- | --- |
 | Operational storage and read-only health | `eve_db.py`, `eve_store.py` |
+| Performance observation analysis | `eve_performance.py` |
 | Evidence and provenance | `eve_evidence.py` |
 | Experience and continuity | `eve_experience.py`, `eve_consciousness.py` |
 | Commitments and unfinished work | `eve_commitments.py` |
 | Permissions and governed proposals | `eve_governance.py` |
 | Model topology and resource policy | `eve_model_topology.py`, `eve_model_governor.py` |
 | Platform/runtime paths | `eve_platform.py`, `eve_profile.py` |
-| Conversation and app APIs | `eve_web.py`, `bin/eve_app_server.py` |
+| Conversation attachments | `eve_attachments.py` |
+| OpenAI-compatible conversation boundary | `eve_openai_compat.py` |
+| Chat transport identity and durable follow-up protocol | `eve_chat_protocol.py` |
+| Durable follow-up queue, worker, verification, and delivery | `eve_chat_followups.py` |
+| Browser mutation request policy | `eve_http_security.py` |
+| Installer and download artifacts | `eve_install_artifacts.py` |
+| Monitor payloads and local resource observation | `eve_monitor_projection.py` |
+| Runtime model-health, activity, and latest-state read models | `eve_runtime_projection.py` |
+| Private sensory-session authorization and feature ingestion | `eve_sensory_sessions.py` |
+| HTTP and app orchestration | `eve_web.py`, `bin/eve_app_server.py` |
 
 Runtime data belongs outside the public source tree. A source checkout may be
 synced into a local runtime mirror, but source, runtime state, and public export
 remain distinct artifacts.
+
+Focused implementation boundaries:
+
+- [conversation attachments](architecture/EVE_ATTACHMENT_BOUNDARY_2026_08_23.md)
+  define local staging, bounded extraction, untrusted model evidence, and the
+  no-automatic-memory contract;
+- [store concurrency](architecture/EVE_STORE_CONCURRENCY_2026_08_23.md)
+  defines same-path writer serialization and exception-safe process locking;
+- [loopback HTTP security](architecture/EVE_LOOPBACK_HTTP_SECURITY_2026_08_23.md)
+  defines the shared browser-origin, Fetch Metadata, and JSON media-type gate
+  for state-changing requests.
+- [performance observations](evidence/PERFORMANCE_OBSERVATION_CONTRACT_2026_08_23.md)
+  distinguish measured latency from explicitly inconclusive or invalid samples
+  without guessing from error prose.
+- [Eve.app refresh](architecture/EVE_APP_REFRESH_CONTRACT_2026_08_23.md)
+  defines one versioned conversation snapshot, visibility-aware cadence,
+  failure fallback, and the boundary between request-count reduction and
+  measured energy or latency evidence.
+- [installer artifacts](architecture/EVE_INSTALL_ARTIFACT_BOUNDARY_2026_08_24.md)
+  separate generated package/page bytes from HTTP orchestration while
+  preserving the existing facade and recording legacy runtime migration debt.
+- [monitor projection](architecture/EVE_MONITOR_PROJECTION_BOUNDARY_2026_08_24.md)
+  defines read-only record/resource conversion, finite numeric output, and
+  process-argument redaction before local UI delivery.
+- [durable Eve Chat follow-ups](architecture/EVE_CHAT_FOLLOWUP_BOUNDARY_2026_08_24.md)
+  define bounded admission, durable leases, restart recovery, verified action
+  consequences, idempotent same-thread delivery, and compatibility hooks.
+
+`eve_openai_compat.py` is a pure interface adapter: it bounds and normalizes
+wire messages, marks interface system/developer text as non-authoritative
+continuity context, and emits local completion envelopes. It cannot select a
+lane, write memory, grant tools, or execute an action. `eve_web.py` retains the
+HTTP/service orchestration and re-exports the adapter names for compatibility.
+`eve_chat_protocol.py` owns the deterministic follow-up intent/delay parser,
+bounded supported-action choice, external transport identity normalization,
+synthetic-evaluation admission metadata, and follow-up receipt/delivery
+projection. It does not lease a worker, execute a check, persist a commitment,
+send a message, or select cognition. Those bounded effects are composed through
+`eve_chat_followups.py`, which owns queue/lease/recovery/verification/delivery
+lifecycle against Eve-owned ledgers without selecting ordinary reply cognition
+or expanding the admitted action set. `EveRuntimeService` retains compatible
+methods, its shared mutation/cache boundary, and HTTP composition; `eve_web.py`
+re-exports the protocol helper names so existing clients and tests retain one
+implementation.
+It likewise re-exports the installer builders now owned by
+`eve_install_artifacts.py`; constructing an artifact does not start services or
+change inference policy. Monitor projections now come from
+`eve_monitor_projection.py`; observing or formatting state does not grant the
+monitor mutation, repair, model, or scheduling authority. The same module owns
+compact/full dashboard assembly, while `EveRuntimeService` retains cached
+status/activity readers, conversation-spine access, HTTP, and live-stream
+orchestration.
+`eve_runtime_projection.py` assembles the model-health, model/system activity,
+and versioned latest-state read models from existing stores and observations.
+It owns no cache, route, model call, lane decision, durable write, or daemon
+control. `EveRuntimeService` retains refresh cadence, locking, cache
+invalidation, and HTTP composition while injecting immutable path/version
+configuration and its existing readers.
+Private sensor sessions are composed through `eve_sensory_sessions.py`. That
+service owns high-entropy session authorization, expiry/rate limits,
+cross-process durable event budgets, restart rehydration, feature-only event
+writes, and bounded integration triggers. `EveRuntimeService` still owns the
+HTTP-facing composition and delegates through its existing method names. The
+service receives its database path and immutable policy snapshot from that
+composition root, so there is one session-state owner without granting the
+module a route, ambient capture, action, or model-selection authority.
 
 ## Evidence and action lifecycle
 
@@ -144,6 +220,12 @@ memory, credentials, captures, or private evaluation fixtures.
 Camera, microphone, filesystem, network, and account access remain explicit,
 bounded capabilities. A UI indicator is not proof that access occurred; runtime
 evidence must identify the owning process, request, and result.
+
+Loopback is a network boundary, not an authentication mechanism. Both local
+HTTP mutation surfaces reject cross-site browser metadata, foreign browser
+origins, and CORS-safelisted request media types before dispatch. No-Origin
+JSON remains available to native and CLI clients, so this control does not
+claim to defend against a hostile process already running as the local user.
 
 ## Research boundary
 

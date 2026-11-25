@@ -1,10 +1,46 @@
 import AppKit
+import Darwin
 import Foundation
 import SwiftUI
 import WebKit
 
 private let eveChatURL = URL(string: "http://127.0.0.1:3000/?view=live")!
 private let eveChatHealthURL = URL(string: "http://127.0.0.1:3000/health")!
+private let launchDiagnosticByteLimit: UInt64 = 32 * 1024
+
+private func openPrivateLaunchLog(at url: URL) throws -> FileHandle {
+    let descriptor = Darwin.open(
+        url.path,
+        O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW,
+        S_IRUSR | S_IWUSR
+    )
+    guard descriptor >= 0 else {
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+    }
+    guard Darwin.fchmod(descriptor, S_IRUSR | S_IWUSR) == 0 else {
+        let code = errno
+        Darwin.close(descriptor)
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+    }
+    return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+}
+
+private func readLaunchDiagnosticTail(from url: URL) -> String {
+    guard let handle = try? FileHandle(forReadingFrom: url) else { return "" }
+    defer { try? handle.close() }
+
+    guard let endOffset = try? handle.seekToEnd() else { return "" }
+    let startOffset = endOffset > launchDiagnosticByteLimit
+        ? endOffset - launchDiagnosticByteLimit
+        : 0
+    guard (try? handle.seek(toOffset: startOffset)) != nil,
+          let data = try? handle.readToEnd() else {
+        return ""
+    }
+    let tail = String(decoding: data, as: UTF8.self)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return startOffset > 0 && !tail.isEmpty ? "…\n\(tail)" : tail
+}
 
 final class EveChatAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -25,6 +61,7 @@ final class EveChatState: ObservableObject {
 
     private var startTask: Task<Void, Never>?
     private var monitorTask: Task<Void, Never>?
+    private var healthMonitorGeneration = 0
 
     func start() {
         guard startTask == nil else { return }
@@ -77,6 +114,16 @@ final class EveChatState: ObservableObject {
         showLiveToken = UUID()
     }
 
+    func verifyHealthNow() {
+        guard isReady else {
+            start()
+            return
+        }
+        monitorTask?.cancel()
+        monitorTask = nil
+        beginHealthMonitor(checkImmediately: true)
+    }
+
     private func markReady(reloadPage: Bool) {
         isStarting = false
         isReady = true
@@ -88,14 +135,38 @@ final class EveChatState: ObservableObject {
         beginHealthMonitor()
     }
 
-    private func beginHealthMonitor() {
+    private func healthMonitorDelayNanoseconds(afterFailures failures: Int) -> UInt64 {
+        if failures > 0 && NSApp.isActive {
+            return 2_000_000_000
+        }
+        return NSApp.isActive ? 30_000_000_000 : 120_000_000_000
+    }
+
+    private func beginHealthMonitor(checkImmediately: Bool = false) {
         guard monitorTask == nil else { return }
+        healthMonitorGeneration += 1
+        let generation = healthMonitorGeneration
         monitorTask = Task { [weak self] in
             var consecutiveFailures = 0
+            var checkNow = checkImmediately
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 15_000_000_000)
-                guard let self, !Task.isCancelled else { return }
-                if await self.healthCheck() {
+                guard let self, self.healthMonitorGeneration == generation else { return }
+                if !checkNow {
+                    do {
+                        try await Task.sleep(
+                            nanoseconds: self.healthMonitorDelayNanoseconds(
+                                afterFailures: consecutiveFailures
+                            )
+                        )
+                    } catch {
+                        return
+                    }
+                }
+                checkNow = false
+                guard !Task.isCancelled, self.healthMonitorGeneration == generation else { return }
+                let healthy = await self.healthCheck()
+                guard !Task.isCancelled, self.healthMonitorGeneration == generation else { return }
+                if healthy {
                     consecutiveFailures = 0
                     continue
                 }
@@ -126,6 +197,9 @@ final class EveChatState: ObservableObject {
     private func launchSurface() async -> (exitCode: Int32, output: String) {
         await Task.detached(priority: .userInitiated) {
             let home = FileManager.default.homeDirectoryForCurrentUser.path
+            let runtimeDirectory = URL(fileURLWithPath: home, isDirectory: true)
+                .appendingPathComponent(".eve_runtime", isDirectory: true)
+            let logURL = runtimeDirectory.appendingPathComponent("eve-app-launch.log")
             var candidates = [
                 "\(home)/.eve_runtime/eve_app_surface.sh",
                 "\(home)/.eve_runtime/bin/eve_app_surface.sh",
@@ -137,29 +211,45 @@ final class EveChatState: ObservableObject {
                 return (127, "Could not find Eve's local app launcher.")
             }
 
-            let logPath = "\(home)/.eve_runtime/eve-app-webkit.log"
-            let command = "nohup \"\(launcher)\" > \"\(logPath)\" 2>&1 & echo $!"
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-lc", command]
+            process.executableURL = URL(fileURLWithPath: launcher)
 
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = pipe
+            do {
+                try FileManager.default.createDirectory(
+                    at: runtimeDirectory,
+                    withIntermediateDirectories: true
+                )
+            } catch {
+                return (126, "Could not prepare Eve's runtime directory: \(error.localizedDescription)")
+            }
+
+            let logHandle: FileHandle
+            do {
+                logHandle = try openPrivateLaunchLog(at: logURL)
+            } catch {
+                return (126, "Could not open Eve's private launch log: \(error.localizedDescription)")
+            }
+            process.standardOutput = logHandle
+            process.standardError = logHandle
 
             do {
                 try process.run()
                 process.waitUntilExit()
             } catch {
-                return (126, "Failed to run Eve's launcher: \(error.localizedDescription)")
+                try? logHandle.close()
+                return (
+                    126,
+                    "Failed to run Eve's launcher: \(error.localizedDescription). Log: \(logURL.path)"
+                )
             }
 
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let terminationStatus = process.terminationStatus
+            try? logHandle.synchronize()
+            try? logHandle.close()
+            let output = readLaunchDiagnosticTail(from: logURL)
             return (
-                process.terminationStatus,
-                output.isEmpty ? "Started Eve. Log: \(logPath)" : output
+                terminationStatus,
+                output.isEmpty ? "Eve's launcher returned no detail. Log: \(logURL.path)" : output
             )
         }.value
     }
@@ -167,6 +257,7 @@ final class EveChatState: ObservableObject {
 
 struct EveChatRootView: View {
     @EnvironmentObject private var state: EveChatState
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         ZStack {
@@ -184,6 +275,11 @@ struct EveChatRootView: View {
         }
         .task {
             state.start()
+        }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active {
+                state.verifyHealthNow()
+            }
         }
     }
 }
@@ -295,12 +391,18 @@ struct EveChatWebView: NSViewRepresentable {
         let configuration = WKWebViewConfiguration()
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
         configuration.userContentController.add(context.coordinator.presenceBridge, name: "evePresence")
+        configuration.userContentController.add(context.coordinator.nativeSpeechBridge, name: "eveNativeSpeech")
+        configuration.userContentController.add(context.coordinator.nativeIntelligenceBridge, name: "eveNativeIntelligence")
+        configuration.userContentController.add(context.coordinator.nativeIndexBridge, name: "eveNativeIndex")
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = false
         webView.setValue(false, forKey: "drawsBackground")
+        context.coordinator.nativeSpeechBridge.attach(to: webView)
+        context.coordinator.nativeIntelligenceBridge.attach(to: webView)
+        context.coordinator.nativeIndexBridge.attach(to: webView)
         webView.load(URLRequest(url: url))
         context.coordinator.lastReloadToken = reloadToken
         context.coordinator.lastNewChatToken = newChatToken
@@ -332,6 +434,9 @@ struct EveChatWebView: NSViewRepresentable {
         var lastNewChatToken: UUID?
         var lastShowLiveToken: UUID?
         let presenceBridge = EvePresenceBridge()
+        let nativeSpeechBridge = EveNativeSpeechBridge()
+        let nativeIntelligenceBridge = EveNativeIntelligenceBridge()
+        let nativeIndexBridge = EveNativeIndexBridge()
 
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
             // Keep Eve's visible body self-healing even if WebKit itself is

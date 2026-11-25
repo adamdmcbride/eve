@@ -16,13 +16,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run Eve's local runtime API server.")
     parser.add_argument("--host", default="127.0.0.1", help="Host interface to bind.")
     parser.add_argument("--port", type=int, default=8787, help="Port to bind.")
+    parser.add_argument(
+        "--advertised-host",
+        help=(
+            "Trusted DNS name or IPv4 address embedded in installer/update artifacts; "
+            "defaults to the bind host or EVE_ADVERTISED_HOST."
+        ),
+    )
     parser.add_argument("--open", action="store_true", help="Open Eve in the browser after startup.")
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    return eve_web.main(host=args.host, port=args.port, open_browser=args.open)
+    return eve_web.main(
+        host=args.host,
+        port=args.port,
+        open_browser=args.open,
+        advertised_host=args.advertised_host,
+    )
 
 
 if __name__ == "__main__":

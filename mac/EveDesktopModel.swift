@@ -70,6 +70,9 @@ final class EveDesktopModel: ObservableObject {
     private let requiredAPIVersion = 5
     private let maxPollAttempts = 80
     private let baseURL = URL(string: "http://127.0.0.1:8787")!
+    private let routeSegmentCharacters = CharacterSet(
+        charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+    )
     private var hasStarted = false
     private var refreshTask: Task<Void, Never>?
     private var replyStatusTask: Task<Void, Never>?
@@ -838,11 +841,17 @@ final class EveDesktopModel: ObservableObject {
         defer { isWorking = false }
 
         do {
-            let threadMessages: [MessageRecord] = try await request("/api/thread/\(threadID)", timeout: 8)
+            guard let encodedThreadID = encodedRouteSegment(threadID) else {
+                throw EveAPIError.invalidResponse
+            }
+            let threadMessages: [MessageRecord] = try await request("/api/thread/\(encodedThreadID)", timeout: 8)
             for message in threadMessages where message.recipient == "user" && message.status != "archived" {
+                guard let encodedMessageID = encodedRouteSegment(message.id) else {
+                    throw EveAPIError.invalidResponse
+                }
                 let payload: [String: String] = ["status": "archived"]
                 let _: MessageRecord = try await request(
-                    "/api/messages/\(message.id)/mark",
+                    "/api/messages/\(encodedMessageID)/mark",
                     method: "POST",
                     json: payload,
                     timeout: 8
@@ -1025,7 +1034,10 @@ final class EveDesktopModel: ObservableObject {
         let loadGeneration = chatLoadGeneration
 
         do {
-            let threadMessages: [MessageRecord] = try await request("/api/thread/\(threadID)", timeout: 8)
+            guard let encodedThreadID = encodedRouteSegment(threadID) else {
+                throw EveAPIError.invalidResponse
+            }
+            let threadMessages: [MessageRecord] = try await request("/api/thread/\(encodedThreadID)", timeout: 8)
             guard loadGeneration == chatLoadGeneration else { return }
             isDraftingNewChat = false
             pendingNewChatMessages = []
@@ -1044,7 +1056,10 @@ final class EveDesktopModel: ObservableObject {
         let loadGeneration = agentLoadGeneration
 
         do {
-            let threadMessages: [MessageRecord] = try await request("/api/thread/\(threadID)", timeout: 8)
+            guard let encodedThreadID = encodedRouteSegment(threadID) else {
+                throw EveAPIError.invalidResponse
+            }
+            let threadMessages: [MessageRecord] = try await request("/api/thread/\(encodedThreadID)", timeout: 8)
             guard loadGeneration == agentLoadGeneration else { return }
             selectedAgentThreadID = threadID
             loadedAgentLatestMessageID = threadMessages.last?.id
@@ -1436,6 +1451,11 @@ final class EveDesktopModel: ObservableObject {
             process.arguments = [helperPath, argument]
             try? process.run()
         }
+    }
+
+    private func encodedRouteSegment(_ value: String) -> String? {
+        guard !value.isEmpty else { return nil }
+        return value.addingPercentEncoding(withAllowedCharacters: routeSegmentCharacters)
     }
 
     private func request<Payload: Decodable>(

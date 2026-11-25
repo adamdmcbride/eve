@@ -11,11 +11,15 @@ import eve
 
 class EveCoderModeTests(unittest.TestCase):
     def test_coder_command_blocks_destructive_commands(self):
+        # Under self-authority deleting inside her own tree is hers, except where her audit
+        # trail and git history live: wiping the workspace root takes those with it.
         result = eve.run_coder_shell_command("rm -rf .", eve.DEFAULT_CONFIG, timeout_seconds=1)
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["blocked"])
-        self.assertIn("deletion", result["error"])
+        self.assertIn("audit trail", result["error"])
+        outside = eve.run_coder_shell_command("rm -rf ~/Documents/Finances/2025", eve.DEFAULT_CONFIG, timeout_seconds=1)
+        self.assertTrue(outside["blocked"]); self.assertIn("outside Eve's own directories", outside["error"])
 
     def test_coder_command_blocks_clawkeeper_style_disk_wipe(self):
         result = eve.run_coder_shell_command("dd if=/dev/zero of=/dev/disk9 bs=1m", eve.DEFAULT_CONFIG, timeout_seconds=1)
@@ -29,7 +33,7 @@ class EveCoderModeTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["blocked"])
-        self.assertIn("SSH keys", result["error"])
+        self.assertIn("credential files are the user's", result["error"])
 
     def test_code_commitment_is_supported_action(self):
         self.assertEqual(
